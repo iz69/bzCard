@@ -9,6 +9,9 @@ WebUIとLINE公式アカウント連携に対応しています。
 現時点では個人利用を前提にした実装です。公開環境に置く場合は、必ずHTTPSと
 リバースプロキシ側の認証・アクセス制限を併用してください。
 
+<img width="1421" height="944" alt="1" src="https://github.com/user-attachments/assets/09033719-eaa6-437d-8ab5-5326bf61d33d" />
+<img width="811" height="457" alt="2" src="https://github.com/user-attachments/assets/d76cc500-73fe-4ab1-9e20-8f5e94fa5a41" />
+
 ## 主な機能
 
 - WebUIからの名刺画像アップロード
@@ -42,24 +45,6 @@ WebUIとLINE公式アカウント連携に対応しています。
 
 - WebUI: `/bzcard/`
 - API: `/bzcard-api/`
-
-## 公開リポジトリでの注意
-
-このリポジトリはpublic前提です。以下はコミットしないでください。
-
-- `.env`
-- `data/`
-- アップロード済み名刺画像
-- SQLite DBファイル
-- LINEチャネルシークレット、アクセストークン
-- 実際の招待コード
-- 実際のBearer token
-
-`.gitignore` で除外しています。コミット前に確認してください。
-
-```sh
-git status --short
-```
 
 ## 起動手順
 
