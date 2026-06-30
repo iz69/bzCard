@@ -1,0 +1,56 @@
+services:
+  api:
+    container_name: bzcard-api
+    build: ./api
+    ports:
+      - "18081:8000"
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Tokyo
+      - BASE_PATH=/bzcard-api
+      - APP_API_TOKEN=${APP_API_TOKEN:-change-me}
+      - DATA_DIR=/data
+      - LLM_BASE_URL=http://ollama:11434
+      - LLM_MODEL=${LLM_MODEL:-qwen2.5:7b}
+      - OCR_DEVICE=cpu
+      - YOMITOKU_LITE=true
+      - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-50}
+      - LINE_CHANNEL_SECRET=${LINE_CHANNEL_SECRET:-}
+      - LINE_CHANNEL_ACCESS_TOKEN=${LINE_CHANNEL_ACCESS_TOKEN:-}
+      - LINE_LOGIN_CHANNEL_ID=${LINE_LOGIN_CHANNEL_ID:-}
+      - LINE_LIFF_URL=${LINE_LIFF_URL:-}
+      - LINE_INVITE_CODES=${LINE_INVITE_CODES:-}
+      - LINE_SESSION_TTL_HOURS=${LINE_SESSION_TTL_HOURS:-720}
+      - LINE_CARD_SCOPE=${LINE_CARD_SCOPE:-personal}
+    volumes:
+      - ./data:/data
+    depends_on:
+      - ollama
+    mem_limit: 3g
+
+  ui:
+    container_name: bzcard-ui
+    build:
+      context: ./ui
+      args:
+        VITE_BASE_PATH: /bzcard/
+        VITE_API_BASE_PATH: /bzcard-api
+        VITE_LIFF_ID: ${LINE_LIFF_ID:-}
+        VITE_LINE_LIFF_URL: ${LINE_LIFF_URL:-}
+    ports:
+      - "15174:5173"
+    restart: unless-stopped
+    mem_limit: 128m
+
+  ollama:
+    container_name: bzcard-ollama
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    restart: unless-stopped
+    volumes:
+      - ollama:/root/.ollama
+    mem_limit: 6g
+
+volumes:
+  ollama:

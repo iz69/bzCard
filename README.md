@@ -1,42 +1,132 @@
-# bzcard
+# bzCard
 
-名刺画像をアップロードし、サーバ側で `yomitoku` OCR とローカルLLM抽出を行う名刺管理DBの初期実装です。
+bzCard is a self-hosted business card database for Japanese business cards.
 
-## 初期構成
+It accepts JPEG/PNG business card images, stores the original and processed images,
+runs OCR with `yomitoku`, extracts structured fields with a local LLM through
+Ollama, and provides both a WebUI and LINE official account integration.
 
-- API: FastAPI + SQLite + background worker
-- OCR: yomitoku
-- LLM: Ollama
-- UI: React + Vite + nginx
-- 永続化: `./data:/data`
+This is a personal-use first implementation. Do not expose it publicly without
+putting it behind your own authentication and HTTPS reverse proxy.
 
-## 起動
+## Features
+
+- Upload business card images from WebUI
+- Register card images from a LINE official account webhook
+- Store original image, processed image, and thumbnail
+- Auto crop, perspective correction, brightness/contrast/sharpness correction
+- Auto retry image orientation when LINE/mobile images arrive rotated
+- OCR with `yomitoku`
+- Field extraction with a local Ollama model, default `qwen2.5:7b`
+- Front/back image support
+- Simple duplicate detection by image hash
+- Simple bearer-token auth for WebUI/API
+- LIFF-based LINE user registration with invite code
+- SQLite storage
+- `not_card` status for images that do not look like business cards
+
+## Architecture
+
+- `api`: FastAPI, SQLite, background worker, OCR/LLM processing
+- `ui`: React + Vite, served by nginx
+- `ollama`: local LLM runtime
+- `data/`: persistent SQLite database and uploaded images
+
+Default local ports:
+
+- WebUI: `http://localhost:15174/bzcard/`
+- API: `http://localhost:18081/`
+- Ollama: `http://localhost:11434/`
+
+The default deployment assumes a host nginx reverse proxy:
+
+- WebUI subpath: `/bzcard/`
+- API subpath: `/bzcard-api/`
+
+## Repository Safety
+
+This repository is intended to be public-safe.
+
+The following must not be committed:
+
+- `.env`
+- `data/`
+- uploaded card images
+- SQLite database files
+- LINE channel secrets or access tokens
+- real invite codes
+- real bearer tokens
+
+`.gitignore` excludes those local files. Before committing, check:
 
 ```sh
-docker compose up --build
+git status --short
 ```
 
-初回はOllamaモデルを取得してください。
+## Quick Start
+
+Create `.env` from the sample values below.
+
+```sh
+cp .env.example .env
+```
+
+Edit at least `APP_API_TOKEN`.
+
+Start services:
+
+```sh
+docker compose up --build -d
+```
+
+Pull the default Ollama model:
 
 ```sh
 docker compose exec ollama ollama pull qwen2.5:7b
 ```
 
-`docker-compose.yml` の `APP_API_TOKEN` は必ず変更してください。
+Open:
 
-## URL
+```text
+http://localhost:15174/bzcard/
+```
 
-ホストnginxからは以下のようにサブパスへproxyする想定です。
+Use the bearer token configured in `APP_API_TOKEN`.
 
-- WebUI: `/bzcard/`
-- API: `/bzcard-api/`
+## Environment
 
-ローカル確認用の公開ポート:
+`docker-compose.yml` reads local secrets from `.env`.
 
-- WebUI: `http://localhost:15174/`
-- API: `http://localhost:18081/`
+Required for normal WebUI/API use:
 
-## nginx例
+```env
+APP_API_TOKEN=replace-with-a-long-random-token
+```
+
+Optional LINE integration:
+
+```env
+LINE_CHANNEL_SECRET=
+LINE_CHANNEL_ACCESS_TOKEN=
+LINE_LOGIN_CHANNEL_ID=
+LINE_LIFF_ID=
+LINE_LIFF_URL=
+LINE_INVITE_CODES=
+LINE_SESSION_TTL_HOURS=720
+LINE_CARD_SCOPE=personal
+```
+
+Other defaults:
+
+```env
+LLM_MODEL=qwen2.5:7b
+MAX_UPLOAD_MB=50
+```
+
+## Reverse Proxy Example
+
+Use a host nginx or similar reverse proxy. The API needs a larger request body
+limit for image uploads.
 
 ```nginx
 location /bzcard-api/ {
@@ -57,51 +147,106 @@ location /bzcard/ {
 }
 ```
 
-## API例
+## API Example
 
 ```sh
-curl -H "Authorization: Bearer change-me" \
+curl -H "Authorization: Bearer ${APP_API_TOKEN}" \
   -F "file=@sample.jpg" \
-  http://localhost:18081/api/cards/upload
+  "http://localhost:18081/api/cards/upload?direction=auto"
 ```
 
-## LINE連携
+`direction` can be:
 
-LINE公式アカウントのMessaging APIでWebhook URLに次を設定します。
+- `auto`
+- `horizontal`
+- `vertical`
+
+## LINE Integration
+
+LINE webhook URL:
 
 ```text
 https://your-domain.example/bzcard-api/line/webhook
 ```
 
-APIコンテナには以下を設定してください。
-
-- `LINE_CHANNEL_SECRET`: Messaging APIチャネルシークレット
-- `LINE_CHANNEL_ACCESS_TOKEN`: Messaging APIチャネルアクセストークン
-- `LINE_LOGIN_CHANNEL_ID`: LIFF/LINE LoginのChannel ID
-- `LINE_LIFF_URL`: 利用登録と処理後の確認画面URL。例: `https://liff.line.me/LIFF_ID`
-- `LINE_LIFF_ID`: UIビルド用のLIFF ID。`LINE_LIFF_URL` からも推定しますが、明示設定を推奨
-- `LINE_INVITE_CODES`: カンマ区切りの招待コード。例: `team-2026,another-code`
-- `LINE_SESSION_TTL_HOURS`: LIFF用セッションの有効時間。デフォルト720時間
-- `LINE_CARD_SCOPE`: `personal` または `owner`。デフォルトは個人利用向けの `personal`
-
-LINEから画像メッセージを受けると、既存の名刺登録キューに投入します。WebhookはLINE署名を検証し、同じイベントの再送は `webhookEventId` で二重処理しません。
-
-LINE入口は既存のWebUI/Bearer APIとは別認証です。LIFFから `/line/auth/login` にLINEのID tokenと招待コードを送ると、サーバ側でID tokenを検証し、招待コードが一致したユーザーだけ `active` にします。Webhookは `active` なLINEユーザーの画像だけ受け付けます。
-
-`LINE_CARD_SCOPE=personal` では、activeなLINEユーザーはWebUI登録分を含む全名刺を検索・確認・編集できます。将来マルチユーザー化する場合は `LINE_CARD_SCOPE=owner` に切り替えると、LINE経由登録時に付与した `owner_line_user_id` で名刺アクセスを分離します。
-
-LIFFのEndpoint URLは次にしてください。
+LIFF endpoint URL:
 
 ```text
 https://your-domain.example/bzcard/liff
 ```
 
-```http
-POST /line/auth/login
-Content-Type: application/json
+Required LINE settings:
 
-{
-  "id_token": "LIFFで取得したID token",
-  "invite_code": "招待コード"
-}
+- `LINE_CHANNEL_SECRET`: Messaging API channel secret
+- `LINE_CHANNEL_ACCESS_TOKEN`: Messaging API channel access token
+- `LINE_LOGIN_CHANNEL_ID`: LINE Login channel ID
+- `LINE_LIFF_ID`: LIFF ID
+- `LINE_LIFF_URL`: for example `https://liff.line.me/LIFF_ID`
+- `LINE_INVITE_CODES`: comma-separated invite codes
+
+LINE flow:
+
+1. User opens LIFF registration screen.
+2. LIFF gets LINE ID token.
+3. API verifies the ID token with LINE.
+4. User enters an invite code.
+5. Active users can send card images to the official account.
+6. Webhook registers the image into the same processing queue as WebUI uploads.
+
+`LINE_CARD_SCOPE`:
+
+- `personal`: active LINE users can access all cards. Best for single-user use.
+- `owner`: users can access only cards registered with their LINE user ID.
+
+## Processing Pipeline
+
+1. Store uploaded original image.
+2. Create processed image:
+   - EXIF transpose
+   - auto crop
+   - perspective correction
+   - brightness/contrast/sharpness correction
+3. Run `yomitoku` OCR.
+4. If `direction=auto`, infer horizontal/vertical text order.
+5. If a mobile/LINE image looks rotated, test 90-degree candidates and fix
+   processed image orientation when OCR confirms it.
+6. Reject obvious non-card images as `not_card`.
+7. Send OCR text to Ollama LLM for JSON field extraction.
+8. Store extracted fields in SQLite.
+
+## Memory Limits
+
+The compose file includes conservative container limits for a roughly 12 GB host:
+
+- `api`: `3g`
+- `ui`: `128m`
+- `ollama`: `6g`
+
+Adjust these based on actual `docker stats` during OCR/LLM processing.
+
+## Development Checks
+
+Compile API sources:
+
+```sh
+python3 -m compileall api/src
 ```
+
+Build containers:
+
+```sh
+docker compose build api ui
+```
+
+Check API health:
+
+```sh
+docker compose exec api python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/ping').status)"
+```
+
+## Notes
+
+- OCR quality mainly depends on `yomitoku` and image quality.
+- The LLM is used for field extraction, not for image OCR itself.
+- Low-resolution migrated card images will usually produce poor OCR results.
+- For public deployment, always use HTTPS and external access controls.
