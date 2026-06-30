@@ -9,8 +9,8 @@ WebUIとLINE公式アカウント連携に対応しています。
 現時点では個人利用を前提にした実装です。公開環境に置く場合は、必ずHTTPSと
 リバースプロキシ側の認証・アクセス制限を併用してください。
 
-<img width="1421" height="944" alt="1" src="https://github.com/user-attachments/assets/09033719-eaa6-437d-8ab5-5326bf61d33d" />
-<img width="811" height="457" alt="2" src="https://github.com/user-attachments/assets/d76cc500-73fe-4ab1-9e20-8f5e94fa5a41" />
+<img width="712" height="460" alt="1" src="https://github.com/user-attachments/assets/732272e4-e999-4ca4-881b-f7b64fe66c9b" />
+<img width="405" height="228" alt="2" src="https://github.com/user-attachments/assets/d76cc500-73fe-4ab1-9e20-8f5e94fa5a41" />
 
 ## 主な機能
 
