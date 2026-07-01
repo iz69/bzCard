@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   AlertCircle,
@@ -43,6 +43,7 @@ type Card = {
   fax?: string;
   email?: string;
   website?: string;
+  tags?: string;
   memo?: string;
   ocr_text?: string;
   extracted_json?: string;
@@ -87,14 +88,23 @@ const fields: Array<[keyof Card, string]> = [
   ['title', '役職'],
   ['postal_code', '郵便番号'],
   ['address', '住所'],
-  ['tel', '電話'],
   ['mobile', '携帯'],
+  ['tel', '電話'],
   ['fax', 'FAX'],
   ['email', 'メール'],
   ['website', 'Web'],
+  ['tags', 'タグ'],
   ['memo', 'メモ'],
 ];
-const wideFieldKeys = new Set<keyof Card>(['address', 'email', 'website', 'memo']);
+const wideFieldKeys = new Set<keyof Card>([
+  'company_name',
+  'address',
+  'email',
+  'website',
+  'tags',
+  'memo',
+]);
+const rowBreakFieldKeys = new Set<keyof Card>(['postal_code', 'mobile', 'tel']);
 
 function loadSession(): Session {
   return {
@@ -116,6 +126,7 @@ function App() {
   const [status, setStatus] = useState('');
   const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(false);
+  const listRequestRef = useRef(0);
 
   const authed = session.token.trim().length > 0;
   const selectedSummary = selectedId ? cards.find((card) => card.id === selectedId) : undefined;
@@ -123,14 +134,17 @@ function App() {
 
   const api = useMemo(() => makeApi(session), [session]);
 
-  async function reload() {
+  const reload = useCallback(async () => {
     if (!authed) return;
+    const requestId = listRequestRef.current + 1;
+    listRequestRef.current = requestId;
     setLoading(true);
     try {
       const params = new URLSearchParams();
       if (query) params.set('q', query);
       if (status) params.set('status', status);
       const data = await api.get(`/api/cards?${params.toString()}`);
+      if (requestId !== listRequestRef.current) return;
       const items = data.items || [];
       setCards(items);
       setSelectedId((current) => {
@@ -140,17 +154,24 @@ function App() {
         return items[0]?.id || '';
       });
     } catch (error) {
-      setMessage(errorMessage(error));
+      if (requestId === listRequestRef.current) {
+        setMessage(errorMessage(error));
+      }
     } finally {
-      setLoading(false);
+      if (requestId === listRequestRef.current) {
+        setLoading(false);
+      }
     }
-  }
+  }, [api, authed, query, status]);
 
   useEffect(() => {
     reload();
     const timer = window.setInterval(reload, 5000);
-    return () => window.clearInterval(timer);
-  }, [authed, query, status, session.apiBase, session.token]);
+    return () => {
+      listRequestRef.current += 1;
+      window.clearInterval(timer);
+    };
+  }, [reload]);
 
   useEffect(() => {
     if (!authed || !selectedId) {
@@ -237,6 +258,7 @@ function App() {
                   <th>状態</th>
                   <th>氏名</th>
                   <th>会社</th>
+                  <th>タグ</th>
                   <th>更新</th>
                 </tr>
               </thead>
@@ -251,6 +273,7 @@ function App() {
                     <td><StatusBadge status={card.status} /></td>
                     <td>{card.person_name || '-'}</td>
                     <td>{card.company_name || '-'}</td>
+                    <td><TagList tags={card.tags} /></td>
                     <td>{formatDate(card.updated_at)}</td>
                   </tr>
                 ))}
@@ -530,6 +553,7 @@ function LiffCardList({ sessionToken }: { sessionToken: string }) {
           <div>
             <strong>{card.person_name || card.company_name || '処理中の名刺'}</strong>
             <span>{card.company_name || card.status}</span>
+            <TagList tags={card.tags} showEmpty={false} />
           </div>
           <StatusBadge status={card.status} />
         </button>
@@ -592,6 +616,13 @@ function LiffCardDetail({ cardId, sessionToken }: { cardId: string; sessionToken
     <div className="liffDetail">
       {message && <div className="liffMessage">{message}</div>}
       <LineCardImage sessionToken={sessionToken} cardId={card.id} status={card.status} />
+      <label className="imageTagEditor liffTagEditor">
+        タグ
+        <TagsInput
+          value={draft.tags || ''}
+          onChange={(value) => setDraft({ ...draft, tags: value })}
+        />
+      </label>
       <div className="liffDetailHeader">
         <div>
           <h2>{card.person_name || card.company_name || '名刺確認'}</h2>
@@ -603,10 +634,10 @@ function LiffCardDetail({ cardId, sessionToken }: { cardId: string; sessionToken
         </button>
       </div>
       <div className="liffForm">
-        {fields.map(([key, label]) => (
+        {fields.filter(([key]) => key !== 'tags').map(([key, label]) => (
           <label key={key}>
             {label}
-            {key === 'memo' || key === 'address' ? (
+            {key === 'memo' ? (
               <textarea
                 value={(draft[key] as string) || ''}
                 onChange={(event) => setDraft({ ...draft, [key]: event.target.value })}
@@ -869,18 +900,12 @@ function CardDetail({
           </div>
         </div>
         <div className="detailActions">
-          <button className="iconButton" onClick={save} title="保存">
+          <button className="iconButton detailActionButton" onClick={save} title="保存">
             <Save />
+            保存
           </button>
           <button
-            className="imageModeButton"
-            onClick={() => setImageMode(imageMode === 'processed' ? 'original' : 'processed')}
-            title={imageMode === 'processed' ? '補正画像を表示中' : '元画像を表示中'}
-          >
-            {imageMode === 'processed' ? '補正画像' : '元画像'}
-          </button>
-          <button
-            className="dangerButton"
+            className="dangerButton detailActionButton"
             onClick={async () => {
               if (!window.confirm('この名刺を削除しますか？')) return;
               try {
@@ -894,6 +919,7 @@ function CardDetail({
             title="削除"
           >
             <Trash2 />
+            削除
           </button>
         </div>
       </div>
@@ -952,10 +978,17 @@ function CardDetail({
             </button>
             {orientationBusy && <Loader2 className="spin" size={16} />}
           </div>
+          <label className="imageTagEditor">
+            タグ
+            <TagsInput
+              value={draft.tags || ''}
+              onChange={(value) => setDraft({ ...draft, tags: value })}
+            />
+          </label>
         </div>
 
         <div className="formPanel">
-          {fields.map(([key, label]) => {
+          {fields.filter(([key]) => key !== 'tags').map(([key, label]) => {
             if (key === 'address') {
               const address = (draft.address || '').trim();
               return (
@@ -973,15 +1006,19 @@ function CardDetail({
                       地図
                     </button>
                   </div>
-                  <textarea
+                  <input
                     value={draft.address || ''}
                     onChange={(e) => setDraft({ ...draft, address: e.target.value })}
                   />
                 </div>
               );
             }
+            const className = [
+              wideFieldKeys.has(key) ? 'fieldWide' : '',
+              rowBreakFieldKeys.has(key) ? 'fieldRowBreak' : '',
+            ].filter(Boolean).join(' ') || undefined;
             return (
-              <label key={key} className={wideFieldKeys.has(key) ? 'fieldWide' : undefined}>
+              <label key={key} className={className}>
                 {label}
                 {key === 'memo' ? (
                   <textarea
@@ -1001,11 +1038,6 @@ function CardDetail({
       </div>
 
       <div className="processBar">
-        <select value={direction} onChange={(e) => setDirection(e.target.value)}>
-          <option value="auto">自動判定で再OCR</option>
-          <option value="horizontal">横書きで再OCR</option>
-          <option value="vertical">縦書きで再OCR</option>
-        </select>
         <button
           className="textButton"
           onClick={() => run(`/api/cards/${card.id}/reprocess?direction=${direction}`, '再処理を開始しました')}
@@ -1013,6 +1045,11 @@ function CardDetail({
           <RefreshCcw size={16} />
           再OCR
         </button>
+        <select value={direction} onChange={(e) => setDirection(e.target.value)}>
+          <option value="auto">自動判定</option>
+          <option value="horizontal">横書き</option>
+          <option value="vertical">縦書き</option>
+        </select>
         <button
           className="textButton"
           onClick={() => run(`/api/cards/${card.id}/reextract`, '再抽出を開始しました')}
@@ -1035,11 +1072,94 @@ function CardDetail({
       {zoomPath && (
         <ImageModal
           api={api}
-          path={zoomPath}
+          path={imagePath}
           title={`${card.person_name || card.company_name || '名刺'} ${imageSide === 'back' ? '裏' : '表'}`}
+          imageMode={imageMode}
+          onToggleMode={() => setImageMode(imageMode === 'processed' ? 'original' : 'processed')}
           onClose={() => setZoomPath('')}
         />
       )}
+    </div>
+  );
+}
+
+function TagsInput({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  const [input, setInput] = useState('');
+  const tags = parseTags(value);
+
+  function commit(rawValue: string) {
+    const nextTags = [...tags];
+    for (const tag of parseTags(rawValue)) {
+      if (!nextTags.includes(tag)) {
+        nextTags.push(tag);
+      }
+    }
+    onChange(nextTags.join(', '));
+    setInput('');
+  }
+
+  function remove(tag: string) {
+    onChange(tags.filter((current) => current !== tag).join(', '));
+  }
+
+  function onKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
+    if (event.nativeEvent.isComposing) return;
+    if (event.key === 'Enter' || event.key === ',' || event.key === '、') {
+      event.preventDefault();
+      commit(input);
+      return;
+    }
+    if (event.key === 'Backspace' && !input && tags.length) {
+      event.preventDefault();
+      remove(tags[tags.length - 1]);
+    }
+  }
+
+  function onInputChange(nextValue: string) {
+    if (/[,、\n\r]/.test(nextValue)) {
+      commit(nextValue);
+      return;
+    }
+    setInput(nextValue);
+  }
+
+  return (
+    <div className="tagsInput">
+      {tags.map((tag) => (
+        <span className="tagPill tagPillEditable" key={tag}>
+          {tag}
+          <button type="button" onClick={() => remove(tag)} title={`${tag}を削除`}>
+            ×
+          </button>
+        </span>
+      ))}
+      <input
+        value={input}
+        onChange={(event) => onInputChange(event.target.value)}
+        onBlur={() => commit(input)}
+        onKeyDown={onKeyDown}
+        placeholder={tags.length ? '' : 'タグを入力'}
+      />
+    </div>
+  );
+}
+
+function TagList({ tags, showEmpty = true }: { tags?: string; showEmpty?: boolean }) {
+  const items = parseTags(tags || '');
+  if (!items.length) {
+    return showEmpty ? <span className="emptyTags">-</span> : null;
+  }
+  return (
+    <div className="tagList">
+      {items.map((tag) => (
+        <span className="tagPill" key={tag}>{tag}</span>
+      ))}
     </div>
   );
 }
@@ -1079,11 +1199,15 @@ function ImageModal({
   api,
   path,
   title,
+  imageMode,
+  onToggleMode,
   onClose,
 }: {
   api: ReturnType<typeof makeApi>;
   path: string;
   title: string;
+  imageMode: 'processed' | 'original';
+  onToggleMode: () => void;
   onClose: () => void;
 }) {
   useEffect(() => {
@@ -1099,7 +1223,17 @@ function ImageModal({
       <div className="imageModal" onClick={(event) => event.stopPropagation()}>
         <div className="imageModalHeader">
           <span>{title}</span>
-          <button onClick={onClose} title="閉じる">×</button>
+          <div className="imageModalActions">
+            <button
+              type="button"
+              className="imageModeButton"
+              onClick={onToggleMode}
+              title={imageMode === 'processed' ? '補正画像を表示中' : '元画像を表示中'}
+            >
+              補正画像 ↔ 元画像
+            </button>
+            <button type="button" onClick={onClose} title="閉じる">×</button>
+          </div>
         </div>
         <AuthedImage api={api} path={path} />
       </div>
@@ -1273,6 +1407,20 @@ function formatJson(value?: string) {
   } catch {
     return value;
   }
+}
+
+function parseTags(value: string) {
+  const normalized = value.normalize('NFKC').trim();
+  if (!normalized) return [];
+  const tags: string[] = [];
+  normalized
+    .split(/[,、\n\r]+/)
+    .map((tag) => tag.trim().replace(/^#+/, '').replace(/\s+/g, ' '))
+    .filter(Boolean)
+    .forEach((tag) => {
+      if (!tags.includes(tag)) tags.push(tag);
+    });
+  return tags;
 }
 
 function errorMessage(error: unknown) {

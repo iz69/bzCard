@@ -23,6 +23,7 @@ CARD_FIELDS = {
     "fax",
     "email",
     "website",
+    "tags",
     "memo",
 }
 
@@ -39,6 +40,7 @@ SEARCH_FIELDS = [
     "fax",
     "email",
     "website",
+    "tags",
     "memo",
     "ocr_text",
     "back_ocr_text",
@@ -589,6 +591,8 @@ def update_card_fields(card_id: str, data: dict) -> dict | None:
         fields["address"] = _normalize_address(fields["address"])
     if "company_name" in fields:
         fields["company_name"] = _normalize_company_name(fields["company_name"])
+    if "tags" in fields:
+        fields["tags"] = _normalize_tags(fields["tags"])
     for phone_field in ("tel", "mobile", "fax"):
         if phone_field in fields:
             fields[phone_field] = _normalize_phone_number(fields[phone_field])
@@ -900,7 +904,6 @@ def save_extraction_result(
         "fax": _normalize_phone_number(extracted.get("fax") or ""),
         "email": extracted.get("email") or "",
         "website": extracted.get("website") or extracted.get("url") or "",
-        "memo": extracted.get("memo") or "",
     }
     with connection() as conn:
         conn.execute(
@@ -920,7 +923,6 @@ def save_extraction_result(
                 fax = ?,
                 email = ?,
                 website = ?,
-                memo = ?,
                 extraction_duration_ms = ?,
                 error_message = NULL,
                 updated_at = ?
@@ -940,7 +942,6 @@ def save_extraction_result(
                 values["fax"],
                 values["email"],
                 values["website"],
-                values["memo"],
                 duration_ms,
                 now,
                 card_id,
@@ -968,6 +969,19 @@ def _normalize_kana_field(value) -> str:
     if not any(_is_kana(char) for char in text):
         return ""
     return _katakana_to_hiragana(text)
+
+
+def _normalize_tags(value) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if not text:
+        return ""
+    raw_tags = re.split(r"[,、\n\r]+", text)
+    tags: list[str] = []
+    for raw_tag in raw_tags:
+        tag = re.sub(r"\s+", " ", raw_tag.strip().lstrip("#")).strip()
+        if tag and tag not in tags:
+            tags.append(tag)
+    return ", ".join(tags)
 
 
 def _normalize_company_name(value) -> str:

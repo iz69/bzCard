@@ -368,9 +368,12 @@ def _search_result_message(query: str, cards: list[dict]) -> str:
     for index, card in enumerate(cards[:5], start=1):
         title = card.get("person_name") or card.get("company_name") or "名称未設定"
         company = card.get("company_name") or "-"
+        tags = card.get("tags") or ""
         lines.append("")
         lines.append(f"{index}. {title}")
         lines.append(f"   {company}")
+        if tags:
+            lines.append(f"   タグ: {tags}")
         if settings.line_liff_url:
             separator = "&" if "?" in settings.line_liff_url else "?"
             lines.append(f"   確認: {settings.line_liff_url}{separator}card={card['id']}")

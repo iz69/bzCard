@@ -72,6 +72,7 @@ def init_db() -> None:
                 fax TEXT,
                 email TEXT,
                 website TEXT,
+                tags TEXT,
                 memo TEXT,
                 ocr_duration_ms INTEGER,
                 extraction_duration_ms INTEGER,
@@ -95,6 +96,7 @@ def init_db() -> None:
         _ensure_column(conn, "cards", "source_filename", "TEXT")
         _ensure_column(conn, "cards", "import_batch_id", "TEXT")
         _ensure_column(conn, "cards", "owner_line_user_id", "TEXT")
+        _ensure_column(conn, "cards", "tags", "TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS import_batches (

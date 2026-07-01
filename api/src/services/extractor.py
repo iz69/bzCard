@@ -29,7 +29,6 @@ SCHEMA_KEYS = [
     "fax",
     "email",
     "website",
-    "memo",
 ]
 
 
