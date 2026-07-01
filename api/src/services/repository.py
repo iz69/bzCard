@@ -732,6 +732,95 @@ def set_card_status(card_id: str, status: str, error_message: str | None = None)
         )
 
 
+def update_image_orientation_metadata(
+    card_id: str,
+    side: str,
+    original_sha256: str | None,
+    thumbnail_path: str,
+    width: int | None,
+    height: int | None,
+    file_size: int | None,
+    original_changed: bool,
+) -> dict | None:
+    now = now_iso()
+    with connection() as conn:
+        if side == "back":
+            conn.execute(
+                """
+                UPDATE card_images
+                SET thumbnail_path = ?,
+                    original_sha256 = CASE WHEN ? THEN ? ELSE original_sha256 END,
+                    width = CASE WHEN ? THEN ? ELSE width END,
+                    height = CASE WHEN ? THEN ? ELSE height END,
+                    file_size = CASE WHEN ? THEN ? ELSE file_size END,
+                    updated_at = ?
+                WHERE card_id = ? AND side = 'back'
+                """,
+                (
+                    thumbnail_path,
+                    original_changed,
+                    original_sha256,
+                    original_changed,
+                    width,
+                    original_changed,
+                    height,
+                    original_changed,
+                    file_size,
+                    now,
+                    card_id,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE cards
+                SET back_thumbnail_path = ?,
+                    back_original_sha256 = CASE WHEN ? THEN ? ELSE back_original_sha256 END,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (thumbnail_path, original_changed, original_sha256, now, card_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE card_images
+                SET thumbnail_path = ?,
+                    original_sha256 = CASE WHEN ? THEN ? ELSE original_sha256 END,
+                    width = CASE WHEN ? THEN ? ELSE width END,
+                    height = CASE WHEN ? THEN ? ELSE height END,
+                    file_size = CASE WHEN ? THEN ? ELSE file_size END,
+                    updated_at = ?
+                WHERE card_id = ? AND side = 'front'
+                """,
+                (
+                    thumbnail_path,
+                    original_changed,
+                    original_sha256,
+                    original_changed,
+                    width,
+                    original_changed,
+                    height,
+                    original_changed,
+                    file_size,
+                    now,
+                    card_id,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE cards
+                SET thumbnail_path = ?,
+                    original_sha256 = CASE WHEN ? THEN ? ELSE original_sha256 END,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (thumbnail_path, original_changed, original_sha256, now, card_id),
+            )
+        row = conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
+    with get_connection() as conn:
+        return _hydrate_card(conn, row)
+
+
 def save_ocr_result(
     card_id: str,
     raw_text: str,

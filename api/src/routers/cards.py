@@ -9,9 +9,11 @@ from ..auth import require_token
 from ..services import repository
 from ..services.image_store import (
     card_dir,
+    image_metadata,
     make_card_id,
     relative_path,
     resolve_data_path,
+    rotate_page_image,
     save_original_upload,
     sha256_file,
 )
@@ -97,6 +99,59 @@ def delete_card(card_id: str) -> dict:
         raise HTTPException(status_code=404, detail="Card not found")
     shutil.rmtree(card_dir(card_id), ignore_errors=True)
     return {"status": "deleted"}
+
+
+@router.post("/cards/{card_id}/rotate")
+def rotate_card_image(
+    card_id: str,
+    side: str = Query("front", pattern="^(front|back)$"),
+    degrees: int = Query(..., ge=-90, le=90),
+) -> dict:
+    if degrees not in {-90, 90}:
+        raise HTTPException(status_code=400, detail="degrees must be -90 or 90")
+    card = repository.get_card(card_id)
+    if card is None:
+        raise HTTPException(status_code=404, detail="Card not found")
+    if repository.get_active_job(card_id) is not None:
+        raise HTTPException(status_code=409, detail="Card is currently processing")
+
+    if side == "back":
+        original_field = "back_original_image_path"
+        processed_field = "back_processed_image_path"
+        thumbnail_field = "back_thumbnail_path"
+        thumbnail_name = "thumbnail_back.jpg"
+    else:
+        original_field = "original_image_path"
+        processed_field = "processed_image_path"
+        thumbnail_field = "thumbnail_path"
+        thumbnail_name = "thumbnail.jpg"
+
+    original_rel = card.get(original_field)
+    image_rel = card.get(processed_field) or original_rel
+    if not original_rel or not image_rel:
+        raise HTTPException(status_code=404, detail="Image not ready")
+
+    thumbnail_rel = card.get(thumbnail_field) or relative_path(card_dir(card_id) / thumbnail_name)
+    image_path = resolve_data_path(image_rel)
+    thumbnail_path = resolve_data_path(thumbnail_rel)
+    if not image_path.exists():
+        raise HTTPException(status_code=404, detail="Image file not found")
+
+    rotate_page_image(image_path, thumbnail_path, degrees)
+    original_changed = image_rel == original_rel
+    original_sha256 = sha256_file(image_path) if original_changed else None
+    width, height, file_size = image_metadata(image_path) if original_changed else (None, None, None)
+    updated = repository.update_image_orientation_metadata(
+        card_id=card_id,
+        side=side,
+        original_sha256=original_sha256,
+        thumbnail_path=thumbnail_rel,
+        width=width,
+        height=height,
+        file_size=file_size,
+        original_changed=original_changed,
+    )
+    return {"card": updated, "side": side, "degrees": degrees}
 
 
 @router.post("/cards/{card_id}/reprocess")

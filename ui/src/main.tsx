@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   AlertCircle,
@@ -9,6 +9,8 @@ import {
   Loader2,
   MapPin,
   RefreshCcw,
+  RotateCcw,
+  RotateCw,
   Save,
   Search,
   Send,
@@ -245,7 +247,7 @@ function App() {
                     className={selected?.id === card.id ? 'selected' : ''}
                     onClick={() => setSelectedId(card.id)}
                   >
-                    <td className="thumbCell"><ThumbImage api={api} cardId={card.id} /></td>
+                    <td className="thumbCell"><ThumbImage api={api} cardId={card.id} version={card.updated_at} /></td>
                     <td><StatusBadge status={card.status} /></td>
                     <td>{card.person_name || '-'}</td>
                     <td>{card.company_name || '-'}</td>
@@ -785,6 +787,7 @@ function CardDetail({
   const [imageSide, setImageSide] = useState<'front' | 'back'>('front');
   const [direction, setDirection] = useState('auto');
   const [backBusy, setBackBusy] = useState(false);
+  const [orientationBusy, setOrientationBusy] = useState(false);
   const [zoomPath, setZoomPath] = useState('');
 
   useEffect(() => setDraft(card), [card.id, card.updated_at]);
@@ -833,6 +836,19 @@ function CardDetail({
       onMessage(errorMessage(error));
     } finally {
       setBackBusy(false);
+    }
+  }
+
+  async function rotateImage(degrees: -90 | 90) {
+    setOrientationBusy(true);
+    try {
+      await api.post(`/api/cards/${card.id}/rotate?side=${imageSide}&degrees=${degrees}`, {});
+      onMessage(degrees === 90 ? '右90度回転しました' : '左90度回転しました');
+      onChanged();
+    } catch (error) {
+      onMessage(errorMessage(error));
+    } finally {
+      setOrientationBusy(false);
     }
   }
 
@@ -915,6 +931,27 @@ function CardDetail({
             </label>
           </div>
           <AuthedImage api={api} path={imagePath} onClick={() => setZoomPath(imagePath)} />
+          <div className="imageTools">
+            <button
+              type="button"
+              onClick={() => rotateImage(-90)}
+              disabled={orientationBusy}
+              title="左90度回転"
+            >
+              <RotateCcw size={15} />
+              左90度回転
+            </button>
+            <button
+              type="button"
+              onClick={() => rotateImage(90)}
+              disabled={orientationBusy}
+              title="右90度回転"
+            >
+              <RotateCw size={15} />
+              右90度回転
+            </button>
+            {orientationBusy && <Loader2 className="spin" size={16} />}
+          </div>
         </div>
 
         <div className="formPanel">
@@ -1070,13 +1107,43 @@ function ImageModal({
   );
 }
 
-function ThumbImage({ api, cardId }: { api: ReturnType<typeof makeApi>; cardId: string }) {
+function ThumbImage({
+  api,
+  cardId,
+  version,
+}: {
+  api: ReturnType<typeof makeApi>;
+  cardId: string;
+  version?: string;
+}) {
   const [src, setSrc] = useState('');
+  const [visible, setVisible] = useState(false);
+  const rootRef = useRef<HTMLSpanElement | null>(null);
 
   useEffect(() => {
+    const element = rootRef.current;
+    if (!element) return;
+    if (!('IntersectionObserver' in window)) {
+      setVisible(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (!entry?.isIntersecting) return;
+        setVisible(true);
+        observer.disconnect();
+      },
+      { rootMargin: '240px' },
+    );
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!visible) return;
     let active = true;
     let url = '';
-    api.blob(`/api/cards/${cardId}/thumbnail`)
+    api.blob(`/api/cards/${cardId}/thumbnail${version ? `?v=${encodeURIComponent(version)}` : ''}`)
       .then((blob) => {
         if (!active) return;
         url = URL.createObjectURL(blob);
@@ -1087,10 +1154,13 @@ function ThumbImage({ api, cardId }: { api: ReturnType<typeof makeApi>; cardId: 
       active = false;
       if (url) URL.revokeObjectURL(url);
     };
-  }, [api, cardId]);
+  }, [api, cardId, version, visible]);
 
-  if (!src) return <span className="thumbPlaceholder" />;
-  return <img className="thumb" src={src} alt="" />;
+  return (
+    <span ref={rootRef} className="thumbSlot">
+      {src ? <img className="thumb" src={src} alt="" /> : <span className="thumbPlaceholder" />}
+    </span>
+  );
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -1175,10 +1245,11 @@ function directionLabel(value?: string) {
 }
 
 function imagePathFor(card: Card, side: 'front' | 'back', mode: 'processed' | 'original') {
+  const version = card.updated_at ? `?v=${encodeURIComponent(card.updated_at)}` : '';
   if (side === 'back') {
-    return `/api/cards/${card.id}/${mode === 'processed' ? 'back-processed-image' : 'back-original-image'}`;
+    return `/api/cards/${card.id}/${mode === 'processed' ? 'back-processed-image' : 'back-original-image'}${version}`;
   }
-  return `/api/cards/${card.id}/${mode === 'processed' ? 'processed-image' : 'original-image'}`;
+  return `/api/cards/${card.id}/${mode === 'processed' ? 'processed-image' : 'original-image'}${version}`;
 }
 
 function openGoogleMaps(address: string) {

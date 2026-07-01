@@ -159,6 +159,36 @@ def rotate_processed_images(processed_path: Path, thumbnail_path: Path, degrees:
         _save_thumbnail(rotated, thumbnail_path)
 
 
+def rotate_page_image(image_path: Path, thumbnail_path: Path, degrees: int) -> None:
+    if degrees not in {-90, 90}:
+        raise HTTPException(status_code=400, detail="Invalid rotation")
+
+    with Image.open(image_path) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+        rotated = image.rotate(-degrees, expand=True)
+        _save_page_image(rotated, image_path)
+        _save_thumbnail(rotated, thumbnail_path)
+
+
+def _save_page_image(image: Image.Image, path: Path) -> None:
+    if path.suffix.lower() == ".png":
+        image.save(path, "PNG", optimize=True)
+        return
+    image.save(path, "JPEG", quality=92, optimize=True)
+
+
+def image_metadata(path: Path) -> tuple[int | None, int | None, int | None]:
+    if not path.exists():
+        return None, None, None
+    file_size = path.stat().st_size
+    try:
+        with Image.open(path) as image:
+            width, height = image.size
+        return width, height, file_size
+    except Exception:
+        return None, None, file_size
+
+
 def save_rotated_candidate(source_path: Path, degrees: int) -> Path:
     candidate_path = source_path.with_name(f"{source_path.stem}_rotate_{degrees}.jpg")
     with Image.open(source_path) as source:
