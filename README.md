@@ -58,6 +58,10 @@ cp .env.example .env
 
 ```env
 APP_API_TOKEN=replace-with-a-long-random-token
+LLM_PROVIDER=ollama
+LLM_MODEL=qwen2.5:7b
+GEMINI_API_KEY=
+GEMINI_MODEL=gemini-3.5-flash
 ```
 
 コンテナを起動します。
@@ -66,10 +70,18 @@ APP_API_TOKEN=replace-with-a-long-random-token
 docker compose up --build -d
 ```
 
-初回はOllamaモデルを取得してください。
+`LLM_PROVIDER=ollama` の場合、初回はOllamaモデルを取得してください。
 
 ```sh
 docker compose exec ollama ollama pull qwen2.5:7b
+```
+
+Gemini APIを使う場合は `.env` で次のように設定します。
+
+```env
+LLM_PROVIDER=gemini
+GEMINI_API_KEY=your-gemini-api-key
+GEMINI_MODEL=gemini-3.5-flash
 ```
 
 WebUIを開きます。
@@ -93,9 +105,17 @@ APP_API_TOKEN=replace-with-a-long-random-token
 任意設定:
 
 ```env
+LLM_PROVIDER=ollama
 LLM_MODEL=qwen2.5:7b
+GEMINI_API_KEY=
+GEMINI_MODEL=gemini-3.5-flash
 MAX_UPLOAD_MB=50
 ```
+
+`LLM_PROVIDER` は次のいずれかです。
+
+- `ollama`: ローカルOllamaの `LLM_MODEL` を使います。
+- `gemini`: Gemini APIの `GEMINI_MODEL` を使います。`GEMINI_API_KEY` が必要です。
 
 LINE連携を使う場合:
 

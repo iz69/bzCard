@@ -10,8 +10,11 @@ services:
       - BASE_PATH=/bzcard-api
       - APP_API_TOKEN=${APP_API_TOKEN:-change-me}
       - DATA_DIR=/data
-      - LLM_BASE_URL=http://ollama:11434
+      - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://ollama:11434}
       - LLM_MODEL=${LLM_MODEL:-qwen2.5:7b}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.5-flash}
       - OCR_DEVICE=cpu
       - YOMITOKU_LITE=true
       - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-50}
@@ -24,8 +27,6 @@ services:
       - LINE_CARD_SCOPE=${LINE_CARD_SCOPE:-personal}
     volumes:
       - ./data:/data
-    depends_on:
-      - ollama
     mem_limit: 3g
 
   ui:
@@ -42,15 +43,13 @@ services:
     restart: unless-stopped
     mem_limit: 128m
 
-  ollama:
-    container_name: bzcard-ollama
-    image: ollama/ollama:latest
-    ports:
-      - "11434:11434"
-    restart: unless-stopped
-    volumes:
-      - ollama:/root/.ollama
-    mem_limit: 6g
+##  ollama:
+##    container_name: bzcard-ollama
+##    image: ollama/ollama:latest
+##    ports:
+##      - "11434:11434"
+##    restart: unless-stopped
+##    volumes:
+##      - ./ollama:/root/.ollama
+##    mem_limit: 6g
 
-volumes:
-  ollama:

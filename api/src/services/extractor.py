@@ -35,6 +35,23 @@ SCHEMA_KEYS = [
 def extract_card_fields(raw_text: str, blocks: list[dict]) -> ExtractionResult:
     started = time.perf_counter()
     prompt = _build_prompt(raw_text, blocks)
+    raw = _generate_structured_response(prompt)
+    data = _parse_json_object(raw)
+    normalized = {key: _string_or_empty(data.get(key)) for key in SCHEMA_KEYS}
+    normalized["_raw"] = data
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    return ExtractionResult(data=normalized, duration_ms=duration_ms)
+
+
+def _generate_structured_response(prompt: str) -> str:
+    if settings.llm_provider == "ollama":
+        return _generate_with_ollama(prompt)
+    if settings.llm_provider == "gemini":
+        return _generate_with_gemini(prompt)
+    raise ValueError(f"Unsupported LLM_PROVIDER: {settings.llm_provider}")
+
+
+def _generate_with_ollama(prompt: str) -> str:
     payload = {
         "model": settings.llm_model,
         "prompt": prompt,
@@ -51,12 +68,84 @@ def extract_card_fields(raw_text: str, blocks: list[dict]) -> ExtractionResult:
     )
     response.raise_for_status()
     body = response.json()
-    raw = body.get("response") or "{}"
-    data = _parse_json_object(raw)
-    normalized = {key: _string_or_empty(data.get(key)) for key in SCHEMA_KEYS}
-    normalized["_raw"] = data
-    duration_ms = int((time.perf_counter() - started) * 1000)
-    return ExtractionResult(data=normalized, duration_ms=duration_ms)
+    return body.get("response") or "{}"
+
+
+def _generate_with_gemini(prompt: str) -> str:
+    if not settings.gemini_api_key:
+        raise RuntimeError("GEMINI_API_KEY is required when LLM_PROVIDER=gemini")
+
+    payload = {
+        "model": settings.gemini_model,
+        "input": prompt,
+        "response_format": {
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": _extraction_schema(),
+        },
+    }
+    response = requests.post(
+        f"{settings.gemini_base_url}/interactions",
+        headers={"x-goog-api-key": settings.gemini_api_key},
+        json=payload,
+        timeout=180,
+    )
+    response.raise_for_status()
+    return _extract_gemini_text(response.json())
+
+
+def _extraction_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            key: {
+                "type": "string",
+            }
+            for key in SCHEMA_KEYS
+        },
+        "required": SCHEMA_KEYS,
+        "additionalProperties": False,
+    }
+
+
+def _extract_gemini_text(body: dict) -> str:
+    if any(key in body for key in SCHEMA_KEYS):
+        return json.dumps(body, ensure_ascii=False)
+
+    for key in ("output_text", "text", "response", "output", "content"):
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+
+    chunks = _collect_text_chunks(body)
+    if chunks:
+        return "\n".join(chunks)
+    raise ValueError("Gemini response did not contain text output")
+
+
+def _collect_text_chunks(value) -> list[str]:
+    if isinstance(value, str):
+        return []
+    if isinstance(value, list):
+        chunks: list[str] = []
+        for item in value:
+            chunks.extend(_collect_text_chunks(item))
+        return chunks
+    if not isinstance(value, dict):
+        return []
+
+    chunks = []
+    text = value.get("text")
+    if isinstance(text, str) and text.strip():
+        chunks.append(text)
+
+    for key in ("steps", "output", "content", "parts", "candidates", "message"):
+        child = value.get(key)
+        if isinstance(child, str) and child.strip():
+            chunks.append(child)
+        elif child is not None:
+            chunks.extend(_collect_text_chunks(child))
+    return chunks
 
 
 def _build_prompt(raw_text: str, blocks: list[dict]) -> str:
@@ -74,6 +163,8 @@ person_name_kana は氏名の読みをひらがなで入れてください。姓
 OCRテキスト内にふりがな・フリガナがある場合はそれを優先してください。
 ふりがながない場合でも、日本人名として自然で一般的な読みを推測してください。
 ローマ字表記がある場合は読み推測の強い手がかりとして使い、person_name_kana にはローマ字ではなくひらがなを入れてください。
+氏名がOCRで姓・名に分割され、行順が崩れることがあります。大きな日本語名らしい断片が複数ある場合は、会社名・部署名・住所ではないかを確認し、自然な日本人名の姓名順に並べ直してください。
+ふりがなはOCRテキストやローマ字表記に存在しない限り、珍しい読みを無理に作らず、判断できない場合は空文字にしてください。
 氏名や社名に「峠」が含まれる場合、姓としての読みは「とうげ」を優先してください。
 読みがどうしても判断できない場合だけ空文字にしてください。
 電話番号、携帯番号、FAX、郵便番号は可能なら半角数字とハイフンに正規化してください。

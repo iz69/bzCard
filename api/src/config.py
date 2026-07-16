@@ -10,8 +10,12 @@ class Settings:
     data_dir: Path
     api_token: str
     base_path: str
+    llm_provider: str
     llm_base_url: str
     llm_model: str
+    gemini_api_key: str
+    gemini_model: str
+    gemini_base_url: str
     ocr_device: str
     yomitoku_lite: bool
     max_upload_mb: int
@@ -37,8 +41,12 @@ def load_settings() -> Settings:
         data_dir=data_dir,
         api_token=os.getenv("APP_API_TOKEN", "change-me").strip(),
         base_path=os.getenv("BASE_PATH", "/").rstrip("/") or "/",
+        llm_provider=os.getenv("LLM_PROVIDER", "ollama").strip().lower(),
         llm_base_url=os.getenv("LLM_BASE_URL", "http://ollama:11434").rstrip("/"),
         llm_model=os.getenv("LLM_MODEL", "qwen2.5:7b").strip(),
+        gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
+        gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip(),
+        gemini_base_url=os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").rstrip("/"),
         ocr_device=os.getenv("OCR_DEVICE", "cpu").strip(),
         yomitoku_lite=_bool_env("YOMITOKU_LITE", True),
         max_upload_mb=int(os.getenv("MAX_UPLOAD_MB", "20")),

@@ -13,6 +13,7 @@ from ..config import settings
 
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png"}
 ALLOWED_FORMATS = {"JPEG", "PNG"}
+BUSINESS_CARD_RATIO = 91 / 55
 
 
 def card_dir(card_id: str) -> Path:
@@ -208,7 +209,8 @@ def _save_thumbnail(image: Image.Image, thumbnail_path: Path) -> None:
 
 
 def _enhance_processed_image(image: Image.Image) -> Image.Image:
-    image = ImageOps.autocontrast(image.convert("RGB"), cutoff=1)
+    image = _normalize_illumination(image.convert("RGB"))
+    image = ImageOps.autocontrast(image, cutoff=1)
     luminance = ImageStat.Stat(image.convert("L")).mean[0]
 
     if luminance < 155:
@@ -221,6 +223,41 @@ def _enhance_processed_image(image: Image.Image) -> Image.Image:
     image = ImageEnhance.Contrast(image).enhance(1.08)
     image = ImageEnhance.Sharpness(image).enhance(1.08)
     return image
+
+
+def _normalize_illumination(image: Image.Image) -> Image.Image:
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return image
+
+    rgb = np.array(image.convert("RGB"))
+    height, width = rgb.shape[:2]
+    if width < 300 or height < 180:
+        return image
+
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    luminance, a_channel, b_channel = cv2.split(lab)
+    close_size = _odd_kernel_size(max(width, height) / 18, minimum=41, maximum=91)
+    blur_size = _odd_kernel_size(max(width, height) / 6, minimum=121, maximum=241)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_size, close_size))
+    background = cv2.morphologyEx(luminance, cv2.MORPH_CLOSE, kernel)
+    background = cv2.GaussianBlur(background, (blur_size, blur_size), 0)
+    corrected_luminance = cv2.divide(luminance, background, scale=235)
+    corrected = cv2.cvtColor(
+        cv2.merge([corrected_luminance, a_channel, b_channel]),
+        cv2.COLOR_LAB2RGB,
+    )
+    blended = cv2.addWeighted(rgb, 0.2, corrected, 0.8, 0)
+    return Image.fromarray(blended)
+
+
+def _odd_kernel_size(value: float, minimum: int, maximum: int) -> int:
+    size = int(round(value))
+    size = max(minimum, min(maximum, size))
+    return size if size % 2 == 1 else size + 1
 
 
 def _autocrop_and_correct(image: Image.Image) -> Image.Image:
@@ -340,6 +377,8 @@ def _perspective_warp(rgb, points):
     if ratio < 1.15 or ratio > 2.25:
         return None
 
+    max_width, max_height = _business_card_warp_size(max_width, max_height)
+
     destination = np.array(
         [
             [0, 0],
@@ -351,6 +390,12 @@ def _perspective_warp(rgb, points):
     )
     matrix = cv2.getPerspectiveTransform(rect, destination)
     return cv2.warpPerspective(rgb, matrix, (max_width, max_height))
+
+
+def _business_card_warp_size(width: int, height: int) -> tuple[int, int]:
+    if width >= height:
+        return width, max(1, round(width / BUSINESS_CARD_RATIO))
+    return max(1, round(height / BUSINESS_CARD_RATIO)), height
 
 
 def _order_points(points):

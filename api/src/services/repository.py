@@ -46,6 +46,21 @@ SEARCH_FIELDS = [
     "back_ocr_text",
 ]
 
+EXTRACTED_JSON_FIELDS = {
+    "person_name",
+    "person_name_kana",
+    "company_name",
+    "department",
+    "title",
+    "postal_code",
+    "address",
+    "tel",
+    "mobile",
+    "fax",
+    "email",
+    "website",
+}
+
 LIST_OMITTED_FIELDS = {
     "ocr_text",
     "ocr_blocks_json",
@@ -478,28 +493,16 @@ def list_cards(q: str | None = None, status: str | None = None) -> list[dict]:
         where.append("status = ?")
         params.append(status)
     if q:
-        variants = _query_variants(q)
-        expressions = []
-        for field in SEARCH_FIELDS:
-            for _variant in variants:
-                expressions.append(f"{field} LIKE ?")
-                expressions.append(f"REPLACE(REPLACE({field}, ' ', ''), '　', '') LIKE ?")
-        where.append(
-            "(" + " OR ".join(expressions) + ")"
-        )
-        for _field in SEARCH_FIELDS:
-            for variant in variants:
-                like = f"%{variant}%"
-                params.extend([like, like])
+        search_clause, search_params = _search_filter(q)
+        if search_clause:
+            where.append(search_clause)
+            params.extend(search_params)
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY created_at DESC"
     with get_connection() as conn:
-        return [
-            card
-            for row in conn.execute(sql, params).fetchall()
-            if (card := _hydrate_card(conn, row, include_images=False)) is not None
-        ]
+        rows = conn.execute(sql, params).fetchall()
+        return _cards_from_rows(conn, rows, q)
 
 
 def get_card(card_id: str) -> dict | None:
@@ -518,25 +521,15 @@ def list_line_user_cards(line_user_id: str, q: str | None = None, status: str | 
         where.append("status = ?")
         params.append(status)
     if q:
-        variants = _query_variants(q)
-        expressions = []
-        for field in SEARCH_FIELDS:
-            for _variant in variants:
-                expressions.append(f"{field} LIKE ?")
-                expressions.append(f"REPLACE(REPLACE({field}, ' ', ''), '　', '') LIKE ?")
-        where.append("(" + " OR ".join(expressions) + ")")
-        for _field in SEARCH_FIELDS:
-            for variant in variants:
-                like = f"%{variant}%"
-                params.extend([like, like])
+        search_clause, search_params = _search_filter(q)
+        if search_clause:
+            where.append(search_clause)
+            params.extend(search_params)
     sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY created_at DESC"
     with get_connection() as conn:
-        return [
-            card
-            for row in conn.execute(sql, params).fetchall()
-            if (card := _hydrate_card(conn, row, include_images=False)) is not None
-        ]
+        rows = conn.execute(sql, params).fetchall()
+        return _cards_from_rows(conn, rows, q)
 
 
 def get_line_user_card(card_id: str, line_user_id: str) -> dict | None:
@@ -605,7 +598,37 @@ def update_card_fields(card_id: str, data: dict) -> dict | None:
             f"UPDATE cards SET {assignments}, updated_at = ? WHERE id = ?",
             params,
         )
+        _sync_extracted_json(conn, card_id, fields, now)
     return get_card(card_id)
+
+
+def _sync_extracted_json(conn, card_id: str, fields: dict, now: str) -> None:
+    updates = {key: value for key, value in fields.items() if key in EXTRACTED_JSON_FIELDS}
+    if not updates:
+        return
+
+    row = conn.execute("SELECT extracted_json FROM cards WHERE id = ?", (card_id,)).fetchone()
+    if row is None or not row["extracted_json"]:
+        return
+
+    try:
+        extracted = json.loads(row["extracted_json"])
+    except json.JSONDecodeError:
+        return
+    if not isinstance(extracted, dict):
+        return
+
+    for key, value in updates.items():
+        extracted[key] = value or ""
+    raw = extracted.get("_raw")
+    if isinstance(raw, dict):
+        for key, value in updates.items():
+            raw[key] = value or ""
+
+    conn.execute(
+        "UPDATE cards SET extracted_json = ?, updated_at = ? WHERE id = ?",
+        (json.dumps(extracted, ensure_ascii=False), now, card_id),
+    )
 
 
 def set_ocr_direction(card_id: str, direction: str) -> None:
@@ -960,6 +983,106 @@ def _query_variants(value: str) -> list[str]:
         if variant and variant not in result:
             result.append(variant)
     return result
+
+
+def _cards_from_rows(conn, rows, query: str | None) -> list[dict]:
+    scored_cards = []
+    for row in rows:
+        card = _hydrate_card(conn, row, include_images=False)
+        if card is None:
+            continue
+        score = _search_score(row, query) if query else 0
+        scored_cards.append((score, row["created_at"] or "", card))
+
+    if query:
+        scored_cards.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [card for _score, _created_at, card in scored_cards]
+
+
+def _search_score(row, query: str | None) -> int:
+    if not query:
+        return 0
+
+    score = 0
+    for token in _query_tokens(query):
+        token_score = 0
+        for variant in _query_variants(token):
+            for field in SEARCH_FIELDS:
+                token_score = max(
+                    token_score,
+                    _field_match_score(row[field], variant, _search_field_weight(field)),
+                )
+        score += token_score
+    return score
+
+
+def _field_match_score(value, variant: str, weight: int) -> int:
+    field = _search_normalize(value)
+    token = _search_normalize(variant)
+    if not field or not token:
+        return 0
+
+    compact_field = _remove_spaces(field)
+    compact_token = _remove_spaces(token)
+    if field == token or compact_field == compact_token:
+        return weight + 1000
+    if field.startswith(token) or compact_field.startswith(compact_token):
+        return weight + 600
+    if token in field or compact_token in compact_field:
+        return weight + 100
+    return 0
+
+
+def _search_field_weight(field: str) -> int:
+    if field == "person_name":
+        return 500
+    if field == "person_name_kana":
+        return 450
+    if field == "company_name":
+        return 350
+    if field in {"department", "title", "tags"}:
+        return 250
+    if field in {"email", "tel", "mobile", "fax", "website"}:
+        return 200
+    if field in {"ocr_text", "back_ocr_text"}:
+        return 50
+    return 100
+
+
+def _search_normalize(value) -> str:
+    return unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+
+
+def _search_filter(query: str) -> tuple[str, list[str]]:
+    token_clauses = []
+    params: list[str] = []
+
+    for token in _query_tokens(query):
+        variants = _query_variants(token)
+        if not variants:
+            continue
+
+        expressions = []
+        for field in SEARCH_FIELDS:
+            for variant in variants:
+                expressions.append(f"{field} LIKE ?")
+                params.append(f"%{variant}%")
+                expressions.append(f"REPLACE(REPLACE({field}, ' ', ''), '　', '') LIKE ?")
+                params.append(f"%{_remove_spaces(variant)}%")
+        token_clauses.append("(" + " OR ".join(expressions) + ")")
+
+    if not token_clauses:
+        return "", []
+    return "(" + " AND ".join(token_clauses) + ")", params
+
+
+def _query_tokens(query: str) -> list[str]:
+    normalized = unicodedata.normalize("NFKC", query).strip()
+    tokens = []
+    for token in re.split(r"\s+", normalized):
+        if token and token not in tokens:
+            tokens.append(token)
+    return tokens
 
 
 def _normalize_kana_field(value) -> str:
