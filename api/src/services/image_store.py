@@ -216,8 +216,8 @@ def _enhance_processed_image(image: Image.Image) -> Image.Image:
     if luminance < 155:
         factor = min(1.65, max(1.0, 172 / max(luminance, 1)))
         image = ImageEnhance.Brightness(image).enhance(factor)
-    elif luminance > 225:
-        factor = max(0.86, 210 / luminance)
+    elif luminance > 242:
+        factor = max(0.94, 235 / luminance)
         image = ImageEnhance.Brightness(image).enhance(factor)
 
     image = ImageEnhance.Contrast(image).enhance(1.08)
