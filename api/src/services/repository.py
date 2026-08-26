@@ -1022,8 +1022,8 @@ def _field_match_score(value, variant: str, weight: int) -> int:
     if not field or not token:
         return 0
 
-    compact_field = _remove_spaces(field)
-    compact_token = _remove_spaces(token)
+    compact_field = _remove_search_separators(field)
+    compact_token = _remove_search_separators(token)
     if field == token or compact_field == compact_token:
         return weight + 1000
     if field.startswith(token) or compact_field.startswith(compact_token):
@@ -1064,11 +1064,12 @@ def _search_filter(query: str) -> tuple[str, list[str]]:
 
         expressions = []
         for field in SEARCH_FIELDS:
+            compact_field = _sql_remove_search_separators(field)
             for variant in variants:
                 expressions.append(f"{field} LIKE ?")
                 params.append(f"%{variant}%")
-                expressions.append(f"REPLACE(REPLACE({field}, ' ', ''), '　', '') LIKE ?")
-                params.append(f"%{_remove_spaces(variant)}%")
+                expressions.append(f"{compact_field} LIKE ?")
+                params.append(f"%{_remove_search_separators(variant)}%")
         token_clauses.append("(" + " OR ".join(expressions) + ")")
 
     if not token_clauses:
@@ -1215,6 +1216,24 @@ def _kanji_number_to_int(value: str) -> int | None:
 
 def _remove_spaces(value: str) -> str:
     return "".join(value.split())
+
+
+SEARCH_SEPARATOR_CHARS = (" ", "　", "-", "‐", "‑", "‒", "–", "—", "―", "−", "ー", "ｰ", "－")
+
+
+def _remove_search_separators(value: str) -> str:
+    text = _remove_spaces(value)
+    for char in SEARCH_SEPARATOR_CHARS:
+        if char.strip():
+            text = text.replace(char, "")
+    return text
+
+
+def _sql_remove_search_separators(field: str) -> str:
+    expression = field
+    for char in SEARCH_SEPARATOR_CHARS:
+        expression = f"REPLACE({expression}, '{char}', '')"
+    return expression
 
 
 def _katakana_to_hiragana(value: str) -> str:
