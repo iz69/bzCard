@@ -168,6 +168,19 @@ curl -H "Authorization: Bearer ${APP_API_TOKEN}" \
 - `horizontal`
 - `vertical`
 
+Androidなどのクライアントから、実際に名刺処理で使用するOCR/LLMのバージョンを確認できます。
+Bearer token認証が必要です。
+
+```sh
+curl -H "Authorization: Bearer ${APP_API_TOKEN}" \
+  "http://localhost:18081/api/system/versions"
+```
+
+レスポンスには `yomitoku` の導入済みバージョン、OCRのlite設定・デバイス、
+LLMプロバイダーとモデル名を含みます。Ollama利用時は、Ollamaサーバー版、モデルの
+digest、パラメーター数・量子化方式などのモデル詳細も返します。Ollamaが停止中の場合も
+HTTP 200で `llm.status: "unavailable"` を返します。
+
 ## LINE連携
 
 LINE公式アカウントのMessaging APIでWebhook URLに次を設定します。

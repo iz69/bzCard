@@ -9,6 +9,7 @@ from .config import settings
 from .database import init_db
 from .routers.cards import router as cards_router
 from .routers.line import router as line_router
+from .routers.system import router as system_router
 from .services.repository import normalize_existing_company_names
 from .worker import start_worker
 
@@ -39,6 +40,7 @@ app.add_middleware(
 
 app.include_router(cards_router)
 app.include_router(line_router)
+app.include_router(system_router)
 
 
 @app.on_event("startup")

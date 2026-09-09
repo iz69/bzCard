@@ -59,6 +59,18 @@ type Session = {
   token: string;
 };
 
+type RuntimeVersions = {
+  ocr: {
+    version?: string | null;
+  };
+  llm: {
+    provider?: string;
+    model?: string;
+    status?: string;
+    server_version?: string | null;
+  };
+};
+
 type LiffProfile = {
   displayName?: string;
   pictureUrl?: string;
@@ -126,6 +138,7 @@ function App() {
   const [status, setStatus] = useState('');
   const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(false);
+  const [runtimeVersions, setRuntimeVersions] = useState<RuntimeVersions | null>(null);
   const listRequestRef = useRef(0);
 
   const authed = session.token.trim().length > 0;
@@ -191,6 +204,24 @@ function App() {
     };
   }, [api, authed, selectedId, selectedSummary?.updated_at]);
 
+  useEffect(() => {
+    if (!authed) {
+      setRuntimeVersions(null);
+      return;
+    }
+    let cancelled = false;
+    api.get('/api/system/versions')
+      .then((versions) => {
+        if (!cancelled) setRuntimeVersions(versions);
+      })
+      .catch(() => {
+        if (!cancelled) setRuntimeVersions(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [api, authed]);
+
   function saveSession(next: Session) {
     localStorage.setItem('bzcard.apiBase', next.apiBase);
     localStorage.setItem('bzcard.token', next.token);
@@ -206,7 +237,7 @@ function App() {
       <header className="topbar">
         <div>
           <h1>bzCard</h1>
-          <p>yomitoku + local LLM verification console</p>
+          <p>{runtimeVersionLabel(runtimeVersions)}</p>
         </div>
         <div className="topActions">
           <UploadPanel api={api} onUploaded={reload} onMessage={setMessage} />
@@ -297,6 +328,17 @@ function App() {
       </main>
     </div>
   );
+}
+
+function runtimeVersionLabel(versions: RuntimeVersions | null) {
+  if (!versions) return 'yomitoku + local LLM verification console';
+
+  const ocrVersion = versions.ocr?.version || 'unknown';
+  const provider = versions.llm?.provider || 'LLM';
+  const model = versions.llm?.model || 'model unknown';
+  const serverVersion = versions.llm?.server_version;
+  const service = serverVersion ? `${provider} ${serverVersion}` : `${provider} unavailable`;
+  return `yomitoku ${ocrVersion} + local LLM verification console · ${service} / ${model}`;
 }
 
 function LiffRegistration() {
