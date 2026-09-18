@@ -8,8 +8,8 @@ WebUIとLINE公式アカウント連携に対応しています。
 
 Androidネイティブアプリは開発済みですが、実際の使用感を試しつつ調整中です。
 
-現時点では個人利用を前提にした実装です。公開環境に置く場合は、必ずHTTPSと
-リバースプロキシ側の認証・アクセス制限を併用してください。
+各利用者はローカルID・パスワードでログインし、自身のLINE公式アカウントを設定できます。
+公開環境に置く場合は、必ずHTTPSとリバースプロキシ側のアクセス制限を併用してください。
 
 <img width="712" height="460" alt="1" src="https://github.com/user-attachments/assets/732272e4-e999-4ca4-881b-f7b64fe66c9b" />
 <img width="405" height="228" alt="2" src="https://github.com/user-attachments/assets/d76cc500-73fe-4ab1-9e20-8f5e94fa5a41" />
@@ -25,8 +25,8 @@ Androidネイティブアプリは開発済みですが、実際の使用感を�
 - Ollama上のローカルLLMによる項目抽出
 - 表面・裏面画像の管理
 - 画像ハッシュによる簡易重複検出
-- WebUI/API用のBearer token認証
-- LIFF + 招待コードによるLINE利用登録
+- ログインID・パスワードによるユーザー認証
+- ユーザーに紐付けたLINE公式アカウントからの名刺登録
 - SQLite保存
 - 名刺ではなさそうな画像を `not_card` として停止
 
@@ -56,10 +56,11 @@ Androidネイティブアプリは開発済みですが、実際の使用感を�
 cp .env.example .env
 ```
 
-最低限、`APP_API_TOKEN` は変更してください。
+利用者のログインはbzCardローカルアカウントで行います。初回にWebUIで管理者の
+ログインIDと12文字以上のパスワードを作成してください。既存の名刺はその管理者へ
+移行され、移行直前のDBバックアップも `data/bzcard-before-local-auth.db` に作成されます。
 
 ```env
-APP_API_TOKEN=replace-with-a-long-random-token
 LLM_PROVIDER=ollama
 LLM_MODEL=qwen2.5:7b
 GEMINI_API_KEY=
@@ -92,19 +93,14 @@ WebUIを開きます。
 http://localhost:15174/bzcard/
 ```
 
-ログイン時は `.env` に設定した `APP_API_TOKEN` をBearer tokenとして入力します。
+初回は管理者IDとパスワードを作成します。以後は、WebUIでは同じサーバのAPI URL、
+ログインID、パスワードでログインします。Androidも同じ認証情報を使います。
 
 ## 環境変数
 
 `docker-compose.yml` は `.env` から設定値を読みます。
 
-通常利用で最低限必要な設定:
-
-```env
-APP_API_TOKEN=replace-with-a-long-random-token
-```
-
-任意設定:
+OCR/LLMの任意設定:
 
 ```env
 LLM_PROVIDER=ollama
@@ -119,17 +115,40 @@ MAX_UPLOAD_MB=50
 - `ollama`: ローカルOllamaの `LLM_MODEL` を使います。
 - `gemini`: Gemini APIの `GEMINI_MODEL` を使います。`GEMINI_API_KEY` が必要です。
 
-LINE連携を使う場合:
+LINE公式アカウントの接続情報は、環境変数ではなくログイン後の「LINE設定」画面で、
+利用者ごとに保存します。設定する値はMessaging APIのチャネルシークレット／
+チャネルアクセストークン、LINE LoginチャネルID、LIFF URLです。
+
+## 利用者モード
+
+`.env` の `MULTI_USER_ENABLED` で、コンテナ再作成時に利用者モードを切り替えられます。
 
 ```env
-LINE_CHANNEL_SECRET=
-LINE_CHANNEL_ACCESS_TOKEN=
-LINE_LOGIN_CHANNEL_ID=
-LINE_LIFF_ID=
-LINE_LIFF_URL=
-LINE_INVITE_CODES=
-LINE_SESSION_TTL_HOURS=720
-LINE_CARD_SCOPE=personal
+# 管理者1名だけで使う（既定値）
+MULTI_USER_ENABLED=false
+
+# 管理者と一般利用者を使う
+MULTI_USER_ENABLED=true
+```
+
+`false` では管理者だけがログイン・名刺操作・公式LINE連携を利用できます。一般利用者の
+アカウント、名刺、公式LINE設定は削除されず、`true` に戻すと再び利用できます。既存の
+一般利用者セッションも、このモードではAPI利用を拒否されます。
+
+接続情報は暗号化してDBに保存され、画面から再表示されません。暗号化鍵を明示的に
+`LINE_CREDENTIALS_ENCRYPTION_KEY` として設定する場合は、DBバックアップと同じ安全な
+場所へ保管してください。未設定の場合も `data/line-credentials.key` が自動作成されるため、
+このファイルを `data/bzcard.db` と必ず一緒にバックアップしてください。
+
+```env
+LINE_CREDENTIALS_ENCRYPTION_KEY=
+SESSION_TTL_HOURS=720
+```
+
+LINE公式アカウント連携のWebhook URL:
+
+```env
+https://your-domain.example/bzcard-api/line/webhook
 ```
 
 ## nginx設定例
@@ -158,8 +177,11 @@ location /bzcard/ {
 
 ## API例
 
+通常APIは、ログイン後に発行される利用者セッショントークンをBearerとして指定します。
+共通のAPIトークンは使用しません。
+
 ```sh
-curl -H "Authorization: Bearer ${APP_API_TOKEN}" \
+curl -H "Authorization: Bearer ${BZCARD_SESSION_TOKEN}" \
   -F "file=@sample.jpg" \
   "http://localhost:18081/api/cards/upload?direction=auto"
 ```
@@ -171,10 +193,10 @@ curl -H "Authorization: Bearer ${APP_API_TOKEN}" \
 - `vertical`
 
 Androidなどのクライアントから、実際に名刺処理で使用するOCR/LLMのバージョンを確認できます。
-Bearer token認証が必要です。
+利用者セッションによるBearer認証が必要です。
 
 ```sh
-curl -H "Authorization: Bearer ${APP_API_TOKEN}" \
+curl -H "Authorization: Bearer ${BZCARD_SESSION_TOKEN}" \
   "http://localhost:18081/api/system/versions"
 ```
 
@@ -191,34 +213,18 @@ LINE公式アカウントのMessaging APIでWebhook URLに次を設定します�
 https://your-domain.example/bzcard-api/line/webhook
 ```
 
-LIFFのEndpoint URLは次にしてください。
-
-```text
-https://your-domain.example/bzcard/liff
-```
-
-必要な設定:
-
-- `LINE_CHANNEL_SECRET`: Messaging APIチャネルシークレット
-- `LINE_CHANNEL_ACCESS_TOKEN`: Messaging APIチャネルアクセストークン
-- `LINE_LOGIN_CHANNEL_ID`: LINE LoginチャネルID
-- `LINE_LIFF_ID`: LIFF ID
-- `LINE_LIFF_URL`: 例 `https://liff.line.me/LIFF_ID`
-- `LINE_INVITE_CODES`: カンマ区切りの招待コード
+公式LINEから名刺検索・名刺画像登録を行えるのは、そのbzCard利用者に紐付けたLINEアカウント
+だけです。LINE Loginチャネルを変更した場合は安全のため紐付けが解除されるため、設定画面から
+新しい紐付けURLを発行して再連携してください。
 
 LINE連携の流れ:
 
-1. ユーザーがLIFF登録画面を開く
-2. LIFFでLINE ID tokenを取得
-3. APIがLINEへID tokenを検証
-4. ユーザーが招待コードを入力
-5. `active` になったユーザーだけ公式アカウントへ名刺画像を送信できる
-6. Webhookが画像を受け取り、WebUIアップロードと同じ処理キューに投入する
+1. WebUIでローカル管理者アカウントを作成する
+2. そのサーバの `.env` に、利用者自身のLINE公式アカウントのMessaging API設定を入れる
+3. Webhookが画像を受け取り、紐付け済みローカルユーザーの処理キューに投入する
 
-`LINE_CARD_SCOPE`:
-
-- `personal`: activeなLINEユーザーは全名刺へアクセス可能。個人利用向け。
-- `owner`: LINE経由登録時の `owner_line_user_id` ごとにアクセスを分離。
+すべての名刺はbzCardローカルユーザーに紐付きます。別ユーザーの名刺は、一覧、
+検索、詳細、画像、更新、削除、ジョブ取得のいずれからも取得できません。
 
 ## 処理の流れ
 

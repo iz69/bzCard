@@ -5,10 +5,10 @@ from importlib.metadata import PackageNotFoundError, version
 import requests
 from fastapi import APIRouter, Depends
 
-from ..auth import require_token
+from ..auth import require_user
 from ..config import settings
 
-router = APIRouter(prefix="/api/system", dependencies=[Depends(require_token)])
+router = APIRouter(prefix="/api/system", dependencies=[Depends(require_user)])
 
 
 @router.get("/versions")

@@ -5,7 +5,7 @@ import shutil
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 
-from ..auth import require_token
+from ..auth import require_user
 from ..services import repository
 from ..services.image_store import (
     card_dir,
@@ -18,18 +18,19 @@ from ..services.image_store import (
     sha256_file,
 )
 
-router = APIRouter(prefix="/api", dependencies=[Depends(require_token)])
+router = APIRouter(prefix="/api")
 
 
 @router.post("/cards/upload")
 async def upload_card(
     file: UploadFile = File(...),
     direction: str = Query("auto", pattern="^(auto|horizontal|vertical)$"),
+    user: dict = Depends(require_user),
 ) -> dict:
     card_id = make_card_id()
     original = await save_original_upload(file, card_id)
     original_sha256 = sha256_file(original)
-    duplicate = repository.get_card_by_original_sha256(original_sha256)
+    duplicate = repository.get_user_owned_card_by_original_sha256(original_sha256, user["id"])
     if duplicate is not None:
         shutil.rmtree(card_dir(card_id), ignore_errors=True)
         return {
@@ -38,7 +39,13 @@ async def upload_card(
             "status": duplicate["status"],
             "duplicate": True,
         }
-    job_id = repository.create_card(card_id, relative_path(original), original_sha256, direction)
+    job_id = repository.create_card(
+        card_id,
+        relative_path(original),
+        original_sha256,
+        direction,
+        user["id"],
+    )
     return {"card_id": card_id, "job_id": job_id, "status": "queued"}
 
 
@@ -47,8 +54,9 @@ async def upload_back_image(
     card_id: str,
     file: UploadFile = File(...),
     direction: str = Query("auto", pattern="^(auto|horizontal|vertical)$"),
+    user: dict = Depends(require_user),
 ) -> dict:
-    card = repository.get_card(card_id)
+    card = repository.get_user_card(card_id, user["id"])
     if card is None:
         raise HTTPException(status_code=404, detail="Card not found")
     if repository.get_active_job(card_id) is not None:
@@ -56,7 +64,7 @@ async def upload_back_image(
 
     original = await save_original_upload(file, card_id, "back")
     original_sha256 = sha256_file(original)
-    duplicate = repository.get_card_by_original_sha256(original_sha256)
+    duplicate = repository.get_user_owned_card_by_original_sha256(original_sha256, user["id"])
     if duplicate is not None and duplicate["id"] != card_id:
         original.unlink(missing_ok=True)
         return {
@@ -73,30 +81,32 @@ async def upload_back_image(
 def list_cards(
     q: str | None = None,
     status: str | None = None,
+    user: dict = Depends(require_user),
 ) -> dict:
-    return {"items": repository.list_cards(q=q, status=status)}
+    return {"items": repository.list_user_cards(user["id"], q=q, status=status)}
 
 
 @router.get("/cards/{card_id}")
-def get_card(card_id: str) -> dict:
-    card = repository.get_card(card_id)
+def get_card(card_id: str, user: dict = Depends(require_user)) -> dict:
+    card = repository.get_user_card(card_id, user["id"])
     if card is None:
         raise HTTPException(status_code=404, detail="Card not found")
     return card
 
 
 @router.patch("/cards/{card_id}")
-def update_card(card_id: str, payload: dict) -> dict:
-    if repository.get_card(card_id) is None:
+def update_card(card_id: str, payload: dict, user: dict = Depends(require_user)) -> dict:
+    if repository.get_user_card(card_id, user["id"]) is None:
         raise HTTPException(status_code=404, detail="Card not found")
     card = repository.update_card_fields(card_id, payload)
     return card or {}
 
 
 @router.delete("/cards/{card_id}")
-def delete_card(card_id: str) -> dict:
-    if not repository.delete_card(card_id):
+def delete_card(card_id: str, user: dict = Depends(require_user)) -> dict:
+    if repository.get_user_card(card_id, user["id"]) is None:
         raise HTTPException(status_code=404, detail="Card not found")
+    repository.delete_card(card_id)
     shutil.rmtree(card_dir(card_id), ignore_errors=True)
     return {"status": "deleted"}
 
@@ -106,10 +116,11 @@ def rotate_card_image(
     card_id: str,
     side: str = Query("front", pattern="^(front|back)$"),
     degrees: int = Query(..., ge=-90, le=90),
+    user: dict = Depends(require_user),
 ) -> dict:
     if degrees not in {-90, 90}:
         raise HTTPException(status_code=400, detail="degrees must be -90 or 90")
-    card = repository.get_card(card_id)
+    card = repository.get_user_card(card_id, user["id"])
     if card is None:
         raise HTTPException(status_code=404, detail="Card not found")
     if repository.get_active_job(card_id) is not None:
@@ -158,8 +169,9 @@ def rotate_card_image(
 def reprocess_card(
     card_id: str,
     direction: str = Query("auto", pattern="^(auto|horizontal|vertical)$"),
+    user: dict = Depends(require_user),
 ) -> dict:
-    if repository.get_card(card_id) is None:
+    if repository.get_user_card(card_id, user["id"]) is None:
         raise HTTPException(status_code=404, detail="Card not found")
     active = repository.get_active_job(card_id)
     if active is not None:
@@ -171,8 +183,8 @@ def reprocess_card(
 
 
 @router.post("/cards/{card_id}/reextract")
-def reextract_card(card_id: str) -> dict:
-    if repository.get_card(card_id) is None:
+def reextract_card(card_id: str, user: dict = Depends(require_user)) -> dict:
+    if repository.get_user_card(card_id, user["id"]) is None:
         raise HTTPException(status_code=404, detail="Card not found")
     active = repository.get_active_job(card_id)
     if active is not None:
@@ -181,8 +193,8 @@ def reextract_card(card_id: str) -> dict:
     return {"job_id": job_id, "status": "queued"}
 
 
-def _image_response(card_id: str, field: str) -> FileResponse:
-    card = repository.get_card(card_id)
+def _image_response(card_id: str, field: str, user: dict) -> FileResponse:
+    card = repository.get_user_card(card_id, user["id"])
     if card is None:
         raise HTTPException(status_code=404, detail="Card not found")
     rel = card.get(field)
@@ -195,38 +207,38 @@ def _image_response(card_id: str, field: str) -> FileResponse:
 
 
 @router.get("/cards/{card_id}/original-image")
-def original_image(card_id: str) -> FileResponse:
-    return _image_response(card_id, "original_image_path")
+def original_image(card_id: str, user: dict = Depends(require_user)) -> FileResponse:
+    return _image_response(card_id, "original_image_path", user)
 
 
 @router.get("/cards/{card_id}/processed-image")
-def processed_image(card_id: str) -> FileResponse:
-    return _image_response(card_id, "processed_image_path")
+def processed_image(card_id: str, user: dict = Depends(require_user)) -> FileResponse:
+    return _image_response(card_id, "processed_image_path", user)
 
 
 @router.get("/cards/{card_id}/thumbnail")
-def thumbnail(card_id: str) -> FileResponse:
-    return _image_response(card_id, "thumbnail_path")
+def thumbnail(card_id: str, user: dict = Depends(require_user)) -> FileResponse:
+    return _image_response(card_id, "thumbnail_path", user)
 
 
 @router.get("/cards/{card_id}/back-original-image")
-def back_original_image(card_id: str) -> FileResponse:
-    return _image_response(card_id, "back_original_image_path")
+def back_original_image(card_id: str, user: dict = Depends(require_user)) -> FileResponse:
+    return _image_response(card_id, "back_original_image_path", user)
 
 
 @router.get("/cards/{card_id}/back-processed-image")
-def back_processed_image(card_id: str) -> FileResponse:
-    return _image_response(card_id, "back_processed_image_path")
+def back_processed_image(card_id: str, user: dict = Depends(require_user)) -> FileResponse:
+    return _image_response(card_id, "back_processed_image_path", user)
 
 
 @router.get("/cards/{card_id}/back-thumbnail")
-def back_thumbnail(card_id: str) -> FileResponse:
-    return _image_response(card_id, "back_thumbnail_path")
+def back_thumbnail(card_id: str, user: dict = Depends(require_user)) -> FileResponse:
+    return _image_response(card_id, "back_thumbnail_path", user)
 
 
 @router.get("/jobs/{job_id}")
-def get_job(job_id: str) -> dict:
-    job = repository.get_job(job_id)
+def get_job(job_id: str, user: dict = Depends(require_user)) -> dict:
+    job = repository.get_user_job(job_id, user["id"])
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return job

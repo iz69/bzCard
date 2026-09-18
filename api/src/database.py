@@ -20,6 +20,21 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
+def backup_before_local_auth() -> Path:
+    """Create one recoverable pre-migration snapshot without overwriting an existing one."""
+    backup_path = settings.data_dir / "bzcard-before-local-auth.db"
+    if backup_path.exists():
+        return backup_path
+    source = get_connection()
+    destination = sqlite3.connect(backup_path)
+    try:
+        source.backup(destination)
+    finally:
+        destination.close()
+        source.close()
+    return backup_path
+
+
 @contextmanager
 def connection() -> Iterator[sqlite3.Connection]:
     conn = get_connection()
@@ -77,6 +92,7 @@ def init_db() -> None:
                 ocr_duration_ms INTEGER,
                 extraction_duration_ms INTEGER,
                 error_message TEXT,
+                owner_user_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -95,7 +111,7 @@ def init_db() -> None:
         _ensure_column(conn, "cards", "source_id", "TEXT")
         _ensure_column(conn, "cards", "source_filename", "TEXT")
         _ensure_column(conn, "cards", "import_batch_id", "TEXT")
-        _ensure_column(conn, "cards", "owner_line_user_id", "TEXT")
+        _ensure_column(conn, "cards", "owner_user_id", "TEXT")
         _ensure_column(conn, "cards", "tags", "TEXT")
         conn.execute(
             """
@@ -156,7 +172,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS line_events (
                 id TEXT PRIMARY KEY,
                 event_type TEXT,
-                line_user_id TEXT,
+                line_sender_id TEXT,
                 message_id TEXT,
                 card_id TEXT REFERENCES cards(id) ON DELETE SET NULL,
                 status TEXT NOT NULL,
@@ -168,43 +184,74 @@ def init_db() -> None:
         )
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS line_users (
-                line_user_id TEXT PRIMARY KEY,
-                display_name TEXT,
-                picture_url TEXT,
-                status TEXT NOT NULL,
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                login_id TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                password_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
                 role TEXT NOT NULL DEFAULT 'user',
-                last_seen_at TEXT,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                last_seen_at TEXT
             )
             """
         )
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS line_sessions (
+            CREATE TABLE IF NOT EXISTS sessions (
                 token_hash TEXT PRIMARY KEY,
-                line_user_id TEXT NOT NULL REFERENCES line_users(line_user_id) ON DELETE CASCADE,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 expires_at TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 last_seen_at TEXT NOT NULL
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS line_connections (
+                id TEXT PRIMARY KEY,
+                owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+                line_user_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        _ensure_column(conn, "line_connections", "line_user_id", "TEXT")
+        _ensure_column(conn, "line_connections", "channel_secret_encrypted", "TEXT")
+        _ensure_column(conn, "line_connections", "access_token_encrypted", "TEXT")
+        _ensure_column(conn, "line_connections", "line_login_channel_id", "TEXT")
+        _ensure_column(conn, "line_connections", "liff_url", "TEXT")
+        _ensure_column(conn, "line_connections", "liff_id", "TEXT")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS line_link_requests (
+                token_hash TEXT PRIMARY KEY,
+                connection_id TEXT NOT NULL REFERENCES line_connections(id) ON DELETE CASCADE,
+                expires_at TEXT NOT NULL, created_at TEXT NOT NULL
+            )"""
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cards_status ON cards(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cards_original_sha256 ON cards(original_sha256)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cards_back_original_sha256 ON cards(back_original_sha256)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_cards_owner_line_user_id ON cards(owner_line_user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cards_owner_user_id ON cards(owner_user_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_card_images_card_id ON card_images(card_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_card_images_sha256 ON card_images(original_sha256)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_card_images_side ON card_images(side)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cards_import_batch_id ON cards(import_batch_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_line_events_message_id ON line_events(message_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_line_events_line_user_id ON line_events(line_user_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_line_users_status ON line_users(status)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_line_sessions_line_user_id ON line_sessions(line_user_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_line_sessions_expires_at ON line_sessions(expires_at)")
+        event_columns = {row["name"] for row in conn.execute("PRAGMA table_info(line_events)")}
+        if "line_sender_id" in event_columns:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_line_events_line_sender_id ON line_events(line_sender_id)")
+        else:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_line_events_line_user_id ON line_events(line_user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_line_connections_owner_user_id ON line_connections(owner_user_id)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_line_connections_line_user_id ON line_connections(line_user_id) WHERE line_user_id IS NOT NULL")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_line_connections_owner_user_id_unique ON line_connections(owner_user_id)")
         _backfill_original_hashes(conn)
         _backfill_card_images(conn)
 

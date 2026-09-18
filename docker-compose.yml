@@ -8,7 +8,6 @@ services:
     environment:
       - TZ=Asia/Tokyo
       - BASE_PATH=/bzcard-api
-      - APP_API_TOKEN=${APP_API_TOKEN:-change-me}
       - DATA_DIR=/data
       - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
       - LLM_BASE_URL=${LLM_BASE_URL:-http://bzcard-ollama:11434}
@@ -18,13 +17,11 @@ services:
       - OCR_DEVICE=cpu
       - YOMITOKU_LITE=true
       - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-50}
-      - LINE_CHANNEL_SECRET=${LINE_CHANNEL_SECRET:-}
-      - LINE_CHANNEL_ACCESS_TOKEN=${LINE_CHANNEL_ACCESS_TOKEN:-}
-      - LINE_LOGIN_CHANNEL_ID=${LINE_LOGIN_CHANNEL_ID:-}
-      - LINE_LIFF_URL=${LINE_LIFF_URL:-}
-      - LINE_INVITE_CODES=${LINE_INVITE_CODES:-}
-      - LINE_SESSION_TTL_HOURS=${LINE_SESSION_TTL_HOURS:-720}
-      - LINE_CARD_SCOPE=${LINE_CARD_SCOPE:-personal}
+      - MULTI_USER_ENABLED=${MULTI_USER_ENABLED:-false}
+      # Connector credentials are saved per bzCard user in the database.
+      # Keep this key together with the database backup if you set it explicitly.
+      - LINE_CREDENTIALS_ENCRYPTION_KEY=${LINE_CREDENTIALS_ENCRYPTION_KEY:-}
+      - SESSION_TTL_HOURS=${SESSION_TTL_HOURS:-720}
     volumes:
       - ./data:/data
     mem_limit: 3g
@@ -36,8 +33,6 @@ services:
       args:
         VITE_BASE_PATH: /bzcard/
         VITE_API_BASE_PATH: /bzcard-api
-        VITE_LIFF_ID: ${LINE_LIFF_ID:-}
-        VITE_LINE_LIFF_URL: ${LINE_LIFF_URL:-}
     ports:
       - "127.0.0.1:15174:5173"
     restart: unless-stopped

@@ -8,9 +8,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from .config import settings
 from .database import init_db
 from .routers.cards import router as cards_router
+from .routers.auth import router as auth_router
+from .routers.account import router as account_router
 from .routers.line import router as line_router
 from .routers.system import router as system_router
-from .services.repository import normalize_existing_company_names
+from .services.repository import backfill_line_connection_liff_ids, normalize_existing_company_names, restore_default_line_identity_from_backup
 from .worker import start_worker
 
 logging.basicConfig(
@@ -39,6 +41,8 @@ app.add_middleware(
 )
 
 app.include_router(cards_router)
+app.include_router(auth_router)
+app.include_router(account_router)
 app.include_router(line_router)
 app.include_router(system_router)
 
@@ -46,10 +50,15 @@ app.include_router(system_router)
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    if restore_default_line_identity_from_backup():
+        logger.info("restored the default LINE identity from the local-auth migration backup")
+    liff_backfilled = backfill_line_connection_liff_ids()
     normalized_count = normalize_existing_company_names()
     start_worker()
     if normalized_count:
         logger.info("normalized %s company names", normalized_count)
+    if liff_backfilled:
+        logger.info("backfilled LIFF IDs for %s LINE connector(s)", liff_backfilled)
     logger.info("bzcard initialized at %s", settings.data_dir)
 
 

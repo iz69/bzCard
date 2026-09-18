@@ -3,11 +3,16 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+import hashlib
+import secrets
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from ..config import settings
 from ..database import connection, get_connection, row_to_dict
 from .timeutil import now_iso
+from .secret_store import encrypt, decrypt
 
 
 CARD_FIELDS = {
@@ -177,17 +182,24 @@ def _apply_image_to_card(card: dict, image: dict) -> None:
         card[f"{prefix}{field}"] = image.get(field)
 
 
-def create_card(card_id: str, original_image_path: str, original_sha256: str, direction: str) -> str:
+def create_card(
+    card_id: str,
+    original_image_path: str,
+    original_sha256: str,
+    direction: str,
+    owner_user_id: str,
+) -> str:
     now = now_iso()
     job_id = uuid4().hex
     with connection() as conn:
         conn.execute(
             """
             INSERT INTO cards (
-                id, status, original_image_path, original_sha256, ocr_direction, created_at, updated_at
-            ) VALUES (?, 'queued', ?, ?, ?, ?, ?)
+                id, status, original_image_path, original_sha256, ocr_direction,
+                owner_user_id, created_at, updated_at
+            ) VALUES (?, 'queued', ?, ?, ?, ?, ?, ?)
             """,
-            (card_id, original_image_path, original_sha256, direction, now, now),
+            (card_id, original_image_path, original_sha256, direction, owner_user_id, now, now),
         )
         _upsert_card_image(conn, card_id, "front", original_image_path, original_sha256, direction)
         conn.execute(
@@ -221,16 +233,7 @@ def set_card_source(
         )
 
 
-def set_card_owner(card_id: str, owner_line_user_id: str) -> None:
-    now = now_iso()
-    with connection() as conn:
-        conn.execute(
-            "UPDATE cards SET owner_line_user_id = ?, updated_at = ? WHERE id = ?",
-            (owner_line_user_id, now, card_id),
-        )
-
-
-def get_line_owned_card_by_original_sha256(original_sha256: str, line_user_id: str) -> dict | None:
+def get_user_owned_card_by_original_sha256(original_sha256: str, user_id: str) -> dict | None:
     if not original_sha256:
         return None
     with get_connection() as conn:
@@ -240,11 +243,11 @@ def get_line_owned_card_by_original_sha256(original_sha256: str, line_user_id: s
             FROM cards
             JOIN card_images ON card_images.card_id = cards.id
             WHERE card_images.original_sha256 = ?
-              AND cards.owner_line_user_id = ?
+              AND cards.owner_user_id = ?
             ORDER BY cards.created_at ASC
             LIMIT 1
             """,
-            (original_sha256, line_user_id),
+            (original_sha256, user_id),
         ).fetchone()
         return _hydrate_card(conn, row)
 
@@ -252,18 +255,20 @@ def get_line_owned_card_by_original_sha256(original_sha256: str, line_user_id: s
 def claim_line_event(
     event_id: str,
     event_type: str | None,
-    line_user_id: str | None,
+    line_sender_id: str | None,
     message_id: str | None,
 ) -> bool:
     now = now_iso()
     with connection() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(line_events)")}
+        sender_column = "line_sender_id" if "line_sender_id" in columns else "line_user_id"
         cursor = conn.execute(
-            """
+            f"""
             INSERT OR IGNORE INTO line_events (
-                id, event_type, line_user_id, message_id, status, created_at, updated_at
+                id, event_type, {sender_column}, message_id, status, created_at, updated_at
             ) VALUES (?, ?, ?, ?, 'received', ?, ?)
             """,
-            (event_id, event_type, line_user_id, message_id, now, now),
+            (event_id, event_type, line_sender_id, message_id, now, now),
         )
         return cursor.rowcount > 0
 
@@ -284,114 +289,315 @@ def finish_line_event(event_id: str, status: str, card_id: str | None = None, er
         )
 
 
-def get_line_user(line_user_id: str) -> dict | None:
+def has_users() -> bool:
+    with get_connection() as conn:
+        return conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
+
+
+def get_user_by_login_id(login_id: str) -> dict | None:
     with get_connection() as conn:
         return row_to_dict(
-            conn.execute(
-                "SELECT * FROM line_users WHERE line_user_id = ?",
-                (line_user_id,),
-            ).fetchone()
+            conn.execute("SELECT * FROM users WHERE login_id = ?", (login_id,)).fetchone()
         )
 
 
-def upsert_line_user_profile(
-    line_user_id: str,
-    display_name: str | None,
-    picture_url: str | None,
-) -> dict:
+def get_user_by_id(user_id: str) -> dict | None:
+    with get_connection() as conn:
+        return row_to_dict(conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone())
+
+
+def list_users() -> list[dict]:
+    with get_connection() as conn:
+        return [dict(row) for row in conn.execute("SELECT * FROM users ORDER BY created_at")]
+
+
+def create_user(login_id: str, password_hash: str, role: str = "user") -> dict:
+    user_id = uuid4().hex
+    now = now_iso()
+    try:
+        with connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO users (id, login_id, password_hash, status, role, created_at, updated_at)
+                VALUES (?, ?, ?, 'active', ?, ?, ?)
+                """,
+                (user_id, login_id, password_hash, role, now, now),
+            )
+    except Exception as exc:
+        if "UNIQUE constraint failed" in str(exc):
+            raise ValueError("このログインIDはすでに使われています") from exc
+        raise
+    return get_user_by_login_id(login_id) or {}
+
+
+def bootstrap_first_user(login_id: str, password_hash: str) -> dict:
+    """Create the local administrator and atomically claim every pre-local-auth card.
+
+    The schema cleanup is intentionally delayed until this point: a pre-existing
+    installation remains usable for rollback until the administrator explicitly
+    completes setup.
+    """
+    if has_users():
+        raise ValueError("Initial setup is already complete")
+    user_id = uuid4().hex
     now = now_iso()
     with connection() as conn:
+        existing = conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()["count"]
+        if existing:
+            raise ValueError("Initial setup is already complete")
         conn.execute(
             """
-            INSERT INTO line_users (
-                line_user_id, display_name, picture_url, status, role, last_seen_at, created_at, updated_at
-            ) VALUES (?, ?, ?, 'pending', 'user', ?, ?, ?)
-            ON CONFLICT(line_user_id) DO UPDATE SET
-                display_name = excluded.display_name,
-                picture_url = excluded.picture_url,
-                last_seen_at = excluded.last_seen_at,
-                updated_at = excluded.updated_at
+            INSERT INTO users (id, login_id, password_hash, status, role, created_at, updated_at)
+            VALUES (?, ?, ?, 'active', 'admin', ?, ?)
             """,
-            (line_user_id, display_name, picture_url, now, now, now),
+            (user_id, login_id, password_hash, now, now),
         )
-        return dict(
-            conn.execute(
-                "SELECT * FROM line_users WHERE line_user_id = ?",
-                (line_user_id,),
-            ).fetchone()
-        )
-
-
-def activate_line_user(line_user_id: str) -> dict:
-    now = now_iso()
-    with connection() as conn:
+        missing = conn.execute(
+            "SELECT COUNT(*) AS count FROM cards WHERE owner_user_id IS NULL OR owner_user_id = ''"
+        ).fetchone()["count"]
+        if missing:
+            updated = conn.execute(
+                "UPDATE cards SET owner_user_id = ?, updated_at = ? WHERE owner_user_id IS NULL OR owner_user_id = ''",
+                (user_id, now),
+            ).rowcount
+            if updated != missing:
+                raise RuntimeError("既存名刺の所有者移行を完了できませんでした")
         conn.execute(
             """
-            UPDATE line_users
-            SET status = 'active',
-                last_seen_at = ?,
-                updated_at = ?
-            WHERE line_user_id = ?
+            INSERT INTO line_connections (id, owner_user_id, created_at, updated_at)
+            VALUES ('default', ?, ?, ?)
             """,
-            (now, now, line_user_id),
+            (user_id, now, now),
         )
-        return dict(
-            conn.execute(
-                "SELECT * FROM line_users WHERE line_user_id = ?",
-                (line_user_id,),
-            ).fetchone()
-        )
+        _remove_legacy_line_auth_schema(conn)
+    return get_user_by_login_id(login_id) or {}
 
 
-def create_line_session(token_hash: str, line_user_id: str, expires_at: str) -> None:
+def _remove_legacy_line_auth_schema(conn) -> None:
+    """Remove only obsolete LINE-login schema after all cards have local owners."""
+    legacy_card_column = any(
+        row["name"] == "owner_line_user_id" for row in conn.execute("PRAGMA table_info(cards)")
+    )
+    if legacy_card_column:
+        conn.execute("DROP INDEX IF EXISTS idx_cards_owner_line_user_id")
+        conn.execute("ALTER TABLE cards DROP COLUMN owner_line_user_id")
+    if any(row["name"] == "line_user_id" for row in conn.execute("PRAGMA table_info(line_events)")):
+        conn.execute("DROP INDEX IF EXISTS idx_line_events_line_user_id")
+        conn.execute("ALTER TABLE line_events RENAME COLUMN line_user_id TO line_sender_id")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_line_events_line_sender_id ON line_events(line_sender_id)")
+    conn.execute("DROP TABLE IF EXISTS line_sessions")
+    conn.execute("DROP TABLE IF EXISTS line_users")
+
+
+def create_session(token_hash: str, user_id: str, expires_at: str) -> None:
     now = now_iso()
     with connection() as conn:
         conn.execute(
             """
-            INSERT INTO line_sessions (token_hash, line_user_id, expires_at, created_at, last_seen_at)
+            INSERT INTO sessions (token_hash, user_id, expires_at, created_at, last_seen_at)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (token_hash, line_user_id, expires_at, now, now),
+            (token_hash, user_id, expires_at, now, now),
         )
 
 
-def get_line_session_user(token_hash: str, now: str) -> dict | None:
+def get_session_user(token_hash: str, now: str) -> dict | None:
     with connection() as conn:
         row = conn.execute(
             """
-            SELECT line_users.*
-            FROM line_sessions
-            JOIN line_users ON line_users.line_user_id = line_sessions.line_user_id
-            WHERE line_sessions.token_hash = ?
-              AND line_sessions.expires_at > ?
-              AND line_users.status = 'active'
+            SELECT users.*
+            FROM sessions
+            JOIN users ON users.id = sessions.user_id
+            WHERE sessions.token_hash = ? AND sessions.expires_at > ? AND users.status = 'active'
             """,
             (token_hash, now),
         ).fetchone()
         if row is None:
             return None
+        conn.execute("UPDATE sessions SET last_seen_at = ? WHERE token_hash = ?", (now, token_hash))
         conn.execute(
-            """
-            UPDATE line_sessions
-            SET last_seen_at = ?
-            WHERE token_hash = ?
-            """,
-            (now, token_hash),
-        )
-        conn.execute(
-            """
-            UPDATE line_users
-            SET last_seen_at = ?, updated_at = ?
-            WHERE line_user_id = ?
-            """,
-            (now, now, row["line_user_id"]),
+            "UPDATE users SET last_seen_at = ?, updated_at = ? WHERE id = ?",
+            (now, now, row["id"]),
         )
         return dict(row)
 
 
-def delete_line_session(token_hash: str) -> None:
+def delete_session(token_hash: str) -> None:
     with connection() as conn:
-        conn.execute("DELETE FROM line_sessions WHERE token_hash = ?", (token_hash,))
+        conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
+
+
+def change_user_password(user_id: str, password_hash: str) -> None:
+    """Replace a password and invalidate every existing session atomically."""
+    now = now_iso()
+    with connection() as conn:
+        conn.execute(
+            "UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?",
+            (password_hash, now, user_id),
+        )
+        conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+
+
+def get_default_line_connection() -> dict | None:
+    with get_connection() as conn:
+        return row_to_dict(
+            conn.execute("SELECT * FROM line_connections WHERE id = 'default'").fetchone()
+        )
+
+
+def restore_default_line_identity_from_backup() -> bool:
+    """Recover the one previous LINE identity only when migration backup is unambiguous."""
+    backup_path = settings.data_dir / "bzcard-before-local-auth.db"
+    if not backup_path.exists():
+        return False
+    with connection() as conn:
+        current = conn.execute("SELECT * FROM line_connections WHERE id = 'default'").fetchone()
+        if current is None or current["line_user_id"]:
+            return False
+        import sqlite3
+
+        backup = sqlite3.connect(backup_path)
+        try:
+            rows = backup.execute(
+                "SELECT line_user_id FROM line_users WHERE status = 'active' ORDER BY created_at"
+            ).fetchall()
+        except sqlite3.Error:
+            return False
+        finally:
+            backup.close()
+        if len(rows) != 1 or not rows[0][0]:
+            return False
+        conn.execute(
+            "UPDATE line_connections SET line_user_id = ?, updated_at = ? WHERE id = 'default'",
+            (rows[0][0], now_iso()),
+        )
+        return True
+
+
+def set_default_line_connection_owner(user_id: str) -> None:
+    now = now_iso()
+    with connection() as conn:
+        conn.execute(
+            "UPDATE line_connections SET owner_user_id = ?, updated_at = ? WHERE id = 'default'",
+            (user_id, now),
+        )
+
+
+def get_user_line_connection(user_id: str) -> dict | None:
+    with get_connection() as conn:
+        return row_to_dict(conn.execute("SELECT * FROM line_connections WHERE owner_user_id = ?", (user_id,)).fetchone())
+
+
+def list_line_connections() -> list[dict]:
+    with get_connection() as conn:
+        return [dict(row) for row in conn.execute("SELECT * FROM line_connections").fetchall()]
+
+
+def get_line_connection(connection_id: str) -> dict | None:
+    with get_connection() as conn:
+        return row_to_dict(conn.execute("SELECT * FROM line_connections WHERE id = ?", (connection_id,)).fetchone())
+
+
+def public_line_connection(row: dict | None) -> dict | None:
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "line_user_id_linked": bool(row.get("line_user_id")),
+        "line_login_channel_id": row.get("line_login_channel_id") or "",
+        "liff_url": row.get("liff_url") or "",
+        "configured": bool(row.get("channel_secret_encrypted") and row.get("access_token_encrypted")),
+    }
+
+
+def public_liff_configuration(connection_id: str) -> dict | None:
+    """Return only the LIFF application identifier needed by its public web client."""
+    row = get_line_connection(connection_id)
+    if row is None or not row.get("liff_id") or not row.get("line_login_channel_id"):
+        return None
+    return {"connection_id": row["id"], "liff_id": row["liff_id"]}
+
+
+def _liff_id_from_url(value: str) -> str:
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return ""
+    if parsed.scheme != "https" or parsed.hostname != "liff.line.me":
+        return ""
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) != 1 or not re.fullmatch(r"[0-9A-Za-z-]{1,128}", parts[0]):
+        return ""
+    return parts[0]
+
+
+def save_user_line_connection(user_id: str, payload: dict) -> dict:
+    current = get_user_line_connection(user_id)
+    now = now_iso()
+    channel_secret = str(payload.get("channel_secret") or "").strip()
+    access_token = str(payload.get("access_token") or "").strip()
+    login_channel_id = str(payload.get("line_login_channel_id") or "").strip()
+    liff_url = str(payload.get("liff_url") or "").strip()
+    liff_id = _liff_id_from_url(liff_url)
+    if not login_channel_id or not liff_url:
+        raise ValueError("LINE LoginチャネルIDとLIFF URLを入力してください")
+    if not liff_id:
+        raise ValueError("LIFF URLには https://liff.line.me/ で始まるLIFF URLを入力してください")
+    if current is None:
+        if not channel_secret or not access_token:
+            raise ValueError("チャネルシークレットとアクセストークンを入力してください")
+        connection_id = secrets.token_hex(16)
+        with connection() as conn:
+            conn.execute("INSERT INTO line_connections (id, owner_user_id, channel_secret_encrypted, access_token_encrypted, line_login_channel_id, liff_url, liff_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (connection_id, user_id, encrypt(channel_secret), encrypt(access_token), login_channel_id, liff_url, liff_id, now, now))
+    else:
+        with connection() as conn:
+            identity_changed = current.get("line_login_channel_id") != login_channel_id
+            conn.execute(
+                "UPDATE line_connections SET channel_secret_encrypted = COALESCE(?, channel_secret_encrypted), access_token_encrypted = COALESCE(?, access_token_encrypted), line_login_channel_id = ?, liff_url = ?, liff_id = ?, line_user_id = CASE WHEN ? THEN NULL ELSE line_user_id END, updated_at = ? WHERE id = ?",
+                (encrypt(channel_secret) if channel_secret else None, encrypt(access_token) if access_token else None, login_channel_id, liff_url, liff_id, identity_changed, now, current["id"]),
+            )
+            if identity_changed:
+                conn.execute("DELETE FROM line_link_requests WHERE connection_id = ?", (current["id"],))
+    return get_user_line_connection(user_id) or {}
+
+
+def connection_credentials(connection: dict) -> tuple[str, str]:
+    return decrypt(connection.get("channel_secret_encrypted")), decrypt(connection.get("access_token_encrypted"))
+
+
+def create_line_link_request(connection_id: str) -> tuple[str, str]:
+    token = secrets.token_urlsafe(32)
+    now = now_iso(); expires = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(timespec="seconds")
+    with connection() as conn:
+        conn.execute("INSERT INTO line_link_requests (token_hash, connection_id, expires_at, created_at) VALUES (?, ?, ?, ?)", (hashlib.sha256(token.encode()).hexdigest(), connection_id, expires, now))
+    return token, expires
+
+
+def consume_line_link_request(token: str, connection_id: str) -> bool:
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    with connection() as conn:
+        row = conn.execute("SELECT * FROM line_link_requests WHERE token_hash = ? AND connection_id = ? AND expires_at > ?", (digest, connection_id, now_iso())).fetchone()
+        if row is None: return False
+        conn.execute("DELETE FROM line_link_requests WHERE token_hash = ?", (digest,))
+        return True
+
+
+def bind_line_identity(connection_id: str, line_user_id: str) -> None:
+    with connection() as conn:
+        conn.execute("UPDATE line_connections SET line_user_id = ?, updated_at = ? WHERE id = ?", (line_user_id, now_iso(), connection_id))
+
+
+def backfill_line_connection_liff_ids() -> int:
+    """Populate the explicit LIFF ID for connectors saved before multi-user LIFF support."""
+    updated = 0
+    with connection() as conn:
+        rows = conn.execute("SELECT id, liff_url FROM line_connections WHERE (liff_id IS NULL OR liff_id = '') AND liff_url IS NOT NULL").fetchall()
+        for row in rows:
+            liff_id = _liff_id_from_url(row["liff_url"])
+            if liff_id:
+                conn.execute("UPDATE line_connections SET liff_id = ?, updated_at = ? WHERE id = ?", (liff_id, now_iso(), row["id"]))
+                updated += 1
+    return updated
 
 
 def get_card_by_original_sha256(original_sha256: str) -> dict | None:
@@ -513,10 +719,10 @@ def get_card(card_id: str) -> dict | None:
         )
 
 
-def list_line_user_cards(line_user_id: str, q: str | None = None, status: str | None = None) -> list[dict]:
+def list_user_cards(user_id: str, q: str | None = None, status: str | None = None) -> list[dict]:
     sql = "SELECT * FROM cards"
-    where = ["owner_line_user_id = ?"]
-    params: list[str] = [line_user_id]
+    where = ["owner_user_id = ?"]
+    params: list[str] = [user_id]
     if status:
         where.append("status = ?")
         params.append(status)
@@ -532,13 +738,13 @@ def list_line_user_cards(line_user_id: str, q: str | None = None, status: str | 
         return _cards_from_rows(conn, rows, q)
 
 
-def get_line_user_card(card_id: str, line_user_id: str) -> dict | None:
+def get_user_card(card_id: str, user_id: str) -> dict | None:
     with get_connection() as conn:
         return _hydrate_card(
             conn,
             conn.execute(
-                "SELECT * FROM cards WHERE id = ? AND owner_line_user_id = ?",
-                (card_id, line_user_id),
+                "SELECT * FROM cards WHERE id = ? AND owner_user_id = ?",
+                (card_id, user_id),
             ).fetchone(),
         )
 
@@ -572,6 +778,22 @@ def get_card_image(card_id: str, side: str) -> dict | None:
 def get_job(job_id: str) -> dict | None:
     with get_connection() as conn:
         return row_to_dict(conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone())
+
+
+def get_user_job(job_id: str, user_id: str) -> dict | None:
+    """Return a job only when its card belongs to the requesting user."""
+    with get_connection() as conn:
+        return row_to_dict(
+            conn.execute(
+                """
+                SELECT jobs.*
+                FROM jobs
+                JOIN cards ON cards.id = jobs.card_id
+                WHERE jobs.id = ? AND cards.owner_user_id = ?
+                """,
+                (job_id, user_id),
+            ).fetchone()
+        )
 
 
 def update_card_fields(card_id: str, data: dict) -> dict | None:

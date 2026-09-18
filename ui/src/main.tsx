@@ -5,15 +5,14 @@ import {
   ArrowDownUp,
   CheckCircle2,
   FileJson,
-  KeyRound,
   Loader2,
   MapPin,
+  MoreVertical,
   RefreshCcw,
   RotateCcw,
   RotateCw,
   Save,
   Search,
-  Send,
   ShieldCheck,
   Trash2,
   Upload,
@@ -91,7 +90,6 @@ declare global {
 }
 
 const defaultApiBase = import.meta.env.VITE_API_BASE_PATH || '/bzcard-api';
-const configuredLiffId = import.meta.env.VITE_LIFF_ID || liffIdFromUrl(import.meta.env.VITE_LINE_LIFF_URL || '');
 const fields: Array<[keyof Card, string]> = [
   ['person_name', '氏名'],
   ['person_name_kana', 'かな'],
@@ -117,11 +115,12 @@ const wideFieldKeys = new Set<keyof Card>([
   'memo',
 ]);
 const rowBreakFieldKeys = new Set<keyof Card>(['postal_code', 'mobile', 'tel']);
+const terminalCardStatuses = new Set(['ready', 'not_card', 'error']);
 
 function loadSession(): Session {
   return {
     apiBase: localStorage.getItem('bzcard.apiBase') || defaultApiBase,
-    token: localStorage.getItem('bzcard.token') || '',
+    token: localStorage.getItem('bzcard.sessionToken') || '',
   };
 }
 
@@ -136,12 +135,25 @@ function App() {
   const [selectedDetail, setSelectedDetail] = useState<Card | undefined>();
   const [query, setQuery] = useState('');
   const [status, setStatus] = useState('');
-  const [message, setMessage] = useState('');
+  const [toast, setToast] = useState<{ id: number; text: string } | null>(null);
   const [loading, setLoading] = useState(false);
   const [runtimeVersions, setRuntimeVersions] = useState<RuntimeVersions | null>(null);
+  const [currentUser, setCurrentUser] = useState<{ login_id: string; role: string; multiUserEnabled: boolean } | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [usersOpen, setUsersOpen] = useState(false);
+  const [passwordChangeOpen, setPasswordChangeOpen] = useState(false);
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const listRequestRef = useRef(0);
+  const accountMenuRef = useRef<HTMLDivElement>(null);
+  const toastIdRef = useRef(0);
+
+  const showToast = useCallback((text: string) => {
+    toastIdRef.current += 1;
+    setToast({ id: toastIdRef.current, text });
+  }, []);
 
   const authed = session.token.trim().length > 0;
+  const hasInProgressCards = cards.some((card) => !terminalCardStatuses.has(card.status));
   const selectedSummary = selectedId ? cards.find((card) => card.id === selectedId) : undefined;
   const selected = selectedDetail?.id === selectedId ? selectedDetail : selectedSummary;
 
@@ -168,23 +180,31 @@ function App() {
       });
     } catch (error) {
       if (requestId === listRequestRef.current) {
-        setMessage(errorMessage(error));
+        const text = errorMessage(error);
+        showToast(text);
+        if (text.includes('シングルユーザーモード')) {
+          saveSession({ apiBase: session.apiBase, token: '' });
+        }
       }
     } finally {
       if (requestId === listRequestRef.current) {
         setLoading(false);
       }
     }
-  }, [api, authed, query, status]);
+  }, [api, authed, query, session.apiBase, showToast, status]);
 
   useEffect(() => {
     reload();
-    const timer = window.setInterval(reload, 5000);
     return () => {
       listRequestRef.current += 1;
-      window.clearInterval(timer);
     };
   }, [reload]);
+
+  useEffect(() => {
+    if (!authed || !hasInProgressCards) return;
+    const timer = window.setInterval(reload, 5000);
+    return () => window.clearInterval(timer);
+  }, [authed, hasInProgressCards, reload]);
 
   useEffect(() => {
     if (!authed || !selectedId) {
@@ -197,12 +217,18 @@ function App() {
         if (!cancelled) setSelectedDetail(card);
       })
       .catch((error) => {
-        if (!cancelled) setMessage(errorMessage(error));
+        if (!cancelled) showToast(errorMessage(error));
       });
     return () => {
       cancelled = true;
     };
-  }, [api, authed, selectedId, selectedSummary?.updated_at]);
+  }, [api, authed, selectedId, selectedSummary?.updated_at, showToast]);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = window.setTimeout(() => setToast(null), 5_000);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
 
   useEffect(() => {
     if (!authed) {
@@ -222,14 +248,44 @@ function App() {
     };
   }, [api, authed]);
 
+  useEffect(() => {
+    if (!authed) return;
+    api.get('/api/auth/me')
+      .then((r) => setCurrentUser({ ...r.user, multiUserEnabled: Boolean(r.multi_user_enabled) }))
+      .catch(() => setCurrentUser(null));
+  }, [api, authed]);
+
+  useEffect(() => {
+    if (!accountMenuOpen) return;
+    const closeOnOutsideClick = (event: MouseEvent) => {
+      if (!accountMenuRef.current?.contains(event.target as Node)) setAccountMenuOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setAccountMenuOpen(false);
+    };
+    document.addEventListener('mousedown', closeOnOutsideClick);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('mousedown', closeOnOutsideClick);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [accountMenuOpen]);
+
   function saveSession(next: Session) {
     localStorage.setItem('bzcard.apiBase', next.apiBase);
-    localStorage.setItem('bzcard.token', next.token);
+    localStorage.removeItem('bzcard.token');
+    localStorage.removeItem('bzcard.lineSessionToken');
+    localStorage.removeItem('bzcard.lineSessionExpiresAt');
+    if (next.token) {
+      localStorage.setItem('bzcard.sessionToken', next.token);
+    } else {
+      localStorage.removeItem('bzcard.sessionToken');
+    }
     setSession(next);
   }
 
   if (!authed) {
-    return <Login initial={session} onSave={saveSession} />;
+    return <Login onLoggedIn={saveSession} />;
   }
 
   return (
@@ -240,30 +296,47 @@ function App() {
           <p>{runtimeVersionLabel(runtimeVersions)}</p>
         </div>
         <div className="topActions">
-          <UploadPanel api={api} onUploaded={reload} onMessage={setMessage} />
+          <UploadPanel api={api} onUploaded={reload} onMessage={showToast} />
           <button className="iconButton" onClick={reload} title="再読み込み">
             {loading ? <Loader2 className="spin" /> : <RefreshCcw />}
           </button>
-          <button
-            className="textButton"
-            onClick={() => saveSession({ ...session, token: '' })}
-          >
-            ログアウト
-          </button>
+          <div className="accountMenu" ref={accountMenuRef}>
+            <button
+              className="iconButton"
+              onClick={() => setAccountMenuOpen((open) => !open)}
+              title="メニュー"
+              aria-label="メニュー"
+              aria-expanded={accountMenuOpen}
+            >
+              <MoreVertical />
+            </button>
+            {accountMenuOpen && (
+              <div className="accountMenuPanel" role="menu">
+                <button role="menuitem" onClick={() => { setPasswordChangeOpen(true); setAccountMenuOpen(false); }}>パスワード変更</button>
+                <button role="menuitem" onClick={() => { setSettingsOpen(true); setAccountMenuOpen(false); }}>LINE設定</button>
+                {currentUser?.role === 'admin' && currentUser.multiUserEnabled && (
+                  <button role="menuitem" onClick={() => { setUsersOpen(true); setAccountMenuOpen(false); }}>利用者一覧・追加</button>
+                )}
+                <div className="accountMenuDivider" />
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    setAccountMenuOpen(false);
+                    api.post('/api/auth/logout', {})
+                      .catch(() => undefined)
+                      .finally(() => saveSession({ apiBase: session.apiBase, token: '' }));
+                  }}
+                >
+                  ログアウト
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </header>
 
       <main className="workspace">
         <section className="leftPane">
-          {message && (
-            <div className="messagePanel">
-              <pre>{message}</pre>
-              <button className="iconButton" onClick={() => setMessage('')} title="閉じる">
-                ×
-              </button>
-            </div>
-          )}
-
           <div className="filterBar">
             <label className="searchBox">
               <Search size={16} />
@@ -319,13 +392,28 @@ function App() {
               api={api}
               card={selected}
               onChanged={reload}
-              onMessage={setMessage}
+              onMessage={showToast}
             />
           ) : (
             <div className="empty">名刺がありません</div>
           )}
         </section>
       </main>
+      {toast && (
+        <div className="toastNotification" role="status" aria-live="polite">
+          <span>{toast.text}</span>
+          <button type="button" onClick={() => setToast(null)} aria-label="閉じる">×</button>
+        </div>
+      )}
+      {passwordChangeOpen && (
+        <PasswordChange
+          api={api}
+          onClose={() => setPasswordChangeOpen(false)}
+          onChanged={() => saveSession({ apiBase: session.apiBase, token: '' })}
+        />
+      )}
+      {settingsOpen && <LineSettings api={api} onClose={() => setSettingsOpen(false)} />}
+      {usersOpen && <UserManager api={api} onClose={() => setUsersOpen(false)} />}
     </div>
   );
 }
@@ -343,13 +431,12 @@ function runtimeVersionLabel(versions: RuntimeVersions | null) {
 
 function LiffRegistration() {
   const targetCardId = getLiffTargetCardId();
+  const connectionId = getLiffParameter('connection');
+  const linkToken = getLiffParameter('link');
   const [profile, setProfile] = useState<LiffProfile | null>(null);
-  const [idToken, setIdToken] = useState('');
-  const [lineSessionToken, setLineSessionToken] = useState(localStorage.getItem('bzcard.lineSessionToken') || '');
-  const [inviteCode, setInviteCode] = useState('');
-  const [status, setStatus] = useState<'loading' | 'needsInvite' | 'active' | 'error'>('loading');
+  const [lineSessionToken, setLineSessionToken] = useState('');
+  const [status, setStatus] = useState<'loading' | 'active' | 'error'>('loading');
   const [message, setMessage] = useState('LINE認証を確認しています');
-  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     document.body.classList.add('liffBody');
@@ -363,28 +450,15 @@ function LiffRegistration() {
 
     async function init() {
       try {
-        const savedToken = localStorage.getItem('bzcard.lineSessionToken') || '';
-        if (savedToken) {
-          try {
-            await getLineMe(savedToken);
-            if (cancelled) return;
-            setLineSessionToken(savedToken);
-            setStatus('active');
-            setMessage('利用登録済みです');
-            return;
-          } catch {
-            localStorage.removeItem('bzcard.lineSessionToken');
-            localStorage.removeItem('bzcard.lineSessionExpiresAt');
-          }
+        if (!connectionId) {
+          throw new Error('LIFF接続先が指定されていません。公式LINEから届いたリンクを開いてください。');
         }
-        if (!configuredLiffId) {
-          throw new Error('LIFF IDが設定されていません');
-        }
+        const config = await getLiffConfig(connectionId);
         await loadLiffSdk();
         if (!window.liff) {
           throw new Error('LIFF SDKを読み込めませんでした');
         }
-        await window.liff.init({ liffId: configuredLiffId });
+        await window.liff.init({ liffId: config.liff_id });
         if (!window.liff.isLoggedIn()) {
           window.liff.login({ redirectUri: window.location.href });
           return;
@@ -396,8 +470,14 @@ function LiffRegistration() {
         const nextProfile = await window.liff.getProfile();
         if (cancelled) return;
         setProfile(nextProfile);
-        setIdToken(token);
-        await loginWithLine(token, '');
+        const result = await postLineLogin(token, connectionId, linkToken);
+        if (!result.session_token) {
+          throw new Error('bzCardセッションを開始できませんでした');
+        }
+        if (cancelled) return;
+        setLineSessionToken(result.session_token);
+        setStatus('active');
+        setMessage('認証済みです');
       } catch (error) {
         if (cancelled) return;
         setStatus('error');
@@ -405,49 +485,11 @@ function LiffRegistration() {
       }
     }
 
-    async function loginWithLine(token: string, code: string) {
-      const result = await postLineLogin(token, code);
-      if (cancelled) return;
-      if (result.needs_invite) {
-        setStatus('needsInvite');
-        setMessage('招待コードを入力してください');
-        return;
-      }
-      if (result.session_token) {
-        localStorage.setItem('bzcard.lineSessionToken', result.session_token);
-        localStorage.setItem('bzcard.lineSessionExpiresAt', result.expires_at || '');
-        setLineSessionToken(result.session_token);
-      }
-      setStatus('active');
-      setMessage('利用登録が完了しました');
-    }
-
     init();
     return () => {
       cancelled = true;
     };
-  }, []);
-
-  async function submitInvite(event: React.FormEvent) {
-    event.preventDefault();
-    if (!idToken || !inviteCode.trim()) return;
-    setBusy(true);
-    try {
-      const result = await postLineLogin(idToken, inviteCode.trim());
-      if (result.session_token) {
-        localStorage.setItem('bzcard.lineSessionToken', result.session_token);
-        localStorage.setItem('bzcard.lineSessionExpiresAt', result.expires_at || '');
-        setLineSessionToken(result.session_token);
-      }
-      setStatus('active');
-      setMessage('利用登録が完了しました');
-    } catch (error) {
-      setStatus('needsInvite');
-      setMessage(errorMessage(error));
-    } finally {
-      setBusy(false);
-    }
-  }
+  }, [connectionId, linkToken]);
 
   return (
     <main className="liffPage">
@@ -469,27 +511,6 @@ function LiffRegistration() {
             <Loader2 className="spin" />
             <span>認証中</span>
           </div>
-        )}
-
-        {status === 'needsInvite' && (
-          <form className="liffInviteForm" onSubmit={submitInvite}>
-            <label>
-              招待コード
-              <div className="liffInviteInput">
-                <KeyRound size={18} />
-                <input
-                  value={inviteCode}
-                  onChange={(event) => setInviteCode(event.target.value)}
-                  autoComplete="one-time-code"
-                  inputMode="text"
-                />
-              </div>
-            </label>
-            <button className="primaryButton" disabled={busy || !inviteCode.trim()}>
-              {busy ? <Loader2 className="spin" /> : <Send size={16} />}
-              登録する
-            </button>
-          </form>
         )}
 
         {status === 'active' && (
@@ -514,7 +535,7 @@ function LiffHeader({
   status,
   message,
 }: {
-  status: 'loading' | 'needsInvite' | 'active' | 'error';
+  status: 'loading' | 'active' | 'error';
   message: string;
 }) {
   const title = status === 'active' ? 'bzCard' : 'bzCard 利用登録';
@@ -711,8 +732,8 @@ function LineCardImage({
   useEffect(() => {
     let active = true;
     let url = '';
-    lineBlob(sessionToken, `/line/cards/${cardId}/processed-image`)
-      .catch(() => lineBlob(sessionToken, `/line/cards/${cardId}/original-image`))
+    lineBlob(sessionToken, `/api/cards/${cardId}/processed-image`)
+      .catch(() => lineBlob(sessionToken, `/api/cards/${cardId}/original-image`))
       .then((blob) => {
         if (!active) return;
         url = URL.createObjectURL(blob);
@@ -735,7 +756,7 @@ function LineThumb({ sessionToken, cardId }: { sessionToken: string; cardId: str
   useEffect(() => {
     let active = true;
     let url = '';
-    lineBlob(sessionToken, `/line/cards/${cardId}/thumbnail`)
+    lineBlob(sessionToken, `/api/cards/${cardId}/thumbnail`)
       .then((blob) => {
         if (!active) return;
         url = URL.createObjectURL(blob);
@@ -752,31 +773,123 @@ function LineThumb({ sessionToken, cardId }: { sessionToken: string; cardId: str
   return <img className="liffThumb" src={src} alt="" />;
 }
 
-function Login({ initial, onSave }: { initial: Session; onSave: (session: Session) => void }) {
-  const [apiBase, setApiBase] = useState(initial.apiBase);
-  const [token, setToken] = useState(initial.token);
+function LineSettings({ api, onClose }: { api: ReturnType<typeof makeApi>; onClose: () => void }) {
+  const [form, setForm] = useState({ channel_secret: '', access_token: '', line_login_channel_id: '', liff_url: '' });
+  const [secretsConfigured, setSecretsConfigured] = useState(false);
+  const [message, setMessage] = useState(''); const [link, setLink] = useState('');
+  useEffect(() => { api.get('/api/line-connections/me').then((r) => { if (r.connection) { setSecretsConfigured(Boolean(r.connection.configured)); setForm((f) => ({ ...f, line_login_channel_id: r.connection.line_login_channel_id || '', liff_url: r.connection.liff_url || '' })); } }).catch((e) => setMessage(errorMessage(e))); }, [api]);
+  async function save(e: React.FormEvent) { e.preventDefault(); try { await api.put('/api/line-connections/me', form); setMessage('保存しました。LINE IDの紐付けURLを発行してください。'); } catch (e) { setMessage(errorMessage(e)); } }
+  async function createLink() { try { const r = await api.post('/api/line-connections/me/link-url', {}); setLink(r.url); } catch (e) { setMessage(errorMessage(e)); } }
+  return <div className="imageModalBackdrop"><form className="imageModal compactModal" onSubmit={save}><div className="imageModalHeader"><b>自分の公式LINE設定</b><button type="button" onClick={onClose}>×</button></div><p>シークレットとトークンは暗号化して保存され、再表示されません。設定済みの場合は `********` と表示し、変更時だけ新しい値を入力します。</p><label>チャネルシークレット<input type="password" value={form.channel_secret} placeholder={secretsConfigured ? '********' : '未設定'} onChange={(e) => setForm({...form,channel_secret:e.target.value})}/></label><label>チャネルアクセストークン<input type="password" value={form.access_token} placeholder={secretsConfigured ? '********' : '未設定'} onChange={(e) => setForm({...form,access_token:e.target.value})}/></label><label>LINE LoginチャネルID<input value={form.line_login_channel_id} onChange={(e) => setForm({...form,line_login_channel_id:e.target.value})} required/></label><label>LIFF URL<input value={form.liff_url} onChange={(e) => setForm({...form,liff_url:e.target.value})} required/></label>{message && <div className="errorBox">{message}</div>}<button className="primaryButton">保存</button><button type="button" className="textButton" onClick={createLink}>LINE ID紐付けURLを発行</button>{link && <a href={link} target="_blank" rel="noreferrer">このURLをLINEアプリで開いて紐付ける</a>}</form></div>;
+}
+
+function PasswordChange({
+  api,
+  onClose,
+  onChanged,
+}: {
+  api: ReturnType<typeof makeApi>;
+  onClose: () => void;
+  onChanged: () => void;
+}) {
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmation, setConfirmation] = useState('');
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    if (newPassword !== confirmation) {
+      setMessage('新しいパスワードが一致しません');
+      return;
+    }
+    setBusy(true);
+    setMessage('');
+    try {
+      await api.post('/api/auth/password', { current_password: currentPassword, new_password: newPassword });
+      onClose();
+      onChanged();
+    } catch (error) {
+      setMessage(errorMessage(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <div className="imageModalBackdrop"><form className="imageModal compactModal" onSubmit={submit}><div className="imageModalHeader"><b>パスワード変更</b><button type="button" onClick={onClose}>×</button></div><p>変更後は、すべての端末・LINE内画面を含む既存のログイン状態が無効になります。</p><label>現在のパスワード<input type="password" value={currentPassword} onChange={(e) => setCurrentPassword(e.target.value)} autoComplete="current-password" required /></label><label>新しいパスワード（12文字以上）<input type="password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} autoComplete="new-password" minLength={12} required /></label><label>新しいパスワード（確認）<input type="password" value={confirmation} onChange={(e) => setConfirmation(e.target.value)} autoComplete="new-password" minLength={12} required /></label>{message && <div className="errorBox">{message}</div>}<button className="primaryButton" disabled={busy}>{busy ? <Loader2 className="spin" /> : null}変更してログアウト</button></form></div>;
+}
+
+function UserManager({ api, onClose }: { api: ReturnType<typeof makeApi>; onClose: () => void }) {
+  const [items,setItems]=useState<Array<{id:string;login_id:string;role:string;status:string}>>([]); const [login_id,setId]=useState(''); const [password,setPassword]=useState(''); const [message,setMessage]=useState('');
+  const reload=()=>api.get('/api/auth/users').then((r)=>setItems(r.items||[])).catch((e)=>setMessage(errorMessage(e)));
+  useEffect(() => { void reload(); }, [api]);
+  async function create(e:React.FormEvent){e.preventDefault();try{await api.post('/api/auth/users',{login_id,password});setId('');setPassword('');setMessage('ユーザーを作成しました');reload();}catch(e){setMessage(errorMessage(e));}}
+  return <div className="imageModalBackdrop"><section className="imageModal compactModal"><div className="imageModalHeader"><b>利用者一覧・追加</b><button type="button" onClick={onClose}>×</button></div><p>ここで作成するアカウントは一般ユーザーです。管理者権限は付与されず、自分の名刺だけを閲覧・操作できます。</p><form onSubmit={create}><label>ログインID<input value={login_id} onChange={(e)=>setId(e.target.value)} required/></label><label>初期パスワード（12文字以上）<input type="password" value={password} onChange={(e)=>setPassword(e.target.value)} minLength={12} required/></label><button className="primaryButton">利用者を追加</button></form>{message&&<div className="errorBox">{message}</div>}<ul>{items.map((u)=><li key={u.id}>{u.login_id} — {u.role} / {u.status}</li>)}</ul></section></div>;
+}
+
+function Login({ onLoggedIn }: { onLoggedIn: (session: Session) => void }) {
+  const [apiBase, setApiBase] = useState(localStorage.getItem('bzcard.apiBase') || defaultApiBase);
+  const [loginId, setLoginId] = useState('');
+  const [password, setPassword] = useState('');
+  const [needsBootstrap, setNeedsBootstrap] = useState<boolean | null>(null);
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    const base = apiBase.replace(/\/$/, '');
+    fetch(`${base}/api/auth/bootstrap-status`)
+      .then(async (response) => {
+        if (!response.ok) throw new Error(await response.text());
+        return response.json();
+      })
+      .then((data) => {
+        if (!cancelled) setNeedsBootstrap(Boolean(data.needs_bootstrap));
+      })
+      .catch(() => {
+        if (!cancelled) setNeedsBootstrap(null);
+      });
+    return () => { cancelled = true; };
+  }, [apiBase]);
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setMessage('');
+    const base = apiBase.trim().replace(/\/$/, '');
+    try {
+      const response = await fetch(`${base}/api/auth/${needsBootstrap ? 'bootstrap' : 'login'}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ login_id: loginId, password }),
+      });
+      const text = await response.text();
+      if (!response.ok) throw new Error(formatHttpError(response, text));
+      const result = JSON.parse(text);
+      onLoggedIn({ apiBase: base, token: result.session_token });
+    } catch (error) {
+      setMessage(errorMessage(error));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   return (
     <main className="login">
-      <form
-        onSubmit={(event) => {
-          event.preventDefault();
-          onSave({ apiBase: apiBase.replace(/\/$/, ''), token });
-        }}
-      >
-        <h1>bzcard</h1>
-        <label>
-          API Base
-          <input value={apiBase} onChange={(e) => setApiBase(e.target.value)} />
-        </label>
-        <label>
-          Bearer Token
-          <input value={token} onChange={(e) => setToken(e.target.value)} type="password" />
-        </label>
-        <button className="primaryButton">
-          <Send size={16} />
-          接続
+      <form onSubmit={submit}>
+        <h1>bzCard</h1>
+        <p>{needsBootstrap ? '最初の管理者アカウントを作成します。既存の名刺はこのアカウントに移行されます。' : 'ログインしてください。'}</p>
+        <label>API URL<input value={apiBase} onChange={(event) => setApiBase(event.target.value)} required /></label>
+        <label>ログインID<input value={loginId} onChange={(event) => setLoginId(event.target.value)} autoComplete="username" required /></label>
+        <label>パスワード<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete={needsBootstrap ? 'new-password' : 'current-password'} minLength={12} required /></label>
+        {needsBootstrap && <small>パスワードは12文字以上にしてください。</small>}
+        {message && <div className="errorBox">{message}</div>}
+        <button className="primaryButton" disabled={busy || needsBootstrap === null}>
+          {busy ? <Loader2 className="spin" /> : null}
+          {needsBootstrap ? '管理者を作成して開始' : 'ログイン'}
         </button>
+        {needsBootstrap === null && <small>API URLへ接続できません。URLを確認してください。</small>}
       </form>
     </main>
   );
@@ -791,7 +904,6 @@ function UploadPanel({
   onUploaded: () => void;
   onMessage: (message: string) => void;
 }) {
-  const [direction, setDirection] = useState('auto');
   const [busy, setBusy] = useState(false);
 
   async function uploadMany(fileList: FileList | null) {
@@ -804,7 +916,7 @@ function UploadPanel({
         const form = new FormData();
         form.append('file', file);
         try {
-          const result = await api.postForm(`/api/cards/upload?direction=${direction}`, form);
+          const result = await api.postForm('/api/cards/upload', form);
           const suffix = result.duplicate ? 'duplicate' : 'queued';
           results.push(`OK: ${file.name} (${suffix})`);
         } catch (error) {
@@ -822,7 +934,7 @@ function UploadPanel({
     <div className="uploadBand">
       <label className="fileButton">
         <Upload size={16} />
-        画像を追加
+        名刺を追加
         <input
           type="file"
           accept="image/png,image/jpeg"
@@ -834,11 +946,6 @@ function UploadPanel({
           }}
         />
       </label>
-      <select value={direction} onChange={(e) => setDirection(e.target.value)}>
-        <option value="auto">自動判定</option>
-        <option value="horizontal">横書き</option>
-        <option value="vertical">縦書き</option>
-      </select>
       {busy && <Loader2 className="spin" size={18} />}
     </div>
   );
@@ -942,12 +1049,12 @@ function CardDetail({
           </div>
         </div>
         <div className="detailActions">
-          <button className="iconButton detailActionButton" onClick={save} title="保存">
+          <button className="primaryButton detailActionButton detailSaveButton" onClick={save} title="保存">
             <Save />
             保存
           </button>
           <button
-            className="dangerButton detailActionButton"
+            className="dangerButton detailActionButton detailDeleteButton"
             onClick={async () => {
               if (!window.confirm('この名刺を削除しますか？')) return;
               try {
@@ -1080,18 +1187,18 @@ function CardDetail({
       </div>
 
       <div className="processBar">
-        <button
-          className="textButton"
-          onClick={() => run(`/api/cards/${card.id}/reprocess?direction=${direction}`, '再処理を開始しました')}
-        >
-          <RefreshCcw size={16} />
-          再OCR
-        </button>
         <select value={direction} onChange={(e) => setDirection(e.target.value)}>
           <option value="auto">自動判定</option>
           <option value="horizontal">横書き</option>
           <option value="vertical">縦書き</option>
         </select>
+        <button
+          className="textButton"
+          onClick={() => run(`/api/cards/${card.id}/reprocess?direction=${direction}`, '再処理を開始しました')}
+        >
+          <RefreshCcw size={16} />
+          再スキャン
+        </button>
         <button
           className="textButton"
           onClick={() => run(`/api/cards/${card.id}/reextract`, '再抽出を開始しました')}
@@ -1378,6 +1485,12 @@ function makeApi(session: Session) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       }),
+    put: (path: string, body: unknown) =>
+      request(path, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }),
     delete: (path: string) =>
       request(path, {
         method: 'DELETE',
@@ -1475,22 +1588,21 @@ function isLiffRoute() {
 }
 
 function getLiffTargetCardId() {
+  return getLiffParameter('card');
+}
+
+function getLiffParameter(name: string) {
   const search = new URLSearchParams(window.location.search);
-  const direct = search.get('card');
+  const direct = search.get(name);
   if (direct) return direct;
   const liffState = search.get('liff.state');
   if (!liffState) return '';
   try {
     const stateUrl = new URL(decodeURIComponent(liffState), window.location.origin);
-    return new URLSearchParams(stateUrl.search).get('card') || '';
+    return new URLSearchParams(stateUrl.search).get(name) || '';
   } catch {
     return '';
   }
-}
-
-function liffIdFromUrl(value: string) {
-  const match = value.match(/liff\.line\.me\/([^/?#]+)/);
-  return match?.[1] || '';
 }
 
 async function loadLiffSdk() {
@@ -1512,11 +1624,19 @@ async function loadLiffSdk() {
   });
 }
 
-async function postLineLogin(idToken: string, inviteCode: string) {
+async function getLiffConfig(connectionId: string) {
+  const response = await fetch(`${defaultApiBase}/api/line-connections/${encodeURIComponent(connectionId)}/liff-config`);
+  if (!response.ok) {
+    throw new Error(formatHttpError(response, await response.text()));
+  }
+  return response.json() as Promise<{ connection_id: string; liff_id: string }>;
+}
+
+async function postLineLogin(idToken: string, connectionId: string, linkToken: string) {
   const response = await fetch(`${defaultApiBase}/line/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id_token: idToken, invite_code: inviteCode }),
+    body: JSON.stringify({ id_token: idToken, connection_id: connectionId, link_token: linkToken }),
   });
   if (!response.ok) {
     const text = await response.text();
@@ -1525,21 +1645,17 @@ async function postLineLogin(idToken: string, inviteCode: string) {
   return response.json();
 }
 
-async function getLineMe(sessionToken: string) {
-  return lineJson('/line/auth/me', sessionToken);
-}
-
 async function getLineCards(sessionToken: string) {
-  const data = await lineJson('/line/cards', sessionToken);
+  const data = await lineJson('/api/cards', sessionToken);
   return data.items || [];
 }
 
 async function getLineCard(sessionToken: string, cardId: string) {
-  return lineJson(`/line/cards/${cardId}`, sessionToken);
+  return lineJson(`/api/cards/${cardId}`, sessionToken);
 }
 
 async function patchLineCard(sessionToken: string, cardId: string, payload: Record<string, string | undefined>) {
-  return lineJson(`/line/cards/${cardId}`, sessionToken, {
+  return lineJson(`/api/cards/${cardId}`, sessionToken, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
