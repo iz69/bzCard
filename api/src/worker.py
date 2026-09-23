@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import threading
 import time
 
@@ -51,10 +52,11 @@ def _run_job(job: dict) -> None:
             return
 
         if job["type"] == "reextract":
-            raw_text = _combined_ocr_text(repository.get_card_images(card_id))
+            images = repository.get_card_images(card_id)
+            raw_text = _combined_ocr_text(images)
             if not raw_text.strip():
                 raise RuntimeError("OCR text is empty; run full reprocess first")
-            extracted = extract_card_fields(raw_text, [])
+            extracted = extract_card_fields(raw_text, _combined_ocr_blocks(images))
             repository.save_extraction_result(card_id, extracted.data, extracted.duration_ms)
             repository.finish_job(job["id"])
             return
@@ -66,14 +68,15 @@ def _run_job(job: dict) -> None:
         for image in images:
             _process_image(card_id, image)
 
-        raw_text = _combined_ocr_text(repository.get_card_images(card_id))
+        images = repository.get_card_images(card_id)
+        raw_text = _combined_ocr_text(images)
         card_check = check_business_card(raw_text)
         if not card_check.is_likely_card:
             repository.set_card_status(card_id, "not_card", card_check.reason)
             repository.finish_job(job["id"])
             return
 
-        extracted = extract_card_fields(raw_text, [])
+        extracted = extract_card_fields(raw_text, _combined_ocr_blocks(images))
         repository.save_extraction_result(card_id, extracted.data, extracted.duration_ms)
         repository.finish_job(job["id"])
     except Exception as exc:
@@ -154,3 +157,21 @@ def _combined_ocr_text(images: list[dict]) -> str:
         label = labels.get(image["side"], image["side"])
         chunks.append(f"【{label}】\n{text}")
     return "\n\n".join(chunks)
+
+
+def _combined_ocr_blocks(images: list[dict]) -> list[dict]:
+    """Return persisted OCR blocks from every side, ignoring malformed entries."""
+    blocks: list[dict] = []
+    for image in images:
+        raw_blocks = image.get("ocr_blocks_json")
+        if not raw_blocks:
+            continue
+        try:
+            parsed = json.loads(raw_blocks) if isinstance(raw_blocks, str) else raw_blocks
+        except (TypeError, json.JSONDecodeError):
+            logger.warning("Ignoring malformed OCR blocks for %s", image.get("side", "unknown"))
+            continue
+        if not isinstance(parsed, list):
+            continue
+        blocks.extend(block for block in parsed if isinstance(block, dict))
+    return blocks

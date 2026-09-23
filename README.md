@@ -41,7 +41,9 @@ Androidネイティブアプリは開発済みですが、実際の使用感を�
 
 - WebUI: `http://localhost:15174/bzcard/`
 - API: `http://localhost:18081/`
-- Ollama: `http://localhost:11434/`
+
+Ollamaはホストへポート公開せず、APIコンテナからだけ利用します。確認やモデル操作は
+`docker compose exec ollama ...` で行います。
 
 標準では、ホスト側nginxなどで次のサブパスへproxyする想定です。
 
@@ -62,21 +64,33 @@ cp .env.example .env
 
 ```env
 LLM_PROVIDER=ollama
-LLM_MODEL=qwen2.5:7b
+LLM_MODEL=bzcard-lfm-jp:202606
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-3.5-flash
 ```
 
-コンテナを起動します。
+まずOllamaを起動し、既定のローカルLLMを登録します。
+
+```sh
+docker compose up -d ollama
+```
+
+`LLM_PROVIDER=ollama` の場合、初回はOllamaモデルを取得してください。既定の
+`bzcard-lfm-jp:202606` は、公式GGUFから作成するローカルモデルです。
+
+```sh
+curl -fL https://huggingface.co/LiquidAI/LFM2.5-1.2B-JP-202606-GGUF/resolve/main/LFM2.5-1.2B-JP-202606-Q4_K_M.gguf -o /tmp/LFM2.5-1.2B-JP-202606-Q4_K_M.gguf
+docker compose exec ollama mkdir -p /root/.ollama/import
+docker cp /tmp/LFM2.5-1.2B-JP-202606-Q4_K_M.gguf bzcard-ollama:/root/.ollama/import/LFM2.5-1.2B-JP-202606-Q4_K_M.gguf
+docker compose exec ollama sh -lc 'printf "FROM /root/.ollama/import/LFM2.5-1.2B-JP-202606-Q4_K_M.gguf\\nPARAMETER num_ctx 4096\\n" > /root/.ollama/import/Modelfile.lfm-jp'
+docker compose exec ollama ollama create bzcard-lfm-jp:202606 -f /root/.ollama/import/Modelfile.lfm-jp
+rm /tmp/LFM2.5-1.2B-JP-202606-Q4_K_M.gguf
+```
+
+続いて、APIとWebUIを含む全コンテナを起動します。
 
 ```sh
 docker compose up --build -d
-```
-
-`LLM_PROVIDER=ollama` の場合、初回はOllamaモデルを取得してください。
-
-```sh
-docker compose exec ollama ollama pull qwen2.5:7b
 ```
 
 Gemini APIを使う場合は `.env` で次のように設定します。
@@ -104,7 +118,7 @@ OCR/LLMの任意設定:
 
 ```env
 LLM_PROVIDER=ollama
-LLM_MODEL=qwen2.5:7b
+LLM_MODEL=bzcard-lfm-jp:202606
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-3.5-flash
 MAX_UPLOAD_MB=50
@@ -114,6 +128,20 @@ MAX_UPLOAD_MB=50
 
 - `ollama`: ローカルOllamaの `LLM_MODEL` を使います。
 - `gemini`: Gemini APIの `GEMINI_MODEL` を使います。`GEMINI_API_KEY` が必要です。
+
+### LLMモデルの切替
+
+現在の既定は、日本語特化のローカルモデル `bzcard-lfm-jp:202606` です。従来の
+`qwen2.5:7b` は削除せず残せるため、`.env` の `LLM_MODEL` を次の値に戻して
+`docker compose up -d --force-recreate api` を実行すれば復帰できます。
+
+```env
+LLM_MODEL=qwen2.5:7b
+```
+
+SQLiteデータベースはホスト側の `data/bzcard.db` に保存されます。画像と
+`data/line-credentials.key` も同じ `data/` 配下にあるため、バックアップ時は
+ディレクトリごと保管してください。
 
 LINE公式アカウントの接続情報は、環境変数ではなくログイン後の「LINE設定」画面で、
 利用者ごとに保存します。設定する値はMessaging APIのチャネルシークレット／
@@ -220,7 +248,7 @@ https://your-domain.example/bzcard-api/line/webhook
 LINE連携の流れ:
 
 1. WebUIでローカル管理者アカウントを作成する
-2. そのサーバの `.env` に、利用者自身のLINE公式アカウントのMessaging API設定を入れる
+2. WebUIの「LINE設定」で、利用者自身のMessaging API／LINE Login設定を保存する
 3. Webhookが画像を受け取り、紐付け済みローカルユーザーの処理キューに投入する
 
 すべての名刺はbzCardローカルユーザーに紐付きます。別ユーザーの名刺は、一覧、

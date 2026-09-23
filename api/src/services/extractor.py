@@ -38,6 +38,7 @@ def extract_card_fields(raw_text: str, blocks: list[dict]) -> ExtractionResult:
     raw = _generate_structured_response(prompt)
     data = _parse_json_object(raw)
     normalized = {key: _string_or_empty(data.get(key)) for key in SCHEMA_KEYS}
+    _remove_ungrounded_values(normalized, raw_text)
     normalized["_raw"] = data
     duration_ms = int((time.perf_counter() - started) * 1000)
     return ExtractionResult(data=normalized, duration_ms=duration_ms)
@@ -56,7 +57,7 @@ def _generate_with_ollama(prompt: str) -> str:
         "model": settings.llm_model,
         "prompt": prompt,
         "stream": False,
-        "format": "json",
+        "format": _extraction_schema(),
         "options": {
             "temperature": 0,
         },
@@ -149,16 +150,27 @@ def _collect_text_chunks(value) -> list[str]:
 
 
 def _build_prompt(raw_text: str, blocks: list[dict]) -> str:
-    marked_text = _marked_text(blocks) or raw_text
+    marked_text = _marked_text(blocks)
     keys = ", ".join(f'"{key}"' for key in SCHEMA_KEYS)
+    large_text_hint = ""
+    if marked_text:
+        large_text_hint = f"""
+
+以下はOCRブロックのうち大きな文字です。氏名・会社名の候補として優先的に参照してください。
+{marked_text}
+"""
     return f"""
 以下は日本の名刺1枚からOCRで読み取ったテキストです。
-【大文字】は大きなフォントサイズのテキストで、氏名や会社名の候補です。
 
-{marked_text}
+{raw_text}
+{large_text_hint}
 
 次のキーを持つJSONオブジェクトだけを返してください。
 不明な項目は空文字にしてください。説明文、Markdown、コードブロックは不要です。
+OCRテキストにない値を補完・創作してはいけません。ただし person_name_kana の読みの推測だけは、下記の規則に従って許可します。
+email は @ を含むOCR上のメールアドレスだけを入れてください。email を mobile、fax、tel に入れてはいけません。
+tel と mobile には電話番号だけを入れてください。fax にはOCR上で FAX と明示された電話番号だけを入れてください。
+department には部署名だけを、title には役職名だけを入れてください。OCR上にない項目は空文字にしてください。
 person_name_kana は氏名の読みをひらがなで入れてください。姓名の間には半角スペースを1つ入れてください。
 OCRテキスト内にふりがな・フリガナがある場合はそれを優先してください。
 ふりがながない場合でも、日本人名として自然で一般的な読みを推測してください。
@@ -217,3 +229,64 @@ def _string_or_empty(value) -> str:
     if isinstance(value, (list, dict)):
         return json.dumps(value, ensure_ascii=False)
     return str(value).strip()
+
+
+def _remove_ungrounded_values(data: dict, raw_text: str) -> None:
+    """Do not persist contact details or labels invented by the extraction model.
+
+    OCR can be wrong, but a local model must not manufacture an address or a phone
+    number that has no basis in the OCR input. Japanese-name kana is deliberately
+    excluded because the prompt explicitly permits a reading to be inferred.
+    """
+    compact_source = _compact_for_evidence(raw_text)
+    numeric_values = {
+        _normalized_digits(value)
+        for value in re.findall(r"[0-9０-９][0-9０-９()（）\-ー－−\s]{4,}", raw_text)
+    }
+
+    for key in ("person_name", "company_name", "department", "title", "email", "website"):
+        value = data.get(key, "")
+        if value and _compact_for_evidence(value) not in compact_source:
+            data[key] = ""
+
+    for key in ("postal_code", "tel", "mobile", "fax"):
+        value = data.get(key, "")
+        if value and _normalized_digits(value) not in numeric_values:
+            data[key] = ""
+
+    fax_values = _numbers_on_labeled_lines(raw_text, r"fax|ファックス")
+    if data.get("fax") and _normalized_digits(data["fax"]) not in fax_values:
+        data["fax"] = ""
+
+    mobile = data.get("mobile", "")
+    mobile_digits = _normalized_digits(mobile)
+    mobile_values = _numbers_on_labeled_lines(raw_text, r"mobile|cell|携帯|直通")
+    if mobile and not (mobile_digits in mobile_values or re.fullmatch(r"0[789]0\d{8}", mobile_digits)):
+        data["mobile"] = ""
+
+    address = data.get("address", "")
+    if address and _compact_address_for_evidence(address) not in _compact_address_for_evidence(raw_text):
+        data["address"] = ""
+
+    if not data.get("person_name"):
+        data["person_name_kana"] = ""
+
+
+def _compact_for_evidence(value: str) -> str:
+    return re.sub(r"[\s()（）\-ー－−./:：]", "", value).casefold()
+
+
+def _normalized_digits(value: str) -> str:
+    return re.sub(r"\D", "", value.translate(str.maketrans("０１２３４５６７８９", "0123456789")))
+
+
+def _numbers_on_labeled_lines(raw_text: str, label_pattern: str) -> set[str]:
+    return {
+        _normalized_digits(line)
+        for line in raw_text.splitlines()
+        if re.search(label_pattern, line, flags=re.IGNORECASE) and _normalized_digits(line)
+    }
+
+
+def _compact_address_for_evidence(value: str) -> str:
+    return re.sub(r"[\s()（）\-ー－−./:：0-9０-９〇一二三四五六七八九十百千万億兆]", "", value).casefold()

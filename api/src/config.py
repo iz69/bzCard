@@ -36,7 +36,7 @@ def load_settings() -> Settings:
         base_path=os.getenv("BASE_PATH", "/").rstrip("/") or "/",
         llm_provider=os.getenv("LLM_PROVIDER", "ollama").strip().lower(),
         llm_base_url=os.getenv("LLM_BASE_URL", "http://ollama:11434").rstrip("/"),
-        llm_model=os.getenv("LLM_MODEL", "qwen2.5:7b").strip(),
+        llm_model=os.getenv("LLM_MODEL", "bzcard-lfm-jp:202606").strip(),
         gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
         gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip(),
         gemini_base_url=os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").rstrip("/"),

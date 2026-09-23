@@ -11,7 +11,7 @@ services:
       - DATA_DIR=/data
       - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
       - LLM_BASE_URL=${LLM_BASE_URL:-http://bzcard-ollama:11434}
-      - LLM_MODEL=${LLM_MODEL:-qwen2.5:7b}
+      - LLM_MODEL=${LLM_MODEL:-bzcard-lfm-jp:202606}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.5-flash}
       - OCR_DEVICE=cpu
