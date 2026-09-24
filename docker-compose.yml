@@ -44,4 +44,4 @@ services:
     restart: unless-stopped
     volumes:
       - ./ollama:/root/.ollama
-    mem_limit: 6g
+    mem_limit: 2g

@@ -271,11 +271,12 @@ LINE連携の流れ:
 
 ## メモリ制限
 
-`docker-compose.yml` では、12GB程度のホストを想定して次の制限を入れています。
+`docker-compose.yml` では、LFM2.5-1.2B-JP のQ4量子化モデルを使う8GB程度のホストを
+想定して次の制限を入れています。
 
 - `api`: `3g`
 - `ui`: `128m`
-- `ollama`: `6g`
+- `ollama`: `2g`
 
 OCR/LLM処理中の `docker stats` を見ながら調整してください。
 
