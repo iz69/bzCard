@@ -173,5 +173,8 @@ def _combined_ocr_blocks(images: list[dict]) -> list[dict]:
             continue
         if not isinstance(parsed, list):
             continue
-        blocks.extend(block for block in parsed if isinstance(block, dict))
+        # Coordinates are meaningful only within an image.  Preserve which side
+        # each block came from so layout-based extraction never joins the front
+        # and back of a card.
+        blocks.extend({**block, "_side": image["side"]} for block in parsed if isinstance(block, dict))
     return blocks

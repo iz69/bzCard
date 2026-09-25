@@ -74,6 +74,16 @@ LIST_OMITTED_FIELDS = {
     "extracted_json",
 }
 
+CONTACT_SUMMARY_FIELDS = (
+    "status",
+    "thumbnail_path",
+    "person_name",
+    "company_name",
+    "tags",
+    "created_at",
+    "updated_at",
+)
+
 
 def _image_metadata(relative: str) -> tuple[int | None, int | None, int | None]:
     path = settings.data_dir / relative
@@ -738,6 +748,42 @@ def list_user_cards(user_id: str, q: str | None = None, status: str | None = Non
         return _cards_from_rows(conn, rows, q)
 
 
+def list_user_contacts(
+    user_id: str,
+    q: str | None = None,
+    status: str | None = None,
+    include_cards: bool = False,
+) -> list[dict]:
+    """List a user's cards grouped into automatically detected people.
+
+    The underlying cards remain independent records.  This presentation-level
+    grouping is deliberately computed on the server so every client applies the
+    same matching and search rules.
+    """
+    where = ["owner_user_id = ?"]
+    params: list[str] = [user_id]
+    if status:
+        where.append("status = ?")
+        params.append(status)
+    sql = "SELECT * FROM cards WHERE " + " AND ".join(where) + " ORDER BY created_at DESC"
+    with get_connection() as conn:
+        rows = conn.execute(sql, params).fetchall()
+        entries = []
+        for row in rows:
+            card = _hydrate_card(conn, row, include_images=False)
+            if card is not None:
+                entries.append((card, _search_score(row, q) if q else 0))
+    return _contacts_from_entries(entries, q, include_cards=include_cards)
+
+
+def get_user_contact(user_id: str, contact_id: str) -> dict | None:
+    """Resolve a contact by its representative card ID or any member card ID."""
+    for contact in list_user_contacts(user_id, include_cards=True):
+        if contact["id"] == contact_id or any(card["id"] == contact_id for card in contact["cards"]):
+            return contact
+    return None
+
+
 def get_user_card(card_id: str, user_id: str) -> dict | None:
     with get_connection() as conn:
         return _hydrate_card(
@@ -747,6 +793,107 @@ def get_user_card(card_id: str, user_id: str) -> dict | None:
                 (card_id, user_id),
             ).fetchone(),
         )
+
+
+def _contacts_from_entries(
+    entries: list[tuple[dict, int]],
+    query: str | None,
+    include_cards: bool = False,
+) -> list[dict]:
+    """Build connected groups from exact contact identifiers.
+
+    An equal email address or mobile number is enough to identify a person.
+    A name and company alone are deliberately not enough: people with the same
+    name can work at the same company, so those cases stay separate until a
+    future explicit merge workflow is added.
+    """
+    parents = list(range(len(entries)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def join(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parents[right_root] = left_root
+
+    by_identifier: dict[tuple[str, str], list[int]] = {}
+    for index, (card, _score) in enumerate(entries):
+        for identifier in _contact_identifiers(card):
+            by_identifier.setdefault(identifier, []).append(index)
+
+    for indices in by_identifier.values():
+        for left_offset, left in enumerate(indices):
+            for right in indices[left_offset + 1:]:
+                if _cards_are_same_contact(entries[left][0], entries[right][0]):
+                    join(left, right)
+
+    grouped: dict[int, list[tuple[dict, int]]] = {}
+    for index, entry in enumerate(entries):
+        grouped.setdefault(find(index), []).append(entry)
+
+    contacts = []
+    for members in grouped.values():
+        if query and not any(score > 0 for _card, score in members):
+            continue
+        members.sort(key=lambda item: (item[0].get("created_at") or "", item[0]["id"]), reverse=True)
+        representative = members[0][0]
+        cards = [card for card, _score in members]
+        contact = {
+            **(representative if include_cards else _contact_summary(representative)),
+            "id": representative["id"],
+            "representative_card_id": representative["id"],
+            "card_count": len(cards),
+            "_search_score": max(score for _card, score in members),
+        }
+        if include_cards:
+            contact["cards"] = cards
+        contacts.append(contact)
+    contacts.sort(
+        key=lambda contact: (
+            contact.pop("_search_score"),
+            contact.get("created_at") or "",
+            contact["id"],
+        ),
+        reverse=True,
+    )
+    return contacts
+
+
+def _contact_summary(card: dict) -> dict:
+    return {field: card.get(field) for field in CONTACT_SUMMARY_FIELDS}
+
+
+def _contact_identifiers(card: dict) -> set[tuple[str, str]]:
+    identifiers = set()
+    email = _contact_email(card.get("email"))
+    mobile = _contact_mobile(card.get("mobile"))
+    if email:
+        identifiers.add(("email", email))
+    if mobile:
+        identifiers.add(("mobile", mobile))
+    return identifiers
+
+
+def _cards_are_same_contact(left: dict, right: dict) -> bool:
+    left_email, right_email = _contact_email(left.get("email")), _contact_email(right.get("email"))
+    left_mobile, right_mobile = _contact_mobile(left.get("mobile")), _contact_mobile(right.get("mobile"))
+    if left_email and left_email == right_email:
+        return True
+    if left_mobile and left_mobile == right_mobile:
+        return True
+    return False
+
+
+def _contact_email(value) -> str:
+    return unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+
+
+def _contact_mobile(value) -> str:
+    return re.sub(r"\D", "", _normalize_phone_number(str(value or "")))
 
 
 def get_card_images(card_id: str) -> list[dict]:

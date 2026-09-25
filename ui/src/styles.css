@@ -334,6 +334,20 @@ tbody tr.selected {
   background: #edf7f6;
 }
 
+tbody tr:not(.virtualSpacer) {
+  height: 61px;
+}
+
+.virtualSpacer {
+  cursor: default;
+}
+
+.virtualSpacer td {
+  height: 0;
+  padding: 0;
+  border: 0;
+}
+
 .thumbCell {
   width: 72px;
 }
@@ -406,6 +420,71 @@ tbody tr.selected {
 
 .detail h2 {
   font-size: 22px;
+}
+
+.contactHistory {
+  margin: 0 0 14px;
+  padding: 12px;
+  border: 1px solid #d8dee6;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.contactHistoryHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.contactHistoryHeader h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.contactHistoryHeader span {
+  color: #667085;
+  font-size: 13px;
+}
+
+.contactHistoryList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.contactHistoryCard {
+  min-width: 180px;
+  padding: 8px 10px;
+  border: 1px solid #d8dee6;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #243b53;
+  cursor: pointer;
+  text-align: left;
+}
+
+.contactHistoryCard:hover {
+  border-color: #2264a8;
+  background: #edf7f6;
+}
+
+.contactHistoryCard span,
+.contactHistoryCard strong,
+.contactHistoryCard small {
+  display: block;
+}
+
+.contactHistoryCard span,
+.contactHistoryCard small {
+  color: #667085;
+  font-size: 12px;
+}
+
+.contactHistoryCard strong {
+  margin: 3px 0;
+  font-size: 13px;
 }
 
 .meta {

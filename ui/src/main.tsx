@@ -53,6 +53,12 @@ type Card = {
   updated_at: string;
 };
 
+type Contact = Card & {
+  representative_card_id: string;
+  card_count: number;
+  cards?: Card[];
+};
+
 type Session = {
   apiBase: string;
   token: string;
@@ -130,9 +136,12 @@ function App() {
   }
 
   const [session, setSession] = useState<Session>(loadSession);
-  const [cards, setCards] = useState<Card[]>([]);
-  const [selectedId, setSelectedId] = useState<string>('');
+  const [contacts, setContacts] = useState<Contact[]>([]);
+  const [selectedContactId, setSelectedContactId] = useState<string>('');
+  const [selectedCardId, setSelectedCardId] = useState<string>('');
   const [selectedDetail, setSelectedDetail] = useState<Card | undefined>();
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [selectedContactDetail, setSelectedContactDetail] = useState<Contact | undefined>();
   const [query, setQuery] = useState('');
   const [status, setStatus] = useState('');
   const [toast, setToast] = useState<{ id: number; text: string } | null>(null);
@@ -143,7 +152,10 @@ function App() {
   const [usersOpen, setUsersOpen] = useState(false);
   const [passwordChangeOpen, setPasswordChangeOpen] = useState(false);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const [listScrollTop, setListScrollTop] = useState(0);
+  const [listViewportHeight, setListViewportHeight] = useState(0);
   const listRequestRef = useRef(0);
+  const listViewportRef = useRef<HTMLDivElement>(null);
   const accountMenuRef = useRef<HTMLDivElement>(null);
   const toastIdRef = useRef(0);
 
@@ -153,9 +165,16 @@ function App() {
   }, []);
 
   const authed = session.token.trim().length > 0;
-  const hasInProgressCards = cards.some((card) => !terminalCardStatuses.has(card.status));
-  const selectedSummary = selectedId ? cards.find((card) => card.id === selectedId) : undefined;
-  const selected = selectedDetail?.id === selectedId ? selectedDetail : selectedSummary;
+  const hasInProgressCards = contacts.some((contact) => !terminalCardStatuses.has(contact.status));
+  const selectedContact = selectedContactId ? contacts.find((contact) => contact.id === selectedContactId) : undefined;
+  const selected = selectedDetail?.id === selectedCardId ? selectedDetail : undefined;
+  const relatedCards = selectedContactDetail?.cards || [];
+  const listRowHeight = 61;
+  const listOverscan = 8;
+  const firstVisibleContact = Math.max(0, Math.floor(listScrollTop / listRowHeight) - listOverscan);
+  const visibleContactCount = Math.ceil(listViewportHeight / listRowHeight) + listOverscan * 2;
+  const visibleContacts = contacts.slice(firstVisibleContact, firstVisibleContact + visibleContactCount);
+  const trailingContacts = Math.max(0, contacts.length - firstVisibleContact - visibleContacts.length);
 
   const api = useMemo(() => makeApi(session), [session]);
 
@@ -168,15 +187,18 @@ function App() {
       const params = new URLSearchParams();
       if (query) params.set('q', query);
       if (status) params.set('status', status);
-      const data = await api.get(`/api/cards?${params.toString()}`);
+      const data = await api.get(`/api/contacts?${params.toString()}`);
       if (requestId !== listRequestRef.current) return;
-      const items = data.items || [];
-      setCards(items);
-      setSelectedId((current) => {
-        if (current && items.some((card: Card) => card.id === current)) {
-          return current;
-        }
-        return items[0]?.id || '';
+      const items: Contact[] = data.items || [];
+      setContacts(items);
+      setSelectedContactId((currentContactId) => {
+        const next = items.find((contact) => contact.id === currentContactId) || items[0];
+        setSelectedCardId((currentCardId) => (
+          next?.id === currentContactId && currentCardId
+            ? currentCardId
+            : next?.representative_card_id || ''
+        ));
+        return next?.id || '';
       });
     } catch (error) {
       if (requestId === listRequestRef.current) {
@@ -207,14 +229,39 @@ function App() {
   }, [authed, hasInProgressCards, reload]);
 
   useEffect(() => {
-    if (!authed || !selectedId) {
+    if (!authed || !selectedCardId) {
       setSelectedDetail(undefined);
+      setDetailLoading(false);
       return;
     }
     let cancelled = false;
-    api.get(`/api/cards/${selectedId}`)
+    setSelectedDetail(undefined);
+    setDetailLoading(true);
+    api.get(`/api/cards/${selectedCardId}`)
       .then((card) => {
         if (!cancelled) setSelectedDetail(card);
+      })
+      .catch((error) => {
+        if (!cancelled) showToast(errorMessage(error));
+      })
+      .finally(() => {
+        if (!cancelled) setDetailLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [api, authed, selectedCardId, showToast]);
+
+  useEffect(() => {
+    if (!authed || !selectedContactId) {
+      setSelectedContactDetail(undefined);
+      return;
+    }
+    let cancelled = false;
+    setSelectedContactDetail(undefined);
+    api.get(`/api/contacts/${selectedContactId}`)
+      .then((contact) => {
+        if (!cancelled) setSelectedContactDetail(contact);
       })
       .catch((error) => {
         if (!cancelled) showToast(errorMessage(error));
@@ -222,7 +269,22 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [api, authed, selectedId, selectedSummary?.updated_at, showToast]);
+  }, [api, authed, selectedContactId, showToast]);
+
+  useEffect(() => {
+    const viewport = listViewportRef.current;
+    if (!viewport) return;
+    const updateHeight = () => setListViewportHeight(viewport.clientHeight);
+    updateHeight();
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(viewport);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    setListScrollTop(0);
+    listViewportRef.current?.scrollTo({ top: 0 });
+  }, [query, status]);
 
   useEffect(() => {
     if (!toast) return;
@@ -354,7 +416,11 @@ function App() {
             </select>
           </div>
 
-          <div className="tableWrap">
+          <div
+            ref={listViewportRef}
+            className="tableWrap"
+            onScroll={(event) => setListScrollTop(event.currentTarget.scrollTop)}
+          >
             <table>
               <thead>
                 <tr>
@@ -367,20 +433,33 @@ function App() {
                 </tr>
               </thead>
               <tbody>
-                {cards.map((card) => (
+                {firstVisibleContact > 0 && (
+                  <tr className="virtualSpacer" aria-hidden="true">
+                    <td colSpan={6} style={{ height: firstVisibleContact * listRowHeight }} />
+                  </tr>
+                )}
+                {visibleContacts.map((contact) => (
                   <tr
-                    key={card.id}
-                    className={selected?.id === card.id ? 'selected' : ''}
-                    onClick={() => setSelectedId(card.id)}
+                    key={contact.id}
+                    className={selectedContactId === contact.id ? 'selected' : ''}
+                    onClick={() => {
+                      setSelectedContactId(contact.id);
+                      setSelectedCardId(contact.representative_card_id);
+                    }}
                   >
-                    <td className="thumbCell"><ThumbImage api={api} cardId={card.id} version={card.updated_at} /></td>
-                    <td><StatusBadge status={card.status} /></td>
-                    <td>{card.person_name || '-'}</td>
-                    <td>{card.company_name || '-'}</td>
-                    <td><TagList tags={card.tags} /></td>
-                    <td>{formatDate(card.updated_at)}</td>
+                    <td className="thumbCell"><ThumbImage api={api} cardId={contact.representative_card_id} version={contact.updated_at} /></td>
+                    <td><StatusBadge status={contact.status} /></td>
+                    <td>{contact.person_name || '-'}</td>
+                    <td>{contact.company_name || '-'}</td>
+                    <td><TagList tags={contact.tags} /></td>
+                    <td>{formatDate(contact.updated_at)}{contact.card_count > 1 ? ` · ${contact.card_count}枚` : ''}</td>
                   </tr>
                 ))}
+                {trailingContacts > 0 && (
+                  <tr className="virtualSpacer" aria-hidden="true">
+                    <td colSpan={6} style={{ height: trailingContacts * listRowHeight }} />
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
@@ -391,9 +470,13 @@ function App() {
             <CardDetail
               api={api}
               card={selected}
+              relatedCards={relatedCards}
+              onSelectRelatedCard={setSelectedCardId}
               onChanged={reload}
               onMessage={showToast}
             />
+          ) : detailLoading ? (
+            <div className="empty">名刺情報を読み込んでいます</div>
           ) : (
             <div className="empty">名刺がありません</div>
           )}
@@ -954,11 +1037,15 @@ function UploadPanel({
 function CardDetail({
   api,
   card,
+  relatedCards,
+  onSelectRelatedCard,
   onChanged,
   onMessage,
 }: {
   api: ReturnType<typeof makeApi>;
   card: Card;
+  relatedCards: Card[];
+  onSelectRelatedCard: (cardId: string) => void;
   onChanged: () => void;
   onMessage: (message: string) => void;
 }) {
@@ -1034,6 +1121,7 @@ function CardDetail({
 
   const hasBack = Boolean(card.back_original_image_path);
   const imagePath = imagePathFor(card, imageSide, imageMode);
+  const historicalCards = relatedCards.filter((relatedCard) => relatedCard.id !== card.id);
 
   return (
     <div className="detail">
@@ -1185,6 +1273,29 @@ function CardDetail({
           })}
         </div>
       </div>
+
+      {historicalCards.length > 0 && (
+        <section className="contactHistory" aria-label="同一人物の名刺">
+          <div className="contactHistoryHeader">
+            <h3>以前の名刺</h3>
+            <span>{relatedCards.length}枚</span>
+          </div>
+          <div className="contactHistoryList">
+            {historicalCards.map((relatedCard) => (
+              <button
+                key={relatedCard.id}
+                type="button"
+                className="contactHistoryCard"
+                onClick={() => onSelectRelatedCard(relatedCard.id)}
+              >
+                <span>{formatDate(relatedCard.created_at)}</span>
+                <strong>{relatedCard.company_name || '会社名未設定'}</strong>
+                <small>{[relatedCard.department, relatedCard.title].filter(Boolean).join(' / ') || '名刺を表示'}</small>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
 
       <div className="processBar">
         <select value={direction} onChange={(e) => setDirection(e.target.value)}>

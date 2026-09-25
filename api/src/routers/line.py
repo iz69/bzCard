@@ -117,9 +117,9 @@ def _handle(event: dict, connection: dict) -> None:
             repository.finish_line_event(event_id, "ignored")
             _reply(reply_token, "検索したい氏名または会社名を送ってください。", connection)
             return
-        cards = repository.list_user_cards(owner, q=query)
+        contacts = repository.list_user_contacts(owner, q=query)
         repository.finish_line_event(event_id, "searched")
-        _reply(reply_token, _search(cards, connection), connection)
+        _reply(reply_token, _search_contacts(contacts, connection), connection)
         return
     if message.get("type") != "image" or not message.get("id"):
         repository.finish_line_event(event_id, "ignored")
@@ -177,12 +177,14 @@ def _liff_url(connection: dict, card_id: str) -> str:
     return f"{base}{'&' if '?' in base else '?'}connection={connection['id']}&card={card_id}"
 
 
-def _search(cards: list[dict], connection: dict) -> str:
-    if not cards:
+def _search_contacts(contacts: list[dict], connection: dict) -> str:
+    if not contacts:
         return "一致する名刺は見つかりませんでした。"
-    lines = [f"{len(cards)}件見つかりました。"]
-    for index, card in enumerate(cards[:5], 1):
-        title = card.get("person_name") or card.get("company_name") or "名称未設定"
-        company = card.get("company_name") or "-"
-        lines += ["", f"{index}. {title}", f"   {company}", _liff_url(connection, card["id"])]
+    lines = [f"{len(contacts)}人見つかりました。"]
+    for index, contact in enumerate(contacts[:5], 1):
+        title = contact.get("person_name") or contact.get("company_name") or "名称未設定"
+        company = contact.get("company_name") or "-"
+        count = int(contact.get("card_count") or 1)
+        history = f"（名刺 {count}枚）" if count > 1 else ""
+        lines += ["", f"{index}. {title}{history}", f"   {company}", _liff_url(connection, contact["representative_card_id"])]
     return "\n".join(lines)

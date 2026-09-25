@@ -86,6 +86,23 @@ def list_cards(
     return {"items": repository.list_user_cards(user["id"], q=q, status=status)}
 
 
+@router.get("/contacts")
+def list_contacts(
+    q: str | None = None,
+    status: str | None = None,
+    user: dict = Depends(require_user),
+) -> dict:
+    return {"items": repository.list_user_contacts(user["id"], q=q, status=status)}
+
+
+@router.get("/contacts/{contact_id}")
+def get_contact(contact_id: str, user: dict = Depends(require_user)) -> dict:
+    contact = repository.get_user_contact(user["id"], contact_id)
+    if contact is None:
+        raise HTTPException(status_code=404, detail="Contact not found")
+    return contact
+
+
 @router.get("/cards/{card_id}")
 def get_card(card_id: str, user: dict = Depends(require_user)) -> dict:
     card = repository.get_user_card(card_id, user["id"])
