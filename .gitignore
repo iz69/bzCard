@@ -4,6 +4,4 @@ dist/
 __pycache__/
 *.pyc
 .env
-android/.gradle/
-android/local.properties
-android/app/build/
+ollama/

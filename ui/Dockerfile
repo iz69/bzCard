@@ -15,7 +15,10 @@ RUN npm run build
 
 FROM nginx:1.27-alpine
 
+ARG VITE_BASE_PATH=/bzcard/
 COPY nginx.conf /etc/nginx/conf.d/default.conf
+RUN base_path="${VITE_BASE_PATH%/}" \
+    && sed -i "s|__BASE_PATH__|${base_path}|g" /etc/nginx/conf.d/default.conf
 COPY --from=build /app/dist /usr/share/nginx/html
 
 EXPOSE 5173

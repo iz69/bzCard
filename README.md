@@ -81,7 +81,7 @@ docker compose up -d ollama
 ```sh
 curl -fL https://huggingface.co/LiquidAI/LFM2.5-1.2B-JP-202606-GGUF/resolve/main/LFM2.5-1.2B-JP-202606-Q4_K_M.gguf -o /tmp/LFM2.5-1.2B-JP-202606-Q4_K_M.gguf
 docker compose exec ollama mkdir -p /root/.ollama/import
-docker cp /tmp/LFM2.5-1.2B-JP-202606-Q4_K_M.gguf bzcard-ollama:/root/.ollama/import/LFM2.5-1.2B-JP-202606-Q4_K_M.gguf
+docker compose cp /tmp/LFM2.5-1.2B-JP-202606-Q4_K_M.gguf ollama:/root/.ollama/import/LFM2.5-1.2B-JP-202606-Q4_K_M.gguf
 docker compose exec ollama sh -lc 'printf "FROM /root/.ollama/import/LFM2.5-1.2B-JP-202606-Q4_K_M.gguf\\nPARAMETER num_ctx 4096\\n" > /root/.ollama/import/Modelfile.lfm-jp'
 docker compose exec ollama ollama create bzcard-lfm-jp:202606 -f /root/.ollama/import/Modelfile.lfm-jp
 rm /tmp/LFM2.5-1.2B-JP-202606-Q4_K_M.gguf
