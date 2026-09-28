@@ -715,6 +715,35 @@ tbody tr:not(.virtualSpacer) {
   padding-left: 20px;
 }
 
+.compactModal .userManagerList {
+  padding-left: 0;
+  list-style: none;
+}
+
+.userManagerList li,
+.userManagerActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.userManagerList li {
+  justify-content: space-between;
+  flex-wrap: wrap;
+  overflow-wrap: anywhere;
+  padding: 8px 0;
+  border-bottom: 1px solid #e4e8ee;
+}
+
+.userDeleteButton {
+  width: auto;
+  padding: 0 10px;
+}
+
+.userManagerActions {
+  flex-shrink: 0;
+}
+
 .formPanel {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

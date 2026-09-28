@@ -5,7 +5,7 @@ import shutil
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 
-from ..auth import require_user
+from ..auth import require_user_data_access as require_user
 from ..services import repository
 from ..services.image_store import (
     card_dir,
@@ -39,13 +39,18 @@ async def upload_card(
             "status": duplicate["status"],
             "duplicate": True,
         }
-    job_id = repository.create_card(
-        card_id,
-        relative_path(original),
-        original_sha256,
-        direction,
-        user["id"],
-    )
+    try:
+        job_id = repository.create_card(
+            card_id,
+            relative_path(original),
+            original_sha256,
+            direction,
+            user["id"],
+        )
+    except ValueError as exc:
+        # The user may have been stopped while the request body was uploading.
+        shutil.rmtree(card_dir(card_id))
+        raise HTTPException(403, str(exc)) from exc
     return {"card_id": card_id, "job_id": job_id, "status": "queued"}
 
 

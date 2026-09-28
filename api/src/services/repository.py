@@ -202,6 +202,9 @@ def create_card(
     now = now_iso()
     job_id = uuid4().hex
     with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM users WHERE id = ? AND status = 'active'", (owner_user_id,)).fetchone() is None:
+            raise ValueError("利用者が無効のため名刺を登録できません")
         conn.execute(
             """
             INSERT INTO cards (
@@ -402,6 +405,10 @@ def _remove_legacy_line_auth_schema(conn) -> None:
 def create_session(token_hash: str, user_id: str, expires_at: str) -> None:
     now = now_iso()
     with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM users WHERE id = ? AND status = 'active'", (user_id,)).fetchone() is None:
+            from fastapi import HTTPException
+            raise HTTPException(403, "このユーザーは利用できません")
         conn.execute(
             """
             INSERT INTO sessions (token_hash, user_id, expires_at, created_at, last_seen_at)
@@ -446,6 +453,84 @@ def change_user_password(user_id: str, password_hash: str) -> None:
             (password_hash, now, user_id),
         )
         conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+
+
+def set_user_status(user_id: str, user_status: str) -> dict | None:
+    """Change a user's availability and revoke sessions when stopping them."""
+    if user_status not in {"active", "stopped"}:
+        raise ValueError("Invalid user status")
+    now = now_iso()
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if existing is None:
+            return None
+        if existing["role"] == "admin":
+            raise ValueError("管理者アカウントは停止できません")
+        conn.execute(
+            "UPDATE users SET status = ?, updated_at = ? WHERE id = ?",
+            (user_status, now, user_id),
+        )
+        if user_status == "stopped":
+            conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+    return get_user_by_id(user_id)
+
+
+def delete_user_and_owned_data(user_id: str) -> list[str] | None:
+    """Caller holds the user's exclusive lock. Fail closed on ambiguous ownership.
+
+    Database changes are atomic. Filesystem failures leave the database/user in
+    place for retry; files already removed from this user cannot be rolled back.
+    """
+    from .user_deletion import owned_image_directories, remove_owned_images
+    with connection() as conn:
+        # Also excludes job claiming and new card registration during deletion.
+        conn.execute("BEGIN IMMEDIATE")
+        user = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if user is None:
+            return None
+        if user["role"] == "admin":
+            raise ValueError("管理者アカウントは削除できません")
+        if conn.execute("SELECT 1 FROM jobs JOIN cards ON cards.id = jobs.card_id WHERE cards.owner_user_id = ? AND jobs.status = 'running'", (user_id,)).fetchone():
+            raise ValueError("名刺を処理中です。完了後に削除を再試行してください")
+        directories = owned_image_directories(conn, user_id)
+        card_ids = [
+            row["id"]
+            for row in conn.execute(
+                "SELECT id FROM cards WHERE owner_user_id = ?", (user_id,)
+            ).fetchall()
+        ]
+        # Connector prefixes include ':' and are matched literally, never LIKE.
+        # A conflicting card owner means the association is unsafe to delete.
+        event_scope = """EXISTS (SELECT 1 FROM line_connections lc
+            WHERE lc.owner_user_id = ? AND substr(line_events.id, 1, length(lc.id) + 1) = lc.id || ':')"""
+        if conn.execute(f"SELECT 1 FROM line_events JOIN cards ON cards.id = line_events.card_id WHERE {event_scope} AND cards.owner_user_id IS NOT ?", (user_id, user_id)).fetchone():
+            raise ValueError("LINE履歴の所有者が一致しないため削除を中止しました")
+        if conn.execute("""SELECT 1 FROM line_events JOIN cards ON cards.id = line_events.card_id
+            JOIN line_connections lc ON substr(line_events.id, 1, length(lc.id) + 1) = lc.id || ':'
+            WHERE cards.owner_user_id = ? AND lc.owner_user_id != ?""", (user_id, user_id)).fetchone():
+            raise ValueError("LINE履歴の所有者が一致しないため削除を中止しました")
+        conn.execute(f"DELETE FROM line_events WHERE {event_scope} OR card_id IN (SELECT id FROM cards WHERE owner_user_id = ?)", (user_id, user_id))
+        batch_ids = [row[0] for row in conn.execute("SELECT DISTINCT import_batch_id FROM cards WHERE owner_user_id = ? AND import_batch_id IS NOT NULL", (user_id,))]
+        if card_ids:
+            deleted_cards = conn.execute(
+                "DELETE FROM cards WHERE owner_user_id = ?", (user_id,)
+            ).rowcount
+            if deleted_cards != len(card_ids):
+                raise RuntimeError("対象ユーザーの名刺削除を完了できませんでした")
+
+        # Removing a connection cascades only to its own link requests.
+        conn.execute("DELETE FROM line_connections WHERE owner_user_id = ?", (user_id,))
+        conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+        deleted_users = conn.execute("DELETE FROM users WHERE id = ?", (user_id,)).rowcount
+        if deleted_users != 1:
+            raise RuntimeError("対象ユーザーの削除を完了できませんでした")
+        for batch_id in batch_ids:
+            conn.execute("DELETE FROM import_batches WHERE id = ? AND NOT EXISTS (SELECT 1 FROM cards WHERE import_batch_id = ?)", (batch_id, batch_id))
+        # Validate/execute every DB constraint before irreversible file removal.
+        # An I/O error rolls back DB changes so this operation can be retried.
+        remove_owned_images(directories)
+    return card_ids
 
 
 def get_default_line_connection() -> dict | None:
@@ -765,23 +850,57 @@ def list_user_contacts(
     if status:
         where.append("status = ?")
         params.append(status)
-    sql = "SELECT * FROM cards WHERE " + " AND ".join(where) + " ORDER BY created_at DESC"
+    # List responses need no OCR blocks/extraction JSON or image metadata. Search
+    # adds OCR text only when needed; keep all cards for cross-card matching.
+    columns = set(CONTACT_SUMMARY_FIELDS) | {"id", "email", "mobile"}
+    if q:
+        columns.update(SEARCH_FIELDS)
+    if include_cards:
+        columns.update(CARD_FIELDS)
+    projection = "*" if include_cards else ", ".join(sorted(columns))
+    sql = "SELECT " + projection + " FROM cards WHERE " + " AND ".join(where)
+    search = _prepare_contact_search(q)
     with get_connection() as conn:
         rows = conn.execute(sql, params).fetchall()
         entries = []
         for row in rows:
-            card = _hydrate_card(conn, row, include_images=False)
-            if card is not None:
-                entries.append((card, _search_score(row, q) if q else 0))
+            card = dict(row)
+            score = _contact_search_score(card, search) if search else 0
+            for field in LIST_OMITTED_FIELDS:
+                card.pop(field, None)
+            entries.append((card, score))
     return _contacts_from_entries(entries, q, include_cards=include_cards)
 
 
 def get_user_contact(user_id: str, contact_id: str) -> dict | None:
     """Resolve a contact by its representative card ID or any member card ID."""
-    for contact in list_user_contacts(user_id, include_cards=True):
-        if contact["id"] == contact_id or any(card["id"] == contact_id for card in contact["cards"]):
-            return contact
-    return None
+    with get_connection() as conn:
+        # Only load identifiers to discover the connected group, then retrieve
+        # full records for that group. Never materialize every person's details.
+        identifiers = [dict(row) for row in conn.execute(
+            "SELECT id, email, mobile FROM cards WHERE owner_user_id = ?", (user_id,)
+        )]
+        members = next((group for group in _contact_groups(identifiers)
+                        if any(card["id"] == contact_id for card in group)), None)
+        if members is None:
+            return None
+        ids = [card["id"] for card in members]
+        cards = []
+        for start in range(0, len(ids), 500):
+            batch = ids[start:start + 500]
+            placeholders = ",".join("?" for _ in batch)
+            cards.extend(dict(row) for row in conn.execute(
+                f"SELECT * FROM cards WHERE owner_user_id = ? AND id IN ({placeholders})",
+                [user_id, *batch],
+            ))
+        if not cards:
+            return None
+        for card in cards:
+            for field in LIST_OMITTED_FIELDS:
+                card.pop(field, None)
+        # Build only the requested person's response, with deterministic ordering.
+        contacts = _contacts_from_entries([(card, 0) for card in cards], None, include_cards=True)
+        return next((contact for contact in contacts if any(card["id"] == contact_id for card in contact["cards"])), None)
 
 
 def get_user_card(card_id: str, user_id: str) -> dict | None:
@@ -795,19 +914,10 @@ def get_user_card(card_id: str, user_id: str) -> dict | None:
         )
 
 
-def _contacts_from_entries(
-    entries: list[tuple[dict, int]],
-    query: str | None,
-    include_cards: bool = False,
-) -> list[dict]:
-    """Build connected groups from exact contact identifiers.
-
-    An equal email address or mobile number is enough to identify a person.
-    A name and company alone are deliberately not enough: people with the same
-    name can work at the same company, so those cases stay separate until a
-    future explicit merge workflow is added.
-    """
-    parents = list(range(len(entries)))
+def _contact_groups(cards: list[dict]) -> list[list[dict]]:
+    """Union each identifier with its first card, avoiding all-pairs comparison."""
+    parents = list(range(len(cards)))
+    sizes = [1] * len(cards)
 
     def find(index: int) -> int:
         while parents[index] != index:
@@ -818,36 +928,48 @@ def _contacts_from_entries(
     def join(left: int, right: int) -> None:
         left_root, right_root = find(left), find(right)
         if left_root != right_root:
+            if sizes[left_root] < sizes[right_root]:
+                left_root, right_root = right_root, left_root
             parents[right_root] = left_root
+            sizes[left_root] += sizes[right_root]
 
-    by_identifier: dict[tuple[str, str], list[int]] = {}
-    for index, (card, _score) in enumerate(entries):
+    by_identifier: dict[tuple[str, str], int] = {}
+    for index, card in enumerate(cards):
         for identifier in _contact_identifiers(card):
-            by_identifier.setdefault(identifier, []).append(index)
+            join(index, by_identifier.setdefault(identifier, index))
 
-    for indices in by_identifier.values():
-        for left_offset, left in enumerate(indices):
-            for right in indices[left_offset + 1:]:
-                if _cards_are_same_contact(entries[left][0], entries[right][0]):
-                    join(left, right)
+    grouped: dict[int, list[dict]] = {}
+    for index, card in enumerate(cards):
+        grouped.setdefault(find(index), []).append(card)
+    return list(grouped.values())
 
-    grouped: dict[int, list[tuple[dict, int]]] = {}
-    for index, entry in enumerate(entries):
-        grouped.setdefault(find(index), []).append(entry)
+
+def _contacts_from_entries(
+    entries: list[tuple[dict, int]],
+    query: str | None,
+    include_cards: bool = False,
+) -> list[dict]:
+    """Group by equal email/mobile, retaining transitive matching and ranking."""
+    scores = {card["id"]: score for card, score in entries}
 
     contacts = []
-    for members in grouped.values():
-        if query and not any(score > 0 for _card, score in members):
+    for cards in _contact_groups([card for card, _score in entries]):
+        if query and not any(scores[card["id"]] > 0 for card in cards):
             continue
-        members.sort(key=lambda item: (item[0].get("created_at") or "", item[0]["id"]), reverse=True)
-        representative = members[0][0]
-        cards = [card for card, _score in members]
+        cards.sort(key=lambda card: (card.get("created_at") or "", card["id"]), reverse=True)
+        representative = cards[0]
+        revision = hashlib.sha256(json.dumps([
+            [card["id"], card.get("updated_at"), card.get("status")]
+            for card in cards
+        ]).encode()).hexdigest()[:20]
         contact = {
             **(representative if include_cards else _contact_summary(representative)),
             "id": representative["id"],
             "representative_card_id": representative["id"],
             "card_count": len(cards),
-            "_search_score": max(score for _card, score in members),
+            "revision": revision,
+            "has_in_progress": any(card.get("status") not in {"ready", "not_card", "error"} for card in cards),
+            "_search_score": max(scores[card["id"]] for card in cards),
         }
         if include_cards:
             contact["cards"] = cards
@@ -1382,6 +1504,40 @@ def _search_score(row, query: str | None) -> int:
                     _field_match_score(row[field], variant, _search_field_weight(field)),
                 )
         score += token_score
+    return score
+
+
+def _prepare_contact_search(query: str | None) -> list[list[tuple[str, str]]]:
+    if not query:
+        return []
+    return [list({(normalized, _remove_search_separators(normalized))
+                  for variant in _query_variants(token)
+                  if (normalized := _search_normalize(variant))})
+            for token in _query_tokens(query)]
+
+
+def _contact_search_score(card: dict, tokens: list[list[tuple[str, str]]]) -> int:
+    # Normalize each field once per card and query variants once per request.
+    fields = []
+    for field in SEARCH_FIELDS:
+        value = _search_normalize(card.get(field))
+        if value:
+            fields.append((value, _remove_search_separators(value), _search_field_weight(field)))
+    score = 0
+    for variants in tokens:
+        best = 0
+        for token, compact_token in variants:
+            for value, compact_value, weight in fields:
+                if value == token or compact_value == compact_token:
+                    match = weight + 1000
+                elif value.startswith(token) or compact_value.startswith(compact_token):
+                    match = weight + 600
+                elif token in value or compact_token in compact_value:
+                    match = weight + 100
+                else:
+                    match = 0
+                best = max(best, match)
+        score += best
     return score
 
 

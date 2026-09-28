@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials
 
@@ -7,6 +9,7 @@ from ..auth import bearer_scheme, hash_password, issue_session, require_user, re
 from ..config import settings
 from ..database import backup_before_local_auth
 from ..services import repository
+from ..services.user_data_lock import user_data_lock
 
 
 router = APIRouter(prefix="/api/auth")
@@ -86,6 +89,47 @@ def list_users(admin: dict = Depends(require_user)) -> dict:
     return {"items": [_public_user(user) for user in repository.list_users()]}
 
 
+@router.post("/users/{user_id}/stop")
+def stop_user(user_id: str, admin: dict = Depends(require_user)) -> dict:
+    target = _manageable_user(user_id, admin)
+    user = repository.set_user_status(target["id"], "stopped")
+    if user is None:
+        raise HTTPException(404, "ユーザーが見つかりません")
+    return {"user": _public_user(user)}
+
+
+@router.post("/users/{user_id}/activate")
+def activate_user(user_id: str, admin: dict = Depends(require_user)) -> dict:
+    target = _manageable_user(user_id, admin)
+    user = repository.set_user_status(target["id"], "active")
+    if user is None:
+        raise HTTPException(404, "ユーザーが見つかりません")
+    return {"user": _public_user(user)}
+
+
+@router.delete("/users/{user_id}")
+def delete_user(user_id: str, payload: dict, admin: dict = Depends(require_user)) -> dict:
+    target = _manageable_user(user_id, admin)
+    confirmation = str(payload.get("confirm_login_id") or "")
+    if confirmation != target["login_id"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="削除確認のログインIDが一致しません",
+        )
+
+    try:
+        with user_data_lock(target["id"], exclusive=True):
+            card_ids = repository.delete_user_and_owned_data(target["id"])
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except OSError as exc:
+        logging.getLogger(__name__).exception("User image deletion failed")
+        raise HTTPException(500, "画像の削除を完了できませんでした。利用者を残しています。再試行してください") from exc
+    if card_ids is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="ユーザーが見つかりません")
+    return {"status": "deleted"}
+
+
 def _credentials(payload: dict) -> tuple[str, str]:
     login_id = str(payload.get("login_id") or "").strip()
     password = str(payload.get("password") or "")
@@ -103,6 +147,27 @@ def _validate_password(password: str) -> None:
 def _require_multi_user_mode() -> None:
     if not settings.multi_user_enabled:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="シングルユーザーモードでは利用者を追加・管理できません")
+
+
+def _manageable_user(user_id: str, admin: dict) -> dict:
+    _require_multi_user_mode()
+    if admin["role"] != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="管理者権限が必要です")
+    target = repository.get_user_by_id(user_id)
+    if target is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="ユーザーが見つかりません")
+    if target["id"] == admin["id"] or target["role"] == "admin":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="管理者アカウントは停止または削除できません",
+        )
+    connection = repository.get_user_line_connection(target["id"])
+    if connection is not None and connection["id"] == "default":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="既定のLINE接続を持つユーザーは停止または削除できません",
+        )
+    return target
 
 
 def _public_user(user: dict) -> dict:

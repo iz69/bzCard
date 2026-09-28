@@ -13,6 +13,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from .services import repository
 from .config import settings
 from .services.timeutil import now_iso
+from .services.user_data_lock import user_data_lock
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -45,6 +46,13 @@ def require_user(credentials: HTTPAuthorizationCredentials | None = Depends(bear
 
 def _session_token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def require_user_data_access(credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme)):
+    user = require_user(credentials)
+    with user_data_lock(user["id"]):
+        # Deletion/stopping may have happened between authentication and locking.
+        yield require_user(credentials)
 
 
 def issue_session(user_id: str) -> tuple[str, str]:

@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 
 from ..auth import issue_session, user_allowed_in_current_mode
 from ..services import repository
+from ..services.user_data_lock import user_data_lock
 from ..services.image_store import card_dir, make_card_id, relative_path, save_original_bytes, sha256_file
 
 logger = logging.getLogger("bzcard.line")
@@ -22,6 +23,17 @@ VERIFY = "https://api.line.me/oauth2/v2.1/verify"
 
 @router.post("/auth/login")
 def liff_login(payload: dict) -> dict:
+    connection = repository.get_line_connection(str(payload.get("connection_id") or ""))
+    if connection is None:
+        raise HTTPException(400, "LIFF connection is not configured")
+    with user_data_lock(connection["owner_user_id"]):
+        user = repository.get_user_by_id(connection["owner_user_id"])
+        if not user or user["status"] != "active" or not user_allowed_in_current_mode(user):
+            raise HTTPException(403, "Linked user is unavailable")
+        return _liff_login(payload)
+
+
+def _liff_login(payload: dict) -> dict:
     connection = repository.get_line_connection(str(payload.get("connection_id") or ""))
     token = str(payload.get("id_token") or "")
     if not connection or not token or not connection.get("line_login_channel_id"):
@@ -60,7 +72,7 @@ async def webhook(request: Request) -> dict:
     if connection is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid LINE signature")
     owner = repository.get_user_by_id(connection["owner_user_id"])
-    if owner is None or not user_allowed_in_current_mode(owner):
+    if owner is None or owner["status"] != "active" or not user_allowed_in_current_mode(owner):
         logger.info("ignored LINE webhook for a disabled user connection")
         return {"status": "disabled"}
     for event in (await request.json()).get("events", []):
@@ -90,6 +102,14 @@ def _connection_for_signature(body: bytes, signature: str) -> dict | None:
 
 
 def _handle(event: dict, connection: dict) -> None:
+    with user_data_lock(connection["owner_user_id"]):
+        owner = repository.get_user_by_id(connection["owner_user_id"])
+        if not owner or owner["status"] != "active" or not user_allowed_in_current_mode(owner):
+            return
+        _handle_owned_event(event, connection)
+
+
+def _handle_owned_event(event: dict, connection: dict) -> None:
     message = event.get("message") or {}
     raw_id = event.get("webhookEventId") or message.get("id")
     if not raw_id:
@@ -137,7 +157,11 @@ def _handle(event: dict, connection: dict) -> None:
             repository.finish_line_event(event_id, "duplicate", duplicate["id"])
             _reply(reply_token, _link_message("すでに登録済みの名刺でした。", duplicate["id"], connection), connection)
             return
-        repository.create_card(card_id, relative_path(original), digest, "auto", owner)
+        try:
+            repository.create_card(card_id, relative_path(original), digest, "auto", owner)
+        except ValueError:
+            shutil.rmtree(card_dir(card_id))
+            raise
         repository.set_card_source(card_id, "line", message["id"])
         repository.finish_line_event(event_id, "queued", card_id)
         _reply(reply_token, _link_message("名刺画像を受け付けました。", card_id, connection), connection)

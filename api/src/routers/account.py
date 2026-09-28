@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from ..auth import require_user, user_allowed_in_current_mode
+from ..auth import require_user_data_access as require_user, user_allowed_in_current_mode
 from ..services import repository
 
 router = APIRouter(prefix="/api/line-connections")

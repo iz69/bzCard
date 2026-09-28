@@ -18,6 +18,7 @@ import {
   Upload,
 } from 'lucide-react';
 import './styles.css';
+import { mergeServerCard } from './cardSync';
 
 type Card = {
   id: string;
@@ -57,6 +58,8 @@ type Contact = Card & {
   representative_card_id: string;
   card_count: number;
   cards?: Card[];
+  revision?: string;
+  has_in_progress?: boolean;
 };
 
 type Session = {
@@ -143,6 +146,8 @@ function App() {
   const [detailLoading, setDetailLoading] = useState(false);
   const [selectedContactDetail, setSelectedContactDetail] = useState<Contact | undefined>();
   const [query, setQuery] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState('');
+  const [detailRefresh, setDetailRefresh] = useState(0);
   const [status, setStatus] = useState('');
   const [toast, setToast] = useState<{ id: number; text: string } | null>(null);
   const [loading, setLoading] = useState(false);
@@ -155,6 +160,9 @@ function App() {
   const [listScrollTop, setListScrollTop] = useState(0);
   const [listViewportHeight, setListViewportHeight] = useState(0);
   const listRequestRef = useRef(0);
+  const listControllerRef = useRef<AbortController | null>(null);
+  const selectionRef = useRef({ contactId: selectedContactId, cardId: selectedCardId });
+  selectionRef.current = { contactId: selectedContactId, cardId: selectedCardId };
   const listViewportRef = useRef<HTMLDivElement>(null);
   const accountMenuRef = useRef<HTMLDivElement>(null);
   const toastIdRef = useRef(0);
@@ -165,10 +173,14 @@ function App() {
   }, []);
 
   const authed = session.token.trim().length > 0;
-  const hasInProgressCards = contacts.some((contact) => !terminalCardStatuses.has(contact.status));
+  const hasInProgressCards = contacts.some((contact) => contact.has_in_progress ?? !terminalCardStatuses.has(contact.status));
   const selectedContact = selectedContactId ? contacts.find((contact) => contact.id === selectedContactId) : undefined;
+  const selectedRevision = selectedContact?.revision || `${selectedContact?.status}:${selectedContact?.updated_at}`;
   const selected = selectedDetail?.id === selectedCardId ? selectedDetail : undefined;
-  const relatedCards = selectedContactDetail?.cards || [];
+  // A status filter can hide a processing historical card from the summary.
+  // Keep that selected detail polling until its own processing has finished.
+  const needsDetailPolling = Boolean(selected && !terminalCardStatuses.has(selected.status) && !selectedContact?.has_in_progress);
+  const relatedCards = selectedContactDetail?.id === selectedContactId ? selectedContactDetail.cards || [] : [];
   const listRowHeight = 61;
   const listOverscan = 8;
   const firstVisibleContact = Math.max(0, Math.floor(listScrollTop / listRowHeight) - listOverscan);
@@ -178,30 +190,48 @@ function App() {
 
   const api = useMemo(() => makeApi(session), [session]);
 
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedQuery(query), 300);
+    return () => window.clearTimeout(timer);
+  }, [query]);
+
   const reload = useCallback(async () => {
     if (!authed) return;
+    listControllerRef.current?.abort();
+    const controller = new AbortController();
+    listControllerRef.current = controller;
     const requestId = listRequestRef.current + 1;
     listRequestRef.current = requestId;
     setLoading(true);
     try {
       const params = new URLSearchParams();
-      if (query) params.set('q', query);
+      if (debouncedQuery) params.set('q', debouncedQuery);
       if (status) params.set('status', status);
-      const data = await api.get(`/api/contacts?${params.toString()}`);
+      const data = await api.get(`/api/contacts?${params.toString()}`, controller.signal);
       if (requestId !== listRequestRef.current) return;
       const items: Contact[] = data.items || [];
+      const selection = selectionRef.current;
+      let regrouped: Contact | undefined;
+      // Processing can merge the selected card into an existing person, whose
+      // representative ID differs. Keep that card selected when still listed.
+      if (selection.cardId && !items.some((item) => item.id === selection.contactId)) {
+        try {
+          const resolved: Contact = await api.get(`/api/contacts/${selection.cardId}`, controller.signal);
+          regrouped = items.find((item) => item.id === resolved.id);
+        } catch (error) {
+          if (controller.signal.aborted) throw error;
+        }
+      }
+      if (requestId !== listRequestRef.current) return;
       setContacts(items);
-      setSelectedContactId((currentContactId) => {
-        const next = items.find((contact) => contact.id === currentContactId) || items[0];
-        setSelectedCardId((currentCardId) => (
-          next?.id === currentContactId && currentCardId
-            ? currentCardId
-            : next?.representative_card_id || ''
-        ));
-        return next?.id || '';
-      });
+      if (selectionRef.current.cardId === selection.cardId && selectionRef.current.contactId === selection.contactId) {
+        const retained = items.find((item) => item.id === selection.contactId) || regrouped;
+        const next = retained || items[0];
+        setSelectedContactId(next?.id || '');
+        setSelectedCardId(retained && selection.cardId ? selection.cardId : next?.representative_card_id || '');
+      }
     } catch (error) {
-      if (requestId === listRequestRef.current) {
+      if (!controller.signal.aborted && requestId === listRequestRef.current) {
         const text = errorMessage(error);
         showToast(text);
         if (text.includes('シングルユーザーモード')) {
@@ -211,22 +241,35 @@ function App() {
     } finally {
       if (requestId === listRequestRef.current) {
         setLoading(false);
+        listControllerRef.current = null;
       }
     }
-  }, [api, authed, query, session.apiBase, showToast, status]);
+  }, [api, authed, debouncedQuery, session.apiBase, showToast, status]);
+
+  const refresh = useCallback(async () => {
+    await reload();
+    setDetailRefresh((value) => value + 1);
+  }, [reload]);
 
   useEffect(() => {
     reload();
     return () => {
       listRequestRef.current += 1;
+      listControllerRef.current?.abort();
+      listControllerRef.current = null;
     };
   }, [reload]);
 
   useEffect(() => {
-    if (!authed || !hasInProgressCards) return;
-    const timer = window.setInterval(reload, 5000);
+    if (!authed || (!hasInProgressCards && !needsDetailPolling)) return;
+    const timer = window.setInterval(() => {
+      if (!listControllerRef.current) {
+        void reload();
+        if (needsDetailPolling) setDetailRefresh((value) => value + 1);
+      }
+    }, 5000);
     return () => window.clearInterval(timer);
-  }, [authed, hasInProgressCards, reload]);
+  }, [authed, hasInProgressCards, needsDetailPolling, reload]);
 
   useEffect(() => {
     if (!authed || !selectedCardId) {
@@ -235,22 +278,24 @@ function App() {
       return;
     }
     let cancelled = false;
-    setSelectedDetail(undefined);
+    const controller = new AbortController();
+    setSelectedDetail((current) => current?.id === selectedCardId ? current : undefined);
     setDetailLoading(true);
-    api.get(`/api/cards/${selectedCardId}`)
+    api.get(`/api/cards/${selectedCardId}`, controller.signal)
       .then((card) => {
         if (!cancelled) setSelectedDetail(card);
       })
       .catch((error) => {
-        if (!cancelled) showToast(errorMessage(error));
+        if (!cancelled && !controller.signal.aborted) showToast(errorMessage(error));
       })
       .finally(() => {
         if (!cancelled) setDetailLoading(false);
       });
     return () => {
       cancelled = true;
+      controller.abort();
     };
-  }, [api, authed, selectedCardId, showToast]);
+  }, [api, authed, selectedCardId, selectedRevision, detailRefresh, showToast]);
 
   useEffect(() => {
     if (!authed || !selectedContactId) {
@@ -258,18 +303,22 @@ function App() {
       return;
     }
     let cancelled = false;
-    setSelectedContactDetail(undefined);
-    api.get(`/api/contacts/${selectedContactId}`)
+    const controller = new AbortController();
+    api.get(`/api/contacts/${selectedContactId}`, controller.signal)
       .then((contact) => {
-        if (!cancelled) setSelectedContactDetail(contact);
+        if (!cancelled) {
+          setSelectedContactDetail(contact);
+          setSelectedCardId((current) => contact.cards?.some((card: Card) => card.id === current) ? current : contact.representative_card_id);
+        }
       })
       .catch((error) => {
-        if (!cancelled) showToast(errorMessage(error));
+        if (!cancelled && !controller.signal.aborted) showToast(errorMessage(error));
       });
     return () => {
       cancelled = true;
+      controller.abort();
     };
-  }, [api, authed, selectedContactId, showToast]);
+  }, [api, authed, selectedContactId, selectedRevision, detailRefresh, showToast]);
 
   useEffect(() => {
     const viewport = listViewportRef.current;
@@ -358,8 +407,8 @@ function App() {
           <p>{runtimeVersionLabel(runtimeVersions)}</p>
         </div>
         <div className="topActions">
-          <UploadPanel api={api} onUploaded={reload} onMessage={showToast} />
-          <button className="iconButton" onClick={reload} title="再読み込み">
+          <UploadPanel api={api} onUploaded={refresh} onMessage={showToast} />
+          <button className="iconButton" onClick={refresh} title="再読み込み">
             {loading ? <Loader2 className="spin" /> : <RefreshCcw />}
           </button>
           <div className="accountMenu" ref={accountMenuRef}>
@@ -377,7 +426,7 @@ function App() {
                 <button role="menuitem" onClick={() => { setPasswordChangeOpen(true); setAccountMenuOpen(false); }}>パスワード変更</button>
                 <button role="menuitem" onClick={() => { setSettingsOpen(true); setAccountMenuOpen(false); }}>LINE設定</button>
                 {currentUser?.role === 'admin' && currentUser.multiUserEnabled && (
-                  <button role="menuitem" onClick={() => { setUsersOpen(true); setAccountMenuOpen(false); }}>利用者一覧・追加</button>
+                  <button role="menuitem" onClick={() => { setUsersOpen(true); setAccountMenuOpen(false); }}>利用者管理</button>
                 )}
                 <div className="accountMenuDivider" />
                 <button
@@ -472,7 +521,7 @@ function App() {
               card={selected}
               relatedCards={relatedCards}
               onSelectRelatedCard={setSelectedCardId}
-              onChanged={reload}
+              onChanged={refresh}
               onMessage={showToast}
             />
           ) : detailLoading ? (
@@ -904,11 +953,103 @@ function PasswordChange({
 }
 
 function UserManager({ api, onClose }: { api: ReturnType<typeof makeApi>; onClose: () => void }) {
-  const [items,setItems]=useState<Array<{id:string;login_id:string;role:string;status:string}>>([]); const [login_id,setId]=useState(''); const [password,setPassword]=useState(''); const [message,setMessage]=useState('');
-  const reload=()=>api.get('/api/auth/users').then((r)=>setItems(r.items||[])).catch((e)=>setMessage(errorMessage(e)));
-  useEffect(() => { void reload(); }, [api]);
-  async function create(e:React.FormEvent){e.preventDefault();try{await api.post('/api/auth/users',{login_id,password});setId('');setPassword('');setMessage('ユーザーを作成しました');reload();}catch(e){setMessage(errorMessage(e));}}
-  return <div className="imageModalBackdrop"><section className="imageModal compactModal"><div className="imageModalHeader"><b>利用者一覧・追加</b><button type="button" onClick={onClose}>×</button></div><p>ここで作成するアカウントは一般ユーザーです。管理者権限は付与されず、自分の名刺だけを閲覧・操作できます。</p><form onSubmit={create}><label>ログインID<input value={login_id} onChange={(e)=>setId(e.target.value)} required/></label><label>初期パスワード（12文字以上）<input type="password" value={password} onChange={(e)=>setPassword(e.target.value)} minLength={12} required/></label><button className="primaryButton">利用者を追加</button></form>{message&&<div className="errorBox">{message}</div>}<ul>{items.map((u)=><li key={u.id}>{u.login_id} — {u.role} / {u.status}</li>)}</ul></section></div>;
+  type ManagedUser = { id: string; login_id: string; role: string; status: string };
+  const [items, setItems] = useState<ManagedUser[]>([]);
+  const [loginId, setLoginId] = useState('');
+  const [password, setPassword] = useState('');
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<ManagedUser | null>(null);
+  const [confirmation, setConfirmation] = useState('');
+  const reload = useCallback(async () => {
+    const result = await api.get('/api/auth/users');
+    setItems(result.items || []);
+  }, [api]);
+  useEffect(() => { void reload().catch((e) => setMessage(errorMessage(e))); }, [reload]);
+
+  async function create(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setMessage('');
+    try {
+      await api.post('/api/auth/users', { login_id: loginId, password });
+      setLoginId('');
+      setPassword('');
+      setMessage('一般ユーザーを作成しました');
+      await reload();
+    } catch (error) {
+      setMessage(errorMessage(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function changeStatus(user: ManagedUser) {
+    const stopping = user.status === 'active';
+    const action = stopping ? '停止' : '再開';
+    if (!window.confirm(`「${user.login_id}」を${action}しますか？${stopping ? 'ログインと既存セッションが無効になります。データは残ります。' : ''}`)) return;
+    setBusy(true);
+    setMessage('');
+    try {
+      await api.post(`/api/auth/users/${encodeURIComponent(user.id)}/${stopping ? 'stop' : 'activate'}`, {});
+      setMessage(`「${user.login_id}」を${action}しました`);
+      await reload();
+    } catch (error) {
+      setMessage(errorMessage(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove(e: React.FormEvent) {
+    e.preventDefault();
+    if (!deleteTarget || confirmation !== deleteTarget.login_id || busy) return;
+    setBusy(true);
+    setMessage('');
+    try {
+      await api.delete(`/api/auth/users/${encodeURIComponent(deleteTarget.id)}`, { confirm_login_id: confirmation });
+      setMessage(`「${deleteTarget.login_id}」と所有データを削除しました`);
+      setDeleteTarget(null);
+      setConfirmation('');
+      await reload();
+    } catch (error) {
+      setMessage(errorMessage(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <div className="imageModalBackdrop">
+    <section className="imageModal compactModal" role="dialog" aria-modal="true" aria-labelledby="user-manager-title">
+      <div className="imageModalHeader"><b id="user-manager-title">利用者管理</b><button type="button" disabled={busy} onClick={onClose} aria-label="閉じる">×</button></div>
+      <p>停止するとログインできなくなり、既存セッションも無効になります。再開すると再ログインできます。管理者は停止・削除できません。</p>
+      {message && <div className="errorBox" role="status">{message}</div>}
+      {deleteTarget ? <form onSubmit={remove}>
+        <b>「{deleteTarget.login_id}」を削除</b>
+        <p>この利用者の名刺・画像・LINE連携設定・履歴を削除します。この操作は取り消せません。保存済みバックアップは対象外です。</p>
+        <label>確認のためログインID「{deleteTarget.login_id}」を入力
+          <input autoFocus value={confirmation} onChange={(e) => setConfirmation(e.target.value)} autoComplete="off" disabled={busy} required />
+        </label>
+        <div className="userManagerActions">
+          <button type="button" className="textButton" disabled={busy} onClick={() => { setDeleteTarget(null); setConfirmation(''); }}>キャンセル</button>
+          <button type="submit" className="dangerButton userDeleteButton" disabled={busy || confirmation !== deleteTarget.login_id}>{busy ? '削除中…' : 'データを含めて削除'}</button>
+        </div>
+      </form> : <>
+        <form onSubmit={create}>
+          <label>ログインID<input value={loginId} onChange={(e) => setLoginId(e.target.value)} maxLength={128} disabled={busy} required /></label>
+          <label>初期パスワード（12文字以上）<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" minLength={12} disabled={busy} required /></label>
+          <button className="primaryButton" disabled={busy}>一般ユーザーを追加</button>
+        </form>
+        <ul className="userManagerList">{items.map((user) => <li key={user.id}>
+          <span>{user.login_id} — {user.role === 'admin' ? '管理者' : '一般'} / {user.status === 'active' ? '有効' : '停止中'}</span>
+          {user.role !== 'admin' && <span className="userManagerActions">
+            <button type="button" className="textButton" disabled={busy} onClick={() => changeStatus(user)}>{user.status === 'active' ? '停止' : '再開'}</button>
+            <button type="button" className="dangerButton userDeleteButton" disabled={busy} onClick={() => { setDeleteTarget(user); setConfirmation(''); setMessage(''); }}>削除</button>
+          </span>}
+        </li>)}</ul>
+      </>}
+    </section>
+  </div>;
 }
 
 function Login({ onLoggedIn }: { onLoggedIn: (session: Session) => void }) {
@@ -1050,6 +1191,7 @@ function CardDetail({
   onMessage: (message: string) => void;
 }) {
   const [draft, setDraft] = useState<Card>(card);
+  const previousServerCard = useRef(card);
   const [imageMode, setImageMode] = useState<'processed' | 'original'>('processed');
   const [imageSide, setImageSide] = useState<'front' | 'back'>('front');
   const [direction, setDirection] = useState('auto');
@@ -1057,7 +1199,11 @@ function CardDetail({
   const [orientationBusy, setOrientationBusy] = useState(false);
   const [zoomPath, setZoomPath] = useState('');
 
-  useEffect(() => setDraft(card), [card.id, card.updated_at]);
+  useEffect(() => {
+    const previous = previousServerCard.current;
+    setDraft((current) => mergeServerCard(current, previous, card, fields.map(([key]) => key)));
+    previousServerCard.current = card;
+  }, [card]);
   useEffect(() => {
     if (imageSide === 'back' && !card.back_original_image_path) {
       setImageSide('front');
@@ -1070,7 +1216,9 @@ function CardDetail({
       payload[key] = draft[key] as string | undefined;
     });
     try {
-      await api.patch(`/api/cards/${card.id}`, payload);
+      const saved: Card = await api.patch(`/api/cards/${card.id}`, payload);
+      setDraft((current) => mergeServerCard(current, draft, saved, fields.map(([key]) => key)));
+      previousServerCard.current = saved;
       onMessage('保存しました');
       onChanged();
     } catch (error) {
@@ -1583,7 +1731,7 @@ function makeApi(session: Session) {
   }
 
   return {
-    get: (path: string) => request(path),
+    get: (path: string, signal?: AbortSignal) => request(path, { signal }),
     post: (path: string, body: unknown) =>
       request(path, {
         method: 'POST',
@@ -1602,9 +1750,11 @@ function makeApi(session: Session) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       }),
-    delete: (path: string) =>
+    delete: (path: string, body?: unknown) =>
       request(path, {
         method: 'DELETE',
+        headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
       }),
     postForm: (path: string, body: FormData) =>
       request(path, {
