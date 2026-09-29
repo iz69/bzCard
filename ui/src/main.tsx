@@ -1566,7 +1566,7 @@ function TagList({ tags, showEmpty = true }: { tags?: string; showEmpty?: boolea
   return (
     <div className="tagList">
       {items.map((tag) => (
-        <span className="tagPill" key={tag}>{tag}</span>
+        <span className="tagPill" key={tag} title={tag}>{tag}</span>
       ))}
     </div>
   );

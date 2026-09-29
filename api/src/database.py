@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sqlite3
-import hashlib
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -252,8 +251,6 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_line_connections_owner_user_id ON line_connections(owner_user_id)")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_line_connections_line_user_id ON line_connections(line_user_id) WHERE line_user_id IS NOT NULL")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_line_connections_owner_user_id_unique ON line_connections(owner_user_id)")
-        _backfill_original_hashes(conn)
-        _backfill_card_images(conn)
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -261,156 +258,6 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition
     if any(row["name"] == column for row in rows):
         return
     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
-
-def _backfill_original_hashes(conn: sqlite3.Connection) -> None:
-    rows = conn.execute(
-        """
-        SELECT id, original_image_path
-        FROM cards
-        WHERE original_sha256 IS NULL OR original_sha256 = ''
-        """
-    ).fetchall()
-    for row in rows:
-        path = settings.data_dir / row["original_image_path"]
-        if not path.exists():
-            continue
-        conn.execute(
-            "UPDATE cards SET original_sha256 = ? WHERE id = ?",
-            (_sha256_file(path), row["id"]),
-        )
-
-    rows = conn.execute(
-        """
-        SELECT id, back_original_image_path
-        FROM cards
-        WHERE back_original_image_path IS NOT NULL
-          AND back_original_image_path != ''
-          AND (back_original_sha256 IS NULL OR back_original_sha256 = '')
-        """
-    ).fetchall()
-    for row in rows:
-        path = settings.data_dir / row["back_original_image_path"]
-        if not path.exists():
-            continue
-        conn.execute(
-            "UPDATE cards SET back_original_sha256 = ? WHERE id = ?",
-            (_sha256_file(path), row["id"]),
-        )
-
-
-def _backfill_card_images(conn: sqlite3.Connection) -> None:
-    rows = conn.execute(
-        """
-        SELECT
-            id, original_sha256, original_image_path, processed_image_path, thumbnail_path,
-            ocr_direction, ocr_text, ocr_blocks_json, ocr_duration_ms,
-            back_original_sha256, back_original_image_path, back_processed_image_path,
-            back_thumbnail_path, back_ocr_direction, back_ocr_text, back_ocr_blocks_json,
-            back_ocr_duration_ms, created_at, updated_at
-        FROM cards
-        """
-    ).fetchall()
-    for row in rows:
-        if row["original_image_path"]:
-            _insert_card_image_from_legacy(
-                conn=conn,
-                card_id=row["id"],
-                side="front",
-                original_sha256=row["original_sha256"],
-                original_image_path=row["original_image_path"],
-                processed_image_path=row["processed_image_path"],
-                thumbnail_path=row["thumbnail_path"],
-                ocr_direction=row["ocr_direction"],
-                ocr_text=row["ocr_text"],
-                ocr_blocks_json=row["ocr_blocks_json"],
-                ocr_duration_ms=row["ocr_duration_ms"],
-                created_at=row["created_at"],
-                updated_at=row["updated_at"],
-            )
-        if row["back_original_image_path"]:
-            _insert_card_image_from_legacy(
-                conn=conn,
-                card_id=row["id"],
-                side="back",
-                original_sha256=row["back_original_sha256"],
-                original_image_path=row["back_original_image_path"],
-                processed_image_path=row["back_processed_image_path"],
-                thumbnail_path=row["back_thumbnail_path"],
-                ocr_direction=row["back_ocr_direction"],
-                ocr_text=row["back_ocr_text"],
-                ocr_blocks_json=row["back_ocr_blocks_json"],
-                ocr_duration_ms=row["back_ocr_duration_ms"],
-                created_at=row["created_at"],
-                updated_at=row["updated_at"],
-            )
-
-
-def _insert_card_image_from_legacy(
-    conn: sqlite3.Connection,
-    card_id: str,
-    side: str,
-    original_sha256: str | None,
-    original_image_path: str,
-    processed_image_path: str | None,
-    thumbnail_path: str | None,
-    ocr_direction: str | None,
-    ocr_text: str | None,
-    ocr_blocks_json: str | None,
-    ocr_duration_ms: int | None,
-    created_at: str,
-    updated_at: str,
-) -> None:
-    width, height, file_size = _image_metadata(settings.data_dir / original_image_path)
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO card_images (
-            id, card_id, side, original_sha256, original_image_path, processed_image_path,
-            thumbnail_path, ocr_direction, ocr_text, ocr_blocks_json, ocr_duration_ms,
-            width, height, file_size, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            f"{card_id}:{side}",
-            card_id,
-            side,
-            original_sha256,
-            original_image_path,
-            processed_image_path,
-            thumbnail_path,
-            ocr_direction or "horizontal",
-            ocr_text,
-            ocr_blocks_json,
-            ocr_duration_ms,
-            width,
-            height,
-            file_size,
-            created_at,
-            updated_at,
-        ),
-    )
-
-
-def _image_metadata(path: Path) -> tuple[int | None, int | None, int | None]:
-    if not path.exists():
-        return None, None, None
-    file_size = path.stat().st_size
-    try:
-        from PIL import Image
-
-        with Image.open(path) as image:
-            width, height = image.size
-        return width, height, file_size
-    except Exception:
-        return None, None, file_size
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict | None:

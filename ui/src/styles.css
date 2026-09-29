@@ -852,6 +852,20 @@ tbody tr:not(.virtualSpacer) {
   background: #eef7f5;
 }
 
+/* The virtualized table assumes a fixed row height, including narrow layouts. */
+.tableWrap .tagList {
+  flex-wrap: nowrap;
+  white-space: nowrap;
+}
+
+.tableWrap .tagPill {
+  display: block;
+  flex: 0 0 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .tagPill button {
   width: 18px;
   height: 18px;
