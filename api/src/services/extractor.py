@@ -42,7 +42,9 @@ def extract_card_fields(raw_text: str, blocks: list[dict]) -> ExtractionResult:
     raw = _generate_structured_response(prompt)
     data = _parse_json_object(raw)
     normalized = {key: _string_or_empty(data.get(key)) for key in SCHEMA_KEYS}
+    _correct_person_name_order(normalized, blocks)
     _refine_person_name_kana(normalized, source_text, blocks)
+    _prefer_labeled_phone_numbers(normalized, source_text)
     _remove_ungrounded_values(normalized, source_text)
     normalized["_raw"] = data
     duration_ms = int((time.perf_counter() - started) * 1000)
@@ -183,8 +185,8 @@ def _build_prompt(raw_text: str, blocks: list[dict]) -> str:
 OCRテキストにない値を補完・創作してはいけません。ただし person_name_kana の読みの推測だけは、下記の規則に従って許可します。
 email は @ を含むOCR上のメールアドレスだけを入れてください。email を mobile、fax、tel に入れてはいけません。
 tel と mobile には電話番号だけを入れてください。fax にはOCR上で FAX と明示された電話番号だけを入れてください。
-department には部署名だけを、title には役職名だけを入れてください。OCR上にない項目は空文字にしてください。
-person_name_kana は氏名の読みをひらがなで入れてください。姓名の間には半角スペースを1つ入れてください。
+department には部署名を入れ、部・課・グループなどが複数行に分かれている場合は上位から順にすべて含めてください。title には役職名だけを入れてください。OCR上にない項目は空文字にしてください。
+person_name_kana は氏名の読みをひらがなだけで入れてください。漢字や別人の名前を混ぜないでください。姓名の間には半角スペースを1つ入れてください。
 OCRテキスト内にふりがな・フリガナがある場合はそれを優先してください。
 ふりがながない場合でも、日本人名として自然で一般的な読みを推測してください。
 ローマ字表記がある場合は読み推測の強い手がかりとして使い、person_name_kana にはローマ字ではなくひらがなを入れてください。
@@ -255,17 +257,41 @@ def _spatial_name_candidates(blocks: list[dict]) -> list[str]:
         )
 
     candidates: list[str] = []
-    for line_blocks in by_side.values():
-        line_blocks.sort(key=lambda item: (item["box"][0], item["box"][1]))
-        run: list[dict] = []
-        for block in line_blocks:
-            if run and _is_horizontal_neighbour(run[-1], block):
-                run.append(block)
-                continue
+    for side_blocks in by_side.values():
+        lines: list[list[dict]] = []
+        for block in sorted(side_blocks, key=lambda item: (item["box"][1] + item["box"][3]) / 2):
+            line = next((line for line in lines if _same_text_line(line[0], block)), None)
+            if line is None:
+                lines.append([block])
+            else:
+                line.append(block)
+        for line in lines:
+            line.sort(key=lambda item: item["box"][0])
+            run: list[dict] = []
+            for block in line:
+                if run and _is_horizontal_neighbour(run[-1], block):
+                    run.append(block)
+                    continue
+                _append_name_candidate(candidates, run)
+                run = [block]
             _append_name_candidate(candidates, run)
-            run = [block]
-        _append_name_candidate(candidates, run)
     return candidates
+
+
+def _same_text_line(left: dict, right: dict) -> bool:
+    left_y1, left_y2 = left["box"][1], left["box"][3]
+    right_y1, right_y2 = right["box"][1], right["box"][3]
+    return abs((left_y1 + left_y2) - (right_y1 + right_y2)) / 2 <= min(left_y2 - left_y1, right_y2 - right_y1) * 0.4
+
+
+def _correct_person_name_order(data: dict, blocks: list[dict]) -> None:
+    """Use the printed left-to-right order when the model reverses two name blocks."""
+    parts = (data.get("person_name") or "").split()
+    if len(parts) != 2:
+        return
+    candidates = _spatial_name_candidates(blocks)
+    if parts[1] + parts[0] in candidates and parts[0] + parts[1] not in candidates:
+        data["person_name"] = f"{parts[1]} {parts[0]}"
 
 
 def _append_name_candidate(candidates: list[str], blocks: list[dict]) -> None:
@@ -290,7 +316,7 @@ def _is_horizontal_neighbour(left: dict, right: dict) -> bool:
     if center_difference > min(left_height, right_height) * 0.4:
         return False
     gap = right_x1 - left_x2
-    return -min(left_height, right_height) * 0.15 <= gap <= (left_height + right_height) * 0.7
+    return -min(left_height, right_height) * 0.3 <= gap <= (left_height + right_height) * 0.7
 
 
 def _kanji_text(value) -> str:
@@ -341,7 +367,7 @@ def _refine_person_name_kana(data: dict, raw_text: str, blocks: list[dict] | Non
     """Prefer printed phonetic evidence over an LLM's kanji-only guess."""
     name = data.get("person_name") or ""
     kana = data.get("person_name_kana") or ""
-    if not name or not kana:
+    if not name:
         return
 
     explicit_kana = _explicit_kana_for_name(raw_text, name) or _ruby_kana_for_name(blocks or [], name)
@@ -350,8 +376,7 @@ def _refine_person_name_kana(data: dict, raw_text: str, blocks: list[dict] | Non
         return
 
     current_parts = _kana_parts(kana)
-    if len(current_parts) != 2:
-        return
+    valid_kana = len(current_parts) == 2 and all(re.fullmatch(r"[ぁ-ゖー]+", part) for part in current_parts)
     for given_roman, family_roman in _roman_name_pairs(raw_text):
         given = _roman_to_hiragana(given_roman)
         family = _roman_to_hiragana(family_roman)
@@ -360,12 +385,26 @@ def _refine_person_name_kana(data: dict, raw_text: str, blocks: list[dict] | Non
         # The common printed order is given-name first (HANAKO AOBA), while the
         # Japanese field is family-name first.  Require one exact matching part
         # so a generic email address cannot overwrite an unrelated name.
-        if current_parts[0] == family or current_parts[1] == given:
+        if valid_kana and (current_parts[0] == family or current_parts[1] == given):
             data["person_name_kana"] = f"{family} {given}"
             return
-        if current_parts[0] == given or current_parts[1] == family:
+        if valid_kana and (current_parts[0] == given or current_parts[1] == family):
             data["person_name_kana"] = f"{given} {family}"
             return
+        if not valid_kana and _surname_roman_hint(raw_text) == family_roman:
+            data["person_name_kana"] = f"{family} {given}"
+            return
+    if not valid_kana:
+        data["person_name_kana"] = ""
+
+
+def _surname_roman_hint(raw_text: str) -> str:
+    """The final component of an email local part is often the family name."""
+    for local_part in re.findall(r"\b([A-Za-z][A-Za-z0-9._-]*)@", raw_text):
+        parts = re.split(r"[._-]+", local_part.casefold())
+        if len(parts) >= 2 and len(parts[-1]) >= 3 and parts[-1].isalpha():
+            return parts[-1]
+    return ""
 
 
 def _explicit_kana_for_name(raw_text: str, name: str) -> str:
@@ -453,6 +492,9 @@ def _roman_to_hiragana(value: str) -> str:
     text = re.sub(r"[^a-z]", "", value.casefold())
     if not text:
         return ""
+    # Hepburn spellings often omit a long vowel in common given names.
+    if text in {"yosuke", "yousuke"}:
+        return "ようすけ"
     syllables = {
         "kya": "きゃ", "kyu": "きゅ", "kyo": "きょ", "sha": "しゃ", "shu": "しゅ", "sho": "しょ",
         "cha": "ちゃ", "chu": "ちゅ", "cho": "ちょ", "nya": "にゃ", "nyu": "にゅ", "nyo": "にょ",
@@ -496,10 +538,7 @@ def _remove_ungrounded_values(data: dict, raw_text: str) -> None:
     excluded because the prompt explicitly permits a reading to be inferred.
     """
     compact_source = _compact_for_evidence(raw_text)
-    numeric_values = {
-        _normalized_digits(value)
-        for value in re.findall(r"[0-9０-９][0-9０-９()（）\-ー－−\s]{4,}", raw_text)
-    }
+    numeric_values = _number_candidates(raw_text)
 
     for key in ("person_name", "company_name", "department", "title", "email", "website"):
         value = data.get(key, "")
@@ -508,17 +547,17 @@ def _remove_ungrounded_values(data: dict, raw_text: str) -> None:
 
     for key in ("postal_code", "tel", "mobile", "fax"):
         value = data.get(key, "")
-        if value and _normalized_digits(value) not in numeric_values:
+        if value and not _number_has_evidence(value, numeric_values):
             data[key] = ""
 
     fax_values = _numbers_on_labeled_lines(raw_text, r"fax|ファックス")
-    if data.get("fax") and _normalized_digits(data["fax"]) not in fax_values:
+    if data.get("fax") and not _number_has_evidence(data["fax"], fax_values):
         data["fax"] = ""
 
     mobile = data.get("mobile", "")
     mobile_digits = _normalized_digits(mobile)
     mobile_values = _numbers_on_labeled_lines(raw_text, r"mobile|cell|携帯|直通")
-    if mobile and not (mobile_digits in mobile_values or re.fullmatch(r"0[789]0\d{8}", mobile_digits)):
+    if mobile and not (_number_has_evidence(mobile, mobile_values) or re.fullmatch(r"0[789]0\d{8}", mobile_digits)):
         data["mobile"] = ""
 
     address = data.get("address", "")
@@ -530,19 +569,58 @@ def _remove_ungrounded_values(data: dict, raw_text: str) -> None:
 
 
 def _compact_for_evidence(value: str) -> str:
-    return re.sub(r"[\s()（）\-ー－−./:：]", "", value).casefold()
+    return re.sub(r"[\s()（）\-ー－−./:：・·･]", "", value).casefold()
 
 
 def _normalized_digits(value: str) -> str:
     return re.sub(r"\D", "", value.translate(str.maketrans("０１２３４５６７８９", "0123456789")))
 
 
+def _number_candidates(raw_text: str) -> set[str]:
+    # Keep each printed number separate even when several appear on one line.
+    pattern = r"(?<![0-9０-９])(?:\+?[0-9０-９]{1,4}[-ー－−()（）]){1,4}[0-9０-９]{2,4}(?![0-9０-９])|(?<![0-9０-９])[0-9０-９]{7,11}(?![0-9０-９])"
+    return {_normalized_digits(match) for match in re.findall(pattern, raw_text)}
+
+
+def _number_has_evidence(value: str, candidates: set[str]) -> bool:
+    digits = _normalized_digits(value)
+    return digits in candidates or (digits.startswith("0") and "81" + digits[1:] in candidates)
+
+
+def _prefer_labeled_phone_numbers(data: dict, raw_text: str) -> None:
+    for key, label in (("tel", r"\btel\b|電話"), ("fax", r"\bfax\b|ファックス")):
+        numbers = {_local_japanese_number(value) for value in _numbers_on_labeled_lines(raw_text, label)}
+        if len(numbers) == 1:
+            digits = numbers.pop()
+            current = data.get(key) or ""
+            if current and _normalized_digits(current) == digits:
+                continue
+            data[key] = _format_japanese_phone(digits)
+
+
+def _local_japanese_number(digits: str) -> str:
+    return "0" + digits[2:] if digits.startswith("81") else digits
+
+
+def _format_japanese_phone(digits: str) -> str:
+    if len(digits) == 11:
+        return f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"
+    if len(digits) == 10 and digits.startswith(("03", "06")):
+        return f"{digits[:2]}-{digits[2:6]}-{digits[6:]}"
+    if len(digits) == 10:
+        return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
+    return digits
+
+
 def _numbers_on_labeled_lines(raw_text: str, label_pattern: str) -> set[str]:
-    return {
-        _normalized_digits(line)
-        for line in raw_text.splitlines()
-        if re.search(label_pattern, line, flags=re.IGNORECASE) and _normalized_digits(line)
-    }
+    values = set()
+    for line in raw_text.splitlines():
+        for label in re.finditer(label_pattern, line, flags=re.IGNORECASE):
+            following = line[label.end():]
+            number = re.match(r"[^0-9０-９+＋\n]{0,12}([+＋]?[0-9０-９][0-9０-９()（）\-ー－−]{5,})", following)
+            if number:
+                values.add(_normalized_digits(number.group(1)))
+    return values
 
 
 def _compact_address_for_evidence(value: str) -> str:

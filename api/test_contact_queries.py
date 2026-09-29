@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 from src import database
@@ -63,3 +64,15 @@ class ContactQueryTests(unittest.TestCase):
             conn.execute("UPDATE cards SET status = 'queued' WHERE id = 'a'")
         rows = repository.list_user_contacts(self.user, status="queued")
         self.assertEqual([row["id"] for row in rows], ["a"])
+
+    def test_postal_code_format_is_shared_by_manual_and_ocr_saves(self):
+        repository.update_card_fields("a", {"postal_code": "〒２５００１９３"})
+        self.assertEqual(repository.get_card("a")["postal_code"], "250-0193")
+
+        repository.save_extraction_result("a", {"postal_code": "2430018", "_raw": {}}, 0)
+        saved = repository.get_card("a")
+        self.assertEqual(saved["postal_code"], "243-0018")
+        self.assertEqual(json.loads(saved["extracted_json"])["postal_code"], "243-0018")
+
+        repository.update_card_fields("a", {"postal_code": "135-0091, 106-0032"})
+        self.assertEqual(repository.get_card("a")["postal_code"], "135-0091, 106-0032")

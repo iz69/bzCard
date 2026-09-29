@@ -209,8 +209,10 @@ def _save_thumbnail(image: Image.Image, thumbnail_path: Path) -> None:
 
 
 def _enhance_processed_image(image: Image.Image) -> Image.Image:
-    image = _normalize_illumination(image.convert("RGB"))
-    image = ImageOps.autocontrast(image, cutoff=1)
+    # Local background division and global autocontrast turn printed colour
+    # bands into blotchy shadows. Keep the original tones after perspective
+    # correction and apply only modest whole-image adjustments.
+    image = image.convert("RGB")
     luminance = ImageStat.Stat(image.convert("L")).mean[0]
 
     if luminance < 155:
@@ -223,41 +225,6 @@ def _enhance_processed_image(image: Image.Image) -> Image.Image:
     image = ImageEnhance.Contrast(image).enhance(1.08)
     image = ImageEnhance.Sharpness(image).enhance(1.08)
     return image
-
-
-def _normalize_illumination(image: Image.Image) -> Image.Image:
-    try:
-        import cv2
-        import numpy as np
-    except ImportError:
-        return image
-
-    rgb = np.array(image.convert("RGB"))
-    height, width = rgb.shape[:2]
-    if width < 300 or height < 180:
-        return image
-
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
-    luminance, a_channel, b_channel = cv2.split(lab)
-    close_size = _odd_kernel_size(max(width, height) / 18, minimum=41, maximum=91)
-    blur_size = _odd_kernel_size(max(width, height) / 6, minimum=121, maximum=241)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_size, close_size))
-    background = cv2.morphologyEx(luminance, cv2.MORPH_CLOSE, kernel)
-    background = cv2.GaussianBlur(background, (blur_size, blur_size), 0)
-    corrected_luminance = cv2.divide(luminance, background, scale=235)
-    corrected = cv2.cvtColor(
-        cv2.merge([corrected_luminance, a_channel, b_channel]),
-        cv2.COLOR_LAB2RGB,
-    )
-    blended = cv2.addWeighted(rgb, 0.2, corrected, 0.8, 0)
-    return Image.fromarray(blended)
-
-
-def _odd_kernel_size(value: float, minimum: int, maximum: int) -> int:
-    size = int(round(value))
-    size = max(minimum, min(maximum, size))
-    return size if size % 2 == 1 else size + 1
 
 
 def _autocrop_and_correct(image: Image.Image) -> Image.Image:
@@ -302,11 +269,57 @@ def _autocrop_and_correct(image: Image.Image) -> Image.Image:
         if corrected is not None:
             return Image.fromarray(corrected)
 
+    corrected = _color_region_warp(rgb, resized, scale)
+    if corrected is not None:
+        return Image.fromarray(corrected)
+
     corrected = _bright_region_warp(rgb, resized, scale)
     if corrected is not None:
         return Image.fromarray(corrected)
 
     return image
+
+
+def _color_region_warp(rgb, resized, scale: float):
+    """Find a whole card against a fairly uniform backdrop, including dark print bands."""
+    import cv2
+    import numpy as np
+
+    height, width = resized.shape[:2]
+    patch = min(80, max(20, min(height, width) // 12))
+    corners = np.concatenate(
+        [
+            resized[:patch, :patch].reshape(-1, 3),
+            resized[:patch, -patch:].reshape(-1, 3),
+            resized[-patch:, :patch].reshape(-1, 3),
+            resized[-patch:, -patch:].reshape(-1, 3),
+        ]
+    )
+    background = np.median(corners, axis=0)
+    distance = np.sqrt(np.sum((resized.astype(np.float32) - background) ** 2, axis=2))
+    mask = np.uint8(distance > 25) * 255
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25)), iterations=2
+    )
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    )
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    image_area = height * width
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
+        area = cv2.contourArea(contour)
+        if not image_area * 0.12 <= area <= image_area * 0.9:
+            continue
+        x, y, box_width, box_height = cv2.boundingRect(contour)
+        if x <= 4 or y <= 4 or x + box_width >= width - 4 or y + box_height >= height - 4:
+            continue
+        approx = cv2.approxPolyDP(contour, 0.02 * cv2.arcLength(contour, True), True)
+        if len(approx) != 4:
+            continue
+        corrected = _perspective_warp(rgb, approx.reshape(4, 2).astype("float32") / scale)
+        if corrected is not None:
+            return corrected
+    return None
 
 
 def _bright_region_warp(rgb, resized, scale: float):

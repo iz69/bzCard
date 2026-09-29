@@ -1073,6 +1073,8 @@ def update_card_fields(card_id: str, data: dict) -> dict | None:
         fields["person_name_kana"] = _normalize_kana_field(fields["person_name_kana"])
     if "address" in fields:
         fields["address"] = _normalize_address(fields["address"])
+    if "postal_code" in fields:
+        fields["postal_code"] = _normalize_postal_code(fields["postal_code"])
     if "company_name" in fields:
         fields["company_name"] = _normalize_company_name(fields["company_name"])
     if "tags" in fields:
@@ -1405,6 +1407,8 @@ def save_extraction_result(
     duration_ms: int,
 ) -> None:
     now = now_iso()
+    extracted = dict(extracted)
+    extracted["postal_code"] = _normalize_postal_code(extracted.get("postal_code"))
     values = {
         "person_name": extracted.get("person_name") or extracted.get("name") or "",
         "person_name_kana": _normalize_kana_field(extracted.get("person_name_kana") or ""),
@@ -1618,6 +1622,14 @@ def _normalize_kana_field(value) -> str:
     if not any(_is_kana(char) for char in text):
         return ""
     return _katakana_to_hiragana(text)
+
+
+def _normalize_postal_code(value) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    digits = re.sub(r"[\s\-ー−]", "", text.removeprefix("〒").strip())
+    if re.fullmatch(r"[0-9]{7}", digits):
+        return f"{digits[:3]}-{digits[3:]}"
+    return text
 
 
 def _normalize_tags(value) -> str:

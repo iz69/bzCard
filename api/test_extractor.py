@@ -1,6 +1,12 @@
 import unittest
 
-from src.services.extractor import _refine_person_name_kana, _remove_ungrounded_values, _with_spatial_name_candidates
+from src.services.extractor import (
+    _correct_person_name_order,
+    _prefer_labeled_phone_numbers,
+    _refine_person_name_kana,
+    _remove_ungrounded_values,
+    _with_spatial_name_candidates,
+)
 
 
 class SpatialNameCandidateTests(unittest.TestCase):
@@ -51,6 +57,38 @@ class SpatialNameCandidateTests(unittest.TestCase):
         _refine_person_name_kana(data, "青葉 花子", blocks)
 
         self.assertEqual(data["person_name_kana"], "あおば はなこ")
+
+    def test_yagami_name_order_and_company_punctuation(self):
+        blocks = [
+            {"text": "寛", "box": [1106, 591, 1367, 694], "_side": "front"},
+            {"text": "矢上", "box": [861, 596, 1126, 697], "_side": "front"},
+        ]
+        data = {
+            "person_name": "寛 矢上",
+            "person_name_kana": "わか や上",
+            "company_name": "アイ・ディ・ケイ株式会社",
+        }
+        raw = "寛\n矢上\nアイ·ディ·ケイ株式会社\nHIROSHI YAGAMI\nh-yagami@i-d-k.com"
+        _correct_person_name_order(data, blocks)
+        _refine_person_name_kana(data, raw, blocks)
+        _remove_ungrounded_values(data, _with_spatial_name_candidates(raw, blocks))
+        self.assertEqual(data["person_name"], "矢上 寛")
+        self.assertEqual(data["person_name_kana"], "やがみ ひろし")
+        self.assertEqual(data["company_name"], "アイ・ディ・ケイ株式会社")
+
+    def test_multiple_numbers_on_one_line_remain_individual_evidence(self):
+        raw = "TEL 0463-35-9650 FAX 0463-35-9763 携帯 080-6885-1369"
+        data = {"tel": "0463-35-9650", "fax": "0463-35-9763", "mobile": "080-6885-1369"}
+        _remove_ungrounded_values(data, raw)
+        self.assertEqual({key: data[key] for key in ("tel", "fax", "mobile")}, {"tel": "0463-35-9650", "fax": "0463-35-9763", "mobile": "080-6885-1369"})
+
+    def test_english_side_phone_labels_correct_swapped_numbers(self):
+        raw = "045-571-6322\nTel.+81-45-570-5300 Fax.+81-45-571-6322"
+        data = {"tel": "045-571-6322", "fax": "045-571-6322"}
+        _prefer_labeled_phone_numbers(data, raw)
+        _remove_ungrounded_values(data, raw)
+        self.assertEqual(data["tel"], "045-570-5300")
+        self.assertEqual(data["fax"], "045-571-6322")
 
 
 if __name__ == "__main__":
