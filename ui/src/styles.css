@@ -399,8 +399,8 @@ tbody tr:not(.virtualSpacer) {
 }
 
 .status-queued,
-.status-preprocessing,
-.status-ocr_processing,
+.status-preparing,
+.status-scanning,
 .status-extracting {
   background: #fff1c7;
   color: #7a4b00;

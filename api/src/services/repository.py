@@ -1208,7 +1208,7 @@ def set_card_processing_artifacts(
             conn.execute(
                 """
                 UPDATE cards
-                SET status = 'ocr_processing',
+                SET status = 'scanning',
                     back_processed_image_path = ?,
                     back_thumbnail_path = ?,
                     error_message = NULL,
@@ -1232,7 +1232,7 @@ def set_card_processing_artifacts(
         conn.execute(
             """
             UPDATE cards
-            SET status = 'ocr_processing',
+            SET status = 'scanning',
                 processed_image_path = ?,
                 thumbnail_path = ?,
                 error_message = NULL,

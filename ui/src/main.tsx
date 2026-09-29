@@ -457,8 +457,8 @@ function App() {
             <select value={status} onChange={(e) => setStatus(e.target.value)}>
               <option value="">すべて</option>
               <option value="queued">queued</option>
-              <option value="preprocessing">preprocessing</option>
-              <option value="ocr_processing">ocr_processing</option>
+              <option value="preparing">preparing</option>
+              <option value="scanning">scanning</option>
               <option value="extracting">extracting</option>
               <option value="ready">ready</option>
               <option value="not_card">not_card</option>

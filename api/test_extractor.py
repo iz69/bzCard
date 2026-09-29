@@ -1,4 +1,6 @@
+import json
 import unittest
+from unittest.mock import patch
 
 from src.services.extractor import (
     _correct_person_name_order,
@@ -7,7 +9,9 @@ from src.services.extractor import (
     _refine_person_name_kana,
     _remove_ungrounded_values,
     _roman_to_hiragana,
+    _separate_department_and_title,
     _with_spatial_name_candidates,
+    extract_card_fields,
 )
 
 
@@ -91,6 +95,104 @@ class SpatialNameCandidateTests(unittest.TestCase):
         _recover_printed_identity(data, "こもれびサービス株式会社\n木森 拓也\nTAKUYA KIMORI\ninfo@example.com")
 
         self.assertEqual(data["person_name"], "こもれびサービス株式会社")
+
+    def test_printed_department_and_title_remove_overlap(self):
+        data = {"department": "経営企画室", "title": "経営企画室 室長"}
+
+        _separate_department_and_title(data, "経営企画室 室長\n遠山 千佳")
+
+        self.assertEqual(data, {"department": "経営企画室", "title": "室長"})
+
+    def test_printed_role_is_recovered_when_combined_title_was_rejected(self):
+        data = {"department": "研究開発部 部長", "title": ""}
+
+        _separate_department_and_title(data, "研究開発部 部長\n朝日 智子")
+
+        self.assertEqual(data, {"department": "研究開発部", "title": "部長"})
+
+    def test_correct_separation_is_preserved(self):
+        data = {"department": "企画開発部", "title": "部長"}
+
+        _separate_department_and_title(data, "企画開発部 部長\n青葉 花子")
+
+        self.assertEqual(data, {"department": "企画開発部", "title": "部長"})
+
+    def test_unrelated_department_and_title_are_not_overwritten(self):
+        data = {"department": "開発部", "title": "研究員"}
+
+        _separate_department_and_title(data, "営業部 課長\n開発部\n研究員")
+
+        self.assertEqual(data, {"department": "開発部", "title": "研究員"})
+
+    def test_scanned_demo_department_and_title_regressions(self):
+        # OCR line and model fields were captured from the 20 scanned demo cards
+        # plus the earlier reference card.  Run the full extraction postprocess.
+        cases = [
+            ("春風", "総務部 係長", "総務部 係長", "総務部係長", "総務部", "係長"),
+            ("日向", "編集部 編集者", "編集部 編集者", "編集者", "編集部", "編集者"),
+            ("水辺", "調査部 研究員", "調査部 研究員", "調査研究員", "調査部", "研究員"),
+            ("木森", "営業企画部 主任", "営業企画部 主任", "営業企画部主任", "営業企画部", "主任"),
+            ("遠山", "経営企画室 室長", "経営企画室", "経営企画室 室長", "経営企画室", "室長"),
+            ("北斗", "設計部 技師", "設計部 技師", "技師", "設計部", "技師"),
+            ("茜", "業務部 課長", "業務部 課長", "業務部課長", "業務部", "課長"),
+            ("森", "商品開発部 主任", "商品開発部 主任", "主任", "商品開発部", "主任"),
+            ("銀河", "情報システム部 部長", "情報システム部 部長", "情報システム部長", "情報システム部", "部長"),
+            ("月見", "技術部 リーダー", "技術部 リーダー", "技術部長", "技術部", "リーダー"),
+            ("花咲", "広報部 担当", "広報部", "広報担当", "広報部", "担当"),
+            ("楓", "生産技術部 課長", "生産技術部 課長", "生産技術部課長", "生産技術部", "課長"),
+            ("白樺", "顧客支援部 主任", "顧客支援部 主任", "主任", "顧客支援部", "主任"),
+            ("虹野", "制作部 部長", "制作部 部長", "制作部長", "制作部", "部長"),
+            ("桜川", "営業部 課長", "営業部 課長", "営業部課長", "営業部", "課長"),
+            ("若葉", "企画部 主任", "企画部 主任", "企画部主任", "企画部", "主任"),
+            ("青空", "開発部 エンジニア", "開発部 エンジニア", "技術担当者", "開発部", "エンジニア"),
+            ("星野", "営業一課 係長", "営業一課 係長", "営業一課 係長", "営業一課", "係長"),
+            ("湊", "制作部 デザイナー", "制作部", "デザイナー", "制作部", "デザイナー"),
+            ("朝日", "研究開発部 部長", "研究開発部 部長", "研究開発部長", "研究開発部", "部長"),
+            ("青葉", "企画開発部 部長", "企画開発部", "部長", "企画開発部", "部長"),
+        ]
+        for label, ocr_line, model_department, model_title, department, title in cases:
+            with self.subTest(card=label):
+                model_output = json.dumps({"department": model_department, "title": model_title}, ensure_ascii=False)
+                with patch("src.services.extractor._generate_structured_response", return_value=model_output):
+                    result = extract_card_fields(ocr_line, []).data
+                self.assertEqual((result["department"], result["title"]), (department, title))
+
+    def test_scanned_demo_identity_regressions(self):
+        # These OCR lines and bad model fields came from the scanned demo cards.
+        # Only fields visible in the OCR are included in this regression corpus.
+        cases = [
+            ("木森", "こもれびサービス株式会社", "木森 拓也", "TAKUYA KIMORI", "takuya.kimori@example.com",
+             "こもれびサービス株式会社", "こもれび サービス", "こもれびサービス株式会社", "木森 拓也", "きもり たくや", "こもれびサービス株式会社"),
+            ("茜", "あかね物流株式会社", "茜 真由", "MAYU AKANE", "mayu.akane@example.com",
+             "あかね 物流 株式会社", "あかね ろぐりてすと", "あかね物流株式会社", "茜 真由", "あかね まゆ", "あかね物流株式会社"),
+            ("楓", "楓工業株式会社", "楓 大輔", "DAISUKE KAEDE", "daisuke.kaede@example.com",
+             "楓 工業株式会社", "楓 大輔", "楓工業株式会社", "楓 大輔", "かえで だいすけ", "楓工業株式会社"),
+            ("湊", "みなとデザイン株式会社", "湊 翔太", "SHOTA MINATO", "shota.minato@example.com",
+             "みなと デザイン 株式会社", "みなと デザイン 株式会社", "MINATO DESIGN", "湊 翔太", "みなと しょうた", "みなとデザイン株式会社"),
+            ("北斗", "株式会社北斗エンジニアリング", "北斗 誠", "MAKOTO HOKUTO", "makoto.hokuto@example.com",
+             "北斗 誠", "北斗 せい", "ホクトエンジニアリング", "北斗 誠", "ほくと まこと", "株式会社北斗エンジニアリング"),
+            ("花咲", "株式会社花咲プランニング", "花咲 彩香", "AYAKA HANASAKI", "ayaka.hanasaki@example.com",
+             "花咲 彩香", "はなこ あおば", "株式会社花咲プランニング", "花咲 彩香", "はなさき あやか", "株式会社花咲プランニング"),
+            ("朝日", "株式会社朝日ラボ", "朝日 智子", "TOMOKO ASAHI", "tomoko.asahi@example.com",
+             "朝日 智子", "あおば はなこ", "株式会社朝日ラボ", "朝日 智子", "あさひ ともこ", "株式会社朝日ラボ"),
+            ("星野", "株式会社星野商事", "星野 由美", "YUMI HOSHINO", "yumi.hoshino@example.com",
+             "星野 由美", "あおば はなこ", "株式会社星野商事", "星野 由美", "ほしの ゆみ", "株式会社星野商事"),
+        ]
+        for (label, company_ocr, name_ocr, roman_ocr, email_ocr,
+             model_name, model_kana, model_company, name, kana, company) in cases:
+            with self.subTest(card=label):
+                ocr = "\n".join((company_ocr, name_ocr, roman_ocr, email_ocr))
+                model_output = json.dumps({
+                    "person_name": model_name,
+                    "person_name_kana": model_kana,
+                    "company_name": model_company,
+                }, ensure_ascii=False)
+                with patch("src.services.extractor._generate_structured_response", return_value=model_output):
+                    result = extract_card_fields(ocr, []).data
+                self.assertEqual(
+                    (result["person_name"], result["person_name_kana"], result["company_name"]),
+                    (name, kana, company),
+                )
 
     def test_ruby_blocks_near_the_name_override_a_kana_guess(self):
         data = {"person_name": "青葉 花子", "person_name_kana": "あおば はこ"}

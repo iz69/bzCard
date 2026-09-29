@@ -251,6 +251,14 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_line_connections_owner_user_id ON line_connections(owner_user_id)")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_line_connections_line_user_id ON line_connections(line_user_id) WHERE line_user_id IS NOT NULL")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_line_connections_owner_user_id_unique ON line_connections(owner_user_id)")
+        conn.execute(
+            """UPDATE cards
+            SET status = CASE status
+                WHEN 'preprocessing' THEN 'preparing'
+                WHEN 'ocr_processing' THEN 'scanning'
+            END
+            WHERE status IN ('preprocessing', 'ocr_processing')"""
+        )
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:

@@ -61,7 +61,7 @@ def _run_job(job: dict) -> None:
             repository.finish_job(job["id"])
             return
 
-        repository.set_card_status(card_id, "preprocessing")
+        repository.set_card_status(card_id, "preparing")
         images = repository.get_card_images(card_id)
         if not images:
             raise RuntimeError("No images registered for this card")

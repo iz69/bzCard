@@ -45,6 +45,7 @@ def extract_card_fields(raw_text: str, blocks: list[dict]) -> ExtractionResult:
     _recover_printed_identity(normalized, source_text)
     _correct_person_name_order(normalized, blocks)
     _refine_person_name_kana(normalized, source_text, blocks)
+    _separate_department_and_title(normalized, source_text)
     _prefer_labeled_phone_numbers(normalized, source_text)
     _remove_ungrounded_values(normalized, source_text)
     normalized["_raw"] = data
@@ -188,7 +189,7 @@ OCRテキストにない値を補完・創作してはいけません。ただ�
 日本語の氏名の直後にローマ字の姓名が印刷されている場合、その日本語行を氏名として優先してください。
 email は @ を含むOCR上のメールアドレスだけを入れてください。email を mobile、fax、tel に入れてはいけません。
 tel と mobile には電話番号だけを入れてください。fax にはOCR上で FAX と明示された電話番号だけを入れてください。
-department には部署名を入れ、部・課・グループなどが複数行に分かれている場合は上位から順にすべて含めてください。title には役職名だけを入れてください。OCR上にない項目は空文字にしてください。
+department には部署名だけを入れ、部・課・グループなどが複数行に分かれている場合は上位から順にすべて含めてください。title には役職名だけを入れてください。同じ行に「営業部 課長」と印刷されている場合、department は「営業部」、title は「課長」です。OCR上にない項目は空文字にしてください。
 person_name_kana は氏名の読みをひらがなだけで入れてください。漢字や別人の名前を混ぜないでください。姓名の間には半角スペースを1つ入れてください。
 OCRテキスト内にふりがな・フリガナがある場合はそれを優先してください。
 ふりがながない場合でも、日本人名として自然で一般的な読みを推測してください。
@@ -412,6 +413,44 @@ def _recover_printed_identity(data: dict, raw_text: str) -> None:
         identities = _printed_identity(raw_text)
         if len(identities) == 1:
             data["person_name"] = identities[0][0]
+
+
+_ROLE_TITLES = {
+    "代表取締役社長", "代表取締役", "取締役", "執行役員", "社長", "副社長",
+    "部長", "課長", "室長", "係長", "主任", "技師", "編集者", "研究員",
+    "担当", "デザイナー", "リーダー", "エンジニア",
+}
+_DEPARTMENT_END = re.compile(r"(?:本部|事業部|部|課|室|局|支店|営業所|センター|グループ|チーム)$")
+
+
+def _separate_department_and_title(data: dict, raw_text: str) -> None:
+    """Use a printed department/role line when the model combines both fields."""
+    candidates = set()
+    for line in raw_text.splitlines():
+        parts = line.strip().split()
+        if len(parts) < 2 or parts[-1] not in _ROLE_TITLES:
+            continue
+        department = " ".join(parts[:-1])
+        if _DEPARTMENT_END.search(department.replace(" ", "")):
+            candidates.add((department, parts[-1]))
+    if len(candidates) != 1:
+        return
+
+    department, title = candidates.pop()
+    current_department = _compact_for_evidence(data.get("department") or "")
+    current_title = _compact_for_evidence(data.get("title") or "")
+    if current_department or current_title:
+        printed_department = _compact_for_evidence(department)
+        printed_title = _compact_for_evidence(title)
+        if not (
+            printed_department in current_department
+            or printed_title in current_department
+            or printed_department in current_title
+            or printed_title in current_title
+        ):
+            return
+    data["department"] = department
+    data["title"] = title
 
 
 def _refine_person_name_kana(data: dict, raw_text: str, blocks: list[dict] | None = None) -> None:
