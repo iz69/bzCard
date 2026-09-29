@@ -42,6 +42,7 @@ def extract_card_fields(raw_text: str, blocks: list[dict]) -> ExtractionResult:
     raw = _generate_structured_response(prompt)
     data = _parse_json_object(raw)
     normalized = {key: _string_or_empty(data.get(key)) for key in SCHEMA_KEYS}
+    _recover_printed_identity(normalized, source_text)
     _correct_person_name_order(normalized, blocks)
     _refine_person_name_kana(normalized, source_text, blocks)
     _prefer_labeled_phone_numbers(normalized, source_text)
@@ -183,6 +184,8 @@ def _build_prompt(raw_text: str, blocks: list[dict]) -> str:
 次のキーを持つJSONオブジェクトだけを返してください。
 不明な項目は空文字にしてください。説明文、Markdown、コードブロックは不要です。
 OCRテキストにない値を補完・創作してはいけません。ただし person_name_kana の読みの推測だけは、下記の規則に従って許可します。
+株式会社などの法人格を含む行は会社名です。person_name に会社名や法人格を入れないでください。
+日本語の氏名の直後にローマ字の姓名が印刷されている場合、その日本語行を氏名として優先してください。
 email は @ を含むOCR上のメールアドレスだけを入れてください。email を mobile、fax、tel に入れてはいけません。
 tel と mobile には電話番号だけを入れてください。fax にはOCR上で FAX と明示された電話番号だけを入れてください。
 department には部署名を入れ、部・課・グループなどが複数行に分かれている場合は上位から順にすべて含めてください。title には役職名だけを入れてください。OCR上にない項目は空文字にしてください。
@@ -191,7 +194,7 @@ OCRテキスト内にふりがな・フリガナがある場合はそれを優�
 ふりがながない場合でも、日本人名として自然で一般的な読みを推測してください。
 ローマ字表記がある場合は読み推測の強い手がかりとして使い、person_name_kana にはローマ字ではなくひらがなを入れてください。
 ローマ字の氏名表記がある場合は、漢字からの推測よりローマ字を優先して読みを検証してください。ローマ字が名→姓の順でも、person_name_kana は person_name と同じ姓→名の順に並べてください。
-例えば person_name が「青葉 花子」でローマ字表記が「HANAKO AOBA」なら、person_name_kana は「あおば はなこ」です。「花子」を「あおば はこ」のように短くしてはいけません。
+例示した別人の氏名や読みを、OCRで確認できない名刺に流用してはいけません。
 氏名がOCRで姓・名に分割され、行順が崩れることがあります。大きな日本語名らしい断片が複数ある場合は、会社名・部署名・住所ではないかを確認し、自然な日本人名の姓名順に並べ直してください。
 ふりがなはOCRテキストやローマ字表記に存在しない限り、珍しい読みを無理に作らず、判断できない場合は空文字にしてください。
 氏名や社名に「峠」が含まれる場合、姓としての読みは「とうげ」を優先してください。
@@ -363,6 +366,54 @@ def _string_or_empty(value) -> str:
     return str(value).strip()
 
 
+_CORPORATE_MARKER = re.compile(
+    r"株式会社|有限会社|合同会社|合名会社|合資会社|医療法人|学校法人|社会福祉法人|社団法人|財団法人"
+)
+
+
+def _printed_identity(raw_text: str) -> list[tuple[str, str, str]]:
+    """Find a Japanese name followed by its roman spelling, corroborated by email."""
+    lines = [line.strip() for line in raw_text.splitlines()]
+    email_pairs = {
+        tuple(part.casefold() for part in re.split(r"[._-]", local))
+        for local in re.findall(r"\b([A-Za-z][A-Za-z0-9._-]*)@", raw_text)
+    }
+    found = []
+    for index, line in enumerate(lines):
+        match = re.fullmatch(r"([A-Za-z]{3,})\s+([A-Za-z]{3,})", line)
+        if not match or tuple(part.casefold() for part in match.groups()) not in email_pairs:
+            continue
+        for previous in (index - 1, index - 2):
+            if previous < 0:
+                continue
+            candidate = lines[previous]
+            if previous == index - 2 and not re.fullmatch(r"\d+", lines[index - 1]):
+                continue
+            if _CORPORATE_MARKER.search(candidate):
+                continue
+            if re.fullmatch(r"[一-龯々〆ヵヶ]{1,4}[\s　]+[一-龯々〆ヵヶ]{1,4}", candidate):
+                found.append((" ".join(candidate.split()), *[part.casefold() for part in match.groups()]))
+                break
+    return found
+
+
+def _recover_printed_identity(data: dict, raw_text: str) -> None:
+    """Use unambiguous OCR labels when the model confuses a person and company."""
+    companies = [line.strip() for line in raw_text.splitlines()
+                 if _CORPORATE_MARKER.search(line) and len(line.strip()) <= 80]
+    companies = list(dict.fromkeys(companies))
+    if len(companies) == 1:
+        data["company_name"] = companies[0]
+
+    name = data.get("person_name") or ""
+    if not name or _CORPORATE_MARKER.search(name) or (
+        data.get("company_name") and _compact_for_evidence(name) == _compact_for_evidence(data["company_name"])
+    ):
+        identities = _printed_identity(raw_text)
+        if len(identities) == 1:
+            data["person_name"] = identities[0][0]
+
+
 def _refine_person_name_kana(data: dict, raw_text: str, blocks: list[dict] | None = None) -> None:
     """Prefer printed phonetic evidence over an LLM's kanji-only guess."""
     name = data.get("person_name") or ""
@@ -377,6 +428,14 @@ def _refine_person_name_kana(data: dict, raw_text: str, blocks: list[dict] | Non
 
     current_parts = _kana_parts(kana)
     valid_kana = len(current_parts) == 2 and all(re.fullmatch(r"[ぁ-ゖー]+", part) for part in current_parts)
+    for printed_name, given_roman, family_roman in _printed_identity(raw_text):
+        if _compact_for_evidence(printed_name) != _compact_for_evidence(name):
+            continue
+        given = _roman_to_hiragana(given_roman)
+        family = _roman_to_hiragana(family_roman)
+        if given and family and (not valid_kana or not set(current_parts) & {family, given}):
+            data["person_name_kana"] = f"{family} {given}"
+            return
     for given_roman, family_roman in _roman_name_pairs(raw_text):
         given = _roman_to_hiragana(given_roman)
         family = _roman_to_hiragana(family_roman)
@@ -386,16 +445,26 @@ def _refine_person_name_kana(data: dict, raw_text: str, blocks: list[dict] | Non
         # Japanese field is family-name first.  Require one exact matching part
         # so a generic email address cannot overwrite an unrelated name.
         if valid_kana and (current_parts[0] == family or current_parts[1] == given):
-            data["person_name_kana"] = f"{family} {given}"
+            data["person_name_kana"] = f"{_prefer_printed_kana(current_parts[0], family)} {_prefer_printed_kana(current_parts[1], given)}"
             return
         if valid_kana and (current_parts[0] == given or current_parts[1] == family):
-            data["person_name_kana"] = f"{given} {family}"
+            data["person_name_kana"] = f"{_prefer_printed_kana(current_parts[0], given)} {_prefer_printed_kana(current_parts[1], family)}"
             return
         if not valid_kana and _surname_roman_hint(raw_text) == family_roman:
             data["person_name_kana"] = f"{family} {given}"
             return
     if not valid_kana:
         data["person_name_kana"] = ""
+
+
+def _prefer_printed_kana(current: str, roman: str) -> str:
+    """Keep a plausible printed reading when roman letters omit one long vowel."""
+    if current == roman or (
+        current.count("う") == roman.count("う") + 1
+        and current.replace("う", "") == roman.replace("う", "")
+    ):
+        return current
+    return roman
 
 
 def _surname_roman_hint(raw_text: str) -> str:
@@ -492,9 +561,20 @@ def _roman_to_hiragana(value: str) -> str:
     text = re.sub(r"[^a-z]", "", value.casefold())
     if not text:
         return ""
-    # Hepburn spellings often omit a long vowel in common given names.
-    if text in {"yosuke", "yousuke"}:
-        return "ようすけ"
+    # Hepburn spellings often omit long vowels in common given names.  Keep
+    # these readings explicit rather than turning e.g. SHOTA into しょた.
+    common_given_names = {
+        "yosuke": "ようすけ", "yousuke": "ようすけ",
+        "shota": "しょうた", "shouta": "しょうた",
+        "ryo": "りょう", "ryou": "りょう",
+        "koji": "こうじ", "kouji": "こうじ",
+        "taro": "たろう", "tarou": "たろう",
+        "yuko": "ゆうこ", "yuuko": "ゆうこ",
+        "kyoko": "きょうこ", "kyouko": "きょうこ",
+        "kenichi": "けんいち",
+    }
+    if text in common_given_names:
+        return common_given_names[text]
     syllables = {
         "kya": "きゃ", "kyu": "きゅ", "kyo": "きょ", "sha": "しゃ", "shu": "しゅ", "sho": "しょ",
         "cha": "ちゃ", "chu": "ちゅ", "cho": "ちょ", "nya": "にゃ", "nyu": "にゅ", "nyo": "にょ",

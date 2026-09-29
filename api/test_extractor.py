@@ -3,8 +3,10 @@ import unittest
 from src.services.extractor import (
     _correct_person_name_order,
     _prefer_labeled_phone_numbers,
+    _recover_printed_identity,
     _refine_person_name_kana,
     _remove_ungrounded_values,
+    _roman_to_hiragana,
     _with_spatial_name_candidates,
 )
 
@@ -45,6 +47,50 @@ class SpatialNameCandidateTests(unittest.TestCase):
         _refine_person_name_kana(data, "青葉 花子（アオバ ハナコ）")
 
         self.assertEqual(data["person_name_kana"], "あおば はなこ")
+
+    def test_printed_name_and_email_override_unrelated_kana(self):
+        data = {"person_name": "花咲 彩香", "person_name_kana": "あおば はなこ"}
+        ocr = "株式会社花咲プランニング\n花咲 彩香\nAYAKA HANASAKI\nayaka.hanasaki@example.com"
+
+        _refine_person_name_kana(data, ocr)
+
+        self.assertEqual(data["person_name_kana"], "はなさき あやか")
+
+    def test_roman_letters_do_not_drop_a_supported_long_vowel(self):
+        data = {"person_name": "桜川 太郎", "person_name_kana": "さくらがわ たろう"}
+        ocr = "桜川 太郎\nTARO SAKURAGAWA\ntaro.sakuragawa@example.com"
+
+        _refine_person_name_kana(data, ocr)
+
+        self.assertEqual(data["person_name_kana"], "さくらがわ たろう")
+
+    def test_common_romanized_given_names_keep_natural_long_vowels(self):
+        self.assertEqual(_roman_to_hiragana("RYO"), "りょう")
+        self.assertEqual(_roman_to_hiragana("SHOTA"), "しょうた")
+        self.assertEqual(_roman_to_hiragana("KENICHI"), "けんいち")
+
+    def test_ocr_name_and_company_correct_model_role_confusion(self):
+        data = {"person_name": "ひだまり メディア 株式会社", "company_name": "HIDAMARI MEDIA"}
+        ocr = "ひだまりメディア株式会社\nHIDAMARI MEDIA\n編集部 編集者\n日向 京\nRYO HINATA\nryo.hinata@example.com"
+
+        _recover_printed_identity(data, ocr)
+
+        self.assertEqual(data["person_name"], "日向 京")
+        self.assertEqual(data["company_name"], "ひだまりメディア株式会社")
+
+    def test_company_is_recovered_when_model_transliterates_it(self):
+        data = {"person_name": "北斗 誠", "company_name": "ホクトエンジニアリング"}
+
+        _recover_printed_identity(data, "株式会社北斗エンジニアリング\n北斗 誠\nMAKOTO HOKUTO\nmakoto.hokuto@example.com")
+
+        self.assertEqual(data["company_name"], "株式会社北斗エンジニアリング")
+
+    def test_unrelated_roman_words_do_not_replace_a_person(self):
+        data = {"person_name": "こもれびサービス株式会社", "company_name": ""}
+
+        _recover_printed_identity(data, "こもれびサービス株式会社\n木森 拓也\nTAKUYA KIMORI\ninfo@example.com")
+
+        self.assertEqual(data["person_name"], "こもれびサービス株式会社")
 
     def test_ruby_blocks_near_the_name_override_a_kana_guess(self):
         data = {"person_name": "青葉 花子", "person_name_kana": "あおば はこ"}

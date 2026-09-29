@@ -321,6 +321,7 @@ function App() {
   }, [api, authed, selectedContactId, selectedRevision, detailRefresh, showToast]);
 
   useEffect(() => {
+    if (!authed) return;
     const viewport = listViewportRef.current;
     if (!viewport) return;
     const updateHeight = () => setListViewportHeight(viewport.clientHeight);
@@ -328,7 +329,7 @@ function App() {
     const observer = new ResizeObserver(updateHeight);
     observer.observe(viewport);
     return () => observer.disconnect();
-  }, []);
+  }, [authed]);
 
   useEffect(() => {
     setListScrollTop(0);
