@@ -52,6 +52,19 @@ Ollamaはホストへポート公開せず、APIコンテナからだけ利用�
 
 ## 起動手順
 
+Git、Docker、Docker Compose（`docker compose` コマンド）を用意してください。
+現在の構成では、APIとWebUIは配布済みイメージを取得するのではなく、配置先で
+ソースからビルドします。`docker-compose.yml` だけでなく、リポジトリ全体が必要です。
+Ollamaは公開イメージを取得し、モデルは別途登録します。
+
+初回はリポジトリをcloneし、取得したディレクトリへ移動します。
+以降のコマンドは、このディレクトリで実行してください。
+
+```sh
+git clone https://github.com/iz69/bzCard.git bzcard
+cd bzcard
+```
+
 `.env.example` から `.env` を作成します。
 
 ```sh
@@ -109,6 +122,35 @@ http://localhost:15174/bzcard/
 
 初回は管理者IDとパスワードを作成します。以後は、WebUIでは同じサーバのAPI URL、
 ログインID、パスワードでログインします。Androidも同じ認証情報を使います。
+
+## 更新手順
+
+インストール済みのリポジトリで、ソースを更新してAPIとWebUIを再ビルドします。
+標準の `main` ブランチを使っている場合は、次を実行してください。
+ローカルで追跡対象のファイルを変更している場合は、変更内容を確認してから更新してください。
+
+```sh
+git pull --ff-only
+docker compose build api ui
+```
+
+新しいコンテナを起動する前にAPIを停止し、DB・画像・暗号化鍵を含む `data/` 全体を
+別途バックアップしてください。詳細は [DB移行・処理復旧](#db移行処理復旧) を参照してください。
+
+```sh
+docker compose stop api
+```
+
+バックアップ後、ビルドしたイメージでコンテナを更新します。
+
+```sh
+docker compose up -d
+```
+
+初回設定済みの `.env`、`data/`、`ollama/` は引き続き使います。
+モデルを変更しない場合、Ollamaモデルの再取得・登録は不要です。
+通常の再起動ではclone・pull・checkoutは不要です。ソースを更新したときに再ビルドし、
+特定のタグやコミットへ切り替える場合だけcheckoutで対象を選んでから再ビルドしてください。
 
 ## 環境変数
 
