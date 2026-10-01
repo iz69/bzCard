@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import logging
 import json
+import fcntl
 import threading
 import time
 
 from .services import repository
+from .config import settings
+from .services.card_data_lock import card_data_lock
 from .services.card_classifier import check_business_card
 from .services.extractor import extract_card_fields
 from .services.image_store import (
@@ -31,6 +34,27 @@ def start_worker() -> None:
 
 
 def _worker_loop() -> None:
+    # Keep the fd open for this thread's lifetime; the OS releases it on exit.
+    with (settings.data_dir / ".worker.lock").open("a") as leader:
+        while True:
+            try:
+                fcntl.flock(leader, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                time.sleep(2)
+        while True:
+            try:
+                repository.recover_interrupted_work()
+                break
+            except Exception:
+                logger.exception("Interrupted work recovery failed; retrying")
+                time.sleep(3)
+        from .routers.line import line_worker_loop
+        threading.Thread(target=line_worker_loop, daemon=True, name="bzcard-line-worker").start()
+        _process_jobs()
+
+
+def _process_jobs() -> None:
     while True:
         try:
             job = repository.claim_next_job()
@@ -44,6 +68,11 @@ def _worker_loop() -> None:
 
 
 def _run_job(job: dict) -> None:
+    with card_data_lock(job["card_id"], wait=True):
+        _run_locked_job(job)
+
+
+def _run_locked_job(job: dict) -> None:
     card_id = job["card_id"]
     try:
         card = repository.get_card(card_id)
@@ -56,8 +85,8 @@ def _run_job(job: dict) -> None:
             raw_text = _combined_ocr_text(images)
             if not raw_text.strip():
                 raise RuntimeError("OCR text is empty; run full reprocess first")
-            extracted = extract_card_fields(raw_text, _combined_ocr_blocks(images))
-            repository.save_extraction_result(card_id, extracted.data, extracted.duration_ms)
+            extracted = extract_card_fields(raw_text, _combined_ocr_blocks(images), owner_user_id=card["owner_user_id"])
+            repository.save_extraction_result(card_id, extracted.data, extracted.duration_ms, raw_text, _combined_ocr_blocks(images))
             repository.finish_job(job["id"])
             return
 
@@ -76,8 +105,8 @@ def _run_job(job: dict) -> None:
             repository.finish_job(job["id"])
             return
 
-        extracted = extract_card_fields(raw_text, _combined_ocr_blocks(images))
-        repository.save_extraction_result(card_id, extracted.data, extracted.duration_ms)
+        extracted = extract_card_fields(raw_text, _combined_ocr_blocks(images), owner_user_id=card["owner_user_id"])
+        repository.save_extraction_result(card_id, extracted.data, extracted.duration_ms, raw_text, _combined_ocr_blocks(images))
         repository.finish_job(job["id"])
     except Exception as exc:
         message = str(exc)[:2000]
@@ -88,7 +117,7 @@ def _run_job(job: dict) -> None:
 def _process_image(card_id: str, image: dict) -> None:
     side = image["side"]
     original_path = resolve_data_path(image["original_image_path"])
-    processed_path, thumbnail_path = create_processed_images(original_path, card_id, side)
+    processed_path, thumbnail_path = create_processed_images(original_path, card_id, side, (image["manual_rotation"] + image["auto_rotation"]) % 360)
     repository.set_card_processing_artifacts(
         card_id,
         relative_path(processed_path),
@@ -96,12 +125,16 @@ def _process_image(card_id: str, image: dict) -> None:
         side,
     )
 
-    ocr = _run_ocr_with_auto_rotation(processed_path, thumbnail_path, image.get("ocr_direction") or "horizontal")
+    direction = image.get("ocr_direction") or "horizontal"
+    if image["manual_rotation"]:
+        ocr = run_yomitoku(processed_path, direction)
+    else:
+        ocr = _run_ocr_with_auto_rotation(processed_path, thumbnail_path, direction, card_id, side)
     repository.save_detected_ocr_direction(card_id, ocr.direction, side)
     repository.save_ocr_result(card_id, ocr.raw_text, ocr.blocks, ocr.duration_ms, side)
 
 
-def _run_ocr_with_auto_rotation(processed_path, thumbnail_path, direction: str) -> OcrResult:
+def _run_ocr_with_auto_rotation(processed_path, thumbnail_path, direction: str, card_id: str | None = None, side: str = "front") -> OcrResult:
     ocr = run_yomitoku(processed_path, direction)
     if direction != "auto" or ocr.direction != "vertical" or not _is_portrait_image(processed_path):
         return ocr
@@ -126,6 +159,8 @@ def _run_ocr_with_auto_rotation(processed_path, thumbnail_path, direction: str) 
 
     _score, rotated_ocr, degrees = best
     rotate_processed_images(processed_path, thumbnail_path, degrees)
+    if card_id:
+        repository.save_auto_rotation(card_id, side, -degrees)
     return rotated_ocr
 
 

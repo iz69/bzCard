@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+from .normalization import normalize_fields
+from .feedback import PIPELINE_VERSION, record_manual_changes
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -10,61 +12,15 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from ..config import settings
+from .fields import SCHEMA_KEYS, CARD_FIELDS, EXTRACTED_JSON_FIELDS, SEARCH_FIELDS
 from ..database import connection, get_connection, row_to_dict
 from .timeutil import now_iso
 from .secret_store import encrypt, decrypt
+from .image_store import image_metadata, resolve_data_path
+from .normalization import (
+    _hiragana_to_katakana, _is_kana, _katakana_to_hiragana, _normalize_company_name, _normalize_phone_number
+)
 
-
-CARD_FIELDS = {
-    "person_name",
-    "person_name_kana",
-    "company_name",
-    "department",
-    "title",
-    "postal_code",
-    "address",
-    "tel",
-    "mobile",
-    "fax",
-    "email",
-    "website",
-    "tags",
-    "memo",
-}
-
-SEARCH_FIELDS = [
-    "person_name",
-    "person_name_kana",
-    "company_name",
-    "department",
-    "title",
-    "postal_code",
-    "address",
-    "tel",
-    "mobile",
-    "fax",
-    "email",
-    "website",
-    "tags",
-    "memo",
-    "ocr_text",
-    "back_ocr_text",
-]
-
-EXTRACTED_JSON_FIELDS = {
-    "person_name",
-    "person_name_kana",
-    "company_name",
-    "department",
-    "title",
-    "postal_code",
-    "address",
-    "tel",
-    "mobile",
-    "fax",
-    "email",
-    "website",
-}
 
 LIST_OMITTED_FIELDS = {
     "ocr_text",
@@ -85,21 +41,6 @@ CONTACT_SUMMARY_FIELDS = (
 )
 
 
-def _image_metadata(relative: str) -> tuple[int | None, int | None, int | None]:
-    path = settings.data_dir / relative
-    if not path.exists():
-        return None, None, None
-    file_size = path.stat().st_size
-    try:
-        from PIL import Image
-
-        with Image.open(path) as image:
-            width, height = image.size
-        return width, height, file_size
-    except Exception:
-        return None, None, file_size
-
-
 def _upsert_card_image(
     conn,
     card_id: str,
@@ -109,7 +50,7 @@ def _upsert_card_image(
     direction: str,
 ) -> None:
     now = now_iso()
-    width, height, file_size = _image_metadata(original_image_path)
+    width, height, file_size = image_metadata(resolve_data_path(original_image_path))
     conn.execute(
         """
         INSERT INTO card_images (
@@ -122,6 +63,7 @@ def _upsert_card_image(
             processed_image_path = NULL,
             thumbnail_path = NULL,
             ocr_direction = excluded.ocr_direction,
+            manual_rotation = 0, auto_rotation = 0,
             ocr_text = NULL,
             ocr_blocks_json = NULL,
             ocr_duration_ms = NULL,
@@ -167,93 +109,42 @@ def _hydrate_card(conn, row, include_images: bool = True) -> dict | None:
         ).fetchall()
     ]
     card["images"] = images
-    for image in images:
-        _apply_image_to_card(card, image)
     return card
 
 
-def _apply_image_to_card(card: dict, image: dict) -> None:
-    if image["side"] == "back":
-        prefix = "back_"
-    elif image["side"] == "front":
-        prefix = ""
-    else:
-        return
-    for field in (
-        "original_sha256",
-        "original_image_path",
-        "processed_image_path",
-        "thumbnail_path",
-        "ocr_direction",
-        "ocr_text",
-        "ocr_blocks_json",
-        "ocr_duration_ms",
-    ):
-        card[f"{prefix}{field}"] = image.get(field)
-
-
-def create_card(
-    card_id: str,
-    original_image_path: str,
-    original_sha256: str,
-    direction: str,
-    owner_user_id: str,
-) -> str:
+def create_card(card_id: str, original_image_path: str, original_sha256: str,
+                direction: str, owner_user_id: str, *, line_event_id: str | None = None) -> str:
     now = now_iso()
     job_id = uuid4().hex
     with connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
         if conn.execute("SELECT 1 FROM users WHERE id = ? AND status = 'active'", (owner_user_id,)).fetchone() is None:
             raise ValueError("利用者が無効のため名刺を登録できません")
-        conn.execute(
-            """
-            INSERT INTO cards (
-                id, status, original_image_path, original_sha256, ocr_direction,
-                owner_user_id, created_at, updated_at
-            ) VALUES (?, 'queued', ?, ?, ?, ?, ?, ?)
-            """,
-            (card_id, original_image_path, original_sha256, direction, owner_user_id, now, now),
-        )
+        conn.execute("INSERT INTO cards (id, status, owner_user_id, created_at, updated_at) VALUES (?, 'queued', ?, ?, ?)",
+                     (card_id, owner_user_id, now, now))
         _upsert_card_image(conn, card_id, "front", original_image_path, original_sha256, direction)
-        conn.execute(
-            """
-            INSERT INTO jobs (id, card_id, type, status, created_at)
-            VALUES (?, ?, 'process_card', 'queued', ?)
-            """,
-            (job_id, card_id, now),
-        )
+        conn.execute("INSERT INTO jobs (id, card_id, type, status, created_at) VALUES (?, ?, 'process_card', 'queued', ?)",
+                     (job_id, card_id, now))
+        if line_event_id:
+            event = conn.execute("SELECT message_id FROM line_events WHERE id = ? AND connection_id IN (SELECT id FROM line_connections WHERE owner_user_id = ?)",
+                                 (line_event_id, owner_user_id)).fetchone()
+            if event is None:
+                raise ValueError("LINEイベントの所有者が一致しません")
+            conn.execute("UPDATE cards SET source_system = 'line', source_id = ? WHERE id = ?", (event['message_id'], card_id))
+            conn.execute("UPDATE line_events SET card_id = ?, status = 'queued', error_message = NULL, updated_at = ? WHERE id = ?",
+                         (card_id, now, line_event_id))
     return job_id
 
-
-def set_card_source(
-    card_id: str,
-    source_system: str,
-    source_id: str,
-    source_filename: str | None = None,
-) -> None:
-    now = now_iso()
-    with connection() as conn:
-        conn.execute(
-            """
-            UPDATE cards
-            SET source_system = ?,
-                source_id = ?,
-                source_filename = ?,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (source_system, source_id, source_filename, now, card_id),
-        )
 
 
 def get_user_owned_card_by_original_sha256(original_sha256: str, user_id: str) -> dict | None:
     if not original_sha256:
         return None
-    with get_connection() as conn:
+    with connection() as conn:
         row = conn.execute(
             """
             SELECT cards.*
-            FROM cards
+            FROM card_records cards
             JOIN card_images ON card_images.card_id = cards.id
             WHERE card_images.original_sha256 = ?
               AND cards.owner_user_id = ?
@@ -264,26 +155,6 @@ def get_user_owned_card_by_original_sha256(original_sha256: str, user_id: str) -
         ).fetchone()
         return _hydrate_card(conn, row)
 
-
-def claim_line_event(
-    event_id: str,
-    event_type: str | None,
-    line_sender_id: str | None,
-    message_id: str | None,
-) -> bool:
-    now = now_iso()
-    with connection() as conn:
-        columns = {row["name"] for row in conn.execute("PRAGMA table_info(line_events)")}
-        sender_column = "line_sender_id" if "line_sender_id" in columns else "line_user_id"
-        cursor = conn.execute(
-            f"""
-            INSERT OR IGNORE INTO line_events (
-                id, event_type, {sender_column}, message_id, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'received', ?, ?)
-            """,
-            (event_id, event_type, line_sender_id, message_id, now, now),
-        )
-        return cursor.rowcount > 0
 
 
 def finish_line_event(event_id: str, status: str, card_id: str | None = None, error_message: str | None = None) -> None:
@@ -303,24 +174,24 @@ def finish_line_event(event_id: str, status: str, card_id: str | None = None, er
 
 
 def has_users() -> bool:
-    with get_connection() as conn:
+    with connection() as conn:
         return conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
 
 
 def get_user_by_login_id(login_id: str) -> dict | None:
-    with get_connection() as conn:
+    with connection() as conn:
         return row_to_dict(
             conn.execute("SELECT * FROM users WHERE login_id = ?", (login_id,)).fetchone()
         )
 
 
 def get_user_by_id(user_id: str) -> dict | None:
-    with get_connection() as conn:
+    with connection() as conn:
         return row_to_dict(conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone())
 
 
 def list_users() -> list[dict]:
-    with get_connection() as conn:
+    with connection() as conn:
         return [dict(row) for row in conn.execute("SELECT * FROM users ORDER BY created_at")]
 
 
@@ -383,6 +254,7 @@ def bootstrap_first_user(login_id: str, password_hash: str) -> dict:
             (user_id, now, now),
         )
         _remove_legacy_line_auth_schema(conn)
+    restore_default_line_identity_from_backup()
     return get_user_by_login_id(login_id) or {}
 
 
@@ -493,6 +365,8 @@ def delete_user_and_owned_data(user_id: str) -> list[str] | None:
             raise ValueError("管理者アカウントは削除できません")
         if conn.execute("SELECT 1 FROM jobs JOIN cards ON cards.id = jobs.card_id WHERE cards.owner_user_id = ? AND jobs.status = 'running'", (user_id,)).fetchone():
             raise ValueError("名刺を処理中です。完了後に削除を再試行してください")
+        if conn.execute("SELECT 1 FROM line_events e JOIN line_connections lc ON lc.id = e.connection_id WHERE lc.owner_user_id = ? AND e.status = 'running'", (user_id,)).fetchone():
+            raise ValueError("LINE画像を取り込み中です。完了後に再試行してください")
         directories = owned_image_directories(conn, user_id)
         card_ids = [
             row["id"]
@@ -533,25 +407,20 @@ def delete_user_and_owned_data(user_id: str) -> list[str] | None:
     return card_ids
 
 
-def get_default_line_connection() -> dict | None:
-    with get_connection() as conn:
-        return row_to_dict(
-            conn.execute("SELECT * FROM line_connections WHERE id = 'default'").fetchone()
-        )
-
-
 def restore_default_line_identity_from_backup() -> bool:
-    """Recover the one previous LINE identity only when migration backup is unambiguous."""
+    """Attempt legacy identity restoration once, never after explicit setup."""
     backup_path = settings.data_dir / "bzcard-before-local-auth.db"
-    if not backup_path.exists():
-        return False
     with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         current = conn.execute("SELECT * FROM line_connections WHERE id = 'default'").fetchone()
-        if current is None or current["line_user_id"]:
+        if current is None or current["legacy_identity_checked"]:
+            return False
+        conn.execute("UPDATE line_connections SET legacy_identity_checked = 1 WHERE id = 'default'")
+        if current["line_user_id"] or current["line_login_channel_id"] or not backup_path.exists():
             return False
         import sqlite3
 
-        backup = sqlite3.connect(backup_path)
+        backup = sqlite3.connect(f"file:{backup_path}?mode=ro", uri=True)
         try:
             rows = backup.execute(
                 "SELECT line_user_id FROM line_users WHERE status = 'active' ORDER BY created_at"
@@ -569,27 +438,18 @@ def restore_default_line_identity_from_backup() -> bool:
         return True
 
 
-def set_default_line_connection_owner(user_id: str) -> None:
-    now = now_iso()
-    with connection() as conn:
-        conn.execute(
-            "UPDATE line_connections SET owner_user_id = ?, updated_at = ? WHERE id = 'default'",
-            (user_id, now),
-        )
-
-
 def get_user_line_connection(user_id: str) -> dict | None:
-    with get_connection() as conn:
+    with connection() as conn:
         return row_to_dict(conn.execute("SELECT * FROM line_connections WHERE owner_user_id = ?", (user_id,)).fetchone())
 
 
 def list_line_connections() -> list[dict]:
-    with get_connection() as conn:
+    with connection() as conn:
         return [dict(row) for row in conn.execute("SELECT * FROM line_connections").fetchall()]
 
 
 def get_line_connection(connection_id: str) -> dict | None:
-    with get_connection() as conn:
+    with connection() as conn:
         return row_to_dict(conn.execute("SELECT * FROM line_connections WHERE id = ?", (connection_id,)).fetchone())
 
 
@@ -648,7 +508,7 @@ def save_user_line_connection(user_id: str, payload: dict) -> dict:
         with connection() as conn:
             identity_changed = current.get("line_login_channel_id") != login_channel_id
             conn.execute(
-                "UPDATE line_connections SET channel_secret_encrypted = COALESCE(?, channel_secret_encrypted), access_token_encrypted = COALESCE(?, access_token_encrypted), line_login_channel_id = ?, liff_url = ?, liff_id = ?, line_user_id = CASE WHEN ? THEN NULL ELSE line_user_id END, updated_at = ? WHERE id = ?",
+                "UPDATE line_connections SET legacy_identity_checked = 1, channel_secret_encrypted = COALESCE(?, channel_secret_encrypted), access_token_encrypted = COALESCE(?, access_token_encrypted), line_login_channel_id = ?, liff_url = ?, liff_id = ?, line_user_id = CASE WHEN ? THEN NULL ELSE line_user_id END, updated_at = ? WHERE id = ?",
                 (encrypt(channel_secret) if channel_secret else None, encrypt(access_token) if access_token else None, login_channel_id, liff_url, liff_id, identity_changed, now, current["id"]),
             )
             if identity_changed:
@@ -679,7 +539,7 @@ def consume_line_link_request(token: str, connection_id: str) -> bool:
 
 def bind_line_identity(connection_id: str, line_user_id: str) -> None:
     with connection() as conn:
-        conn.execute("UPDATE line_connections SET line_user_id = ?, updated_at = ? WHERE id = ?", (line_user_id, now_iso(), connection_id))
+        conn.execute("UPDATE line_connections SET line_user_id = ?, legacy_identity_checked = 1, updated_at = ? WHERE id = ?", (line_user_id, now_iso(), connection_id))
 
 
 def backfill_line_connection_liff_ids() -> int:
@@ -695,90 +555,37 @@ def backfill_line_connection_liff_ids() -> int:
     return updated
 
 
-def get_card_by_original_sha256(original_sha256: str) -> dict | None:
-    if not original_sha256:
-        return None
-    with get_connection() as conn:
-        row = conn.execute(
-            """
-            SELECT cards.*
-            FROM cards
-            JOIN card_images ON card_images.card_id = cards.id
-            WHERE card_images.original_sha256 = ?
-            ORDER BY cards.created_at ASC
-            LIMIT 1
-            """,
-            (original_sha256,),
-        ).fetchone()
-        if row is not None:
-            return _hydrate_card(conn, row)
-        row = conn.execute(
-            """
-            SELECT * FROM cards
-            WHERE original_sha256 = ? OR back_original_sha256 = ?
-            ORDER BY created_at ASC
-            LIMIT 1
-            """,
-            (original_sha256, original_sha256),
-        ).fetchone()
-        return _hydrate_card(conn, row)
-
-
 def set_back_image(card_id: str, original_image_path: str, original_sha256: str, direction: str) -> str:
-    now = now_iso()
-    job_id = uuid4().hex
     with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         _upsert_card_image(conn, card_id, "back", original_image_path, original_sha256, direction)
-        conn.execute(
-            """
-            UPDATE cards
-            SET status = 'queued',
-                back_original_image_path = ?,
-                back_original_sha256 = ?,
-                back_processed_image_path = NULL,
-                back_thumbnail_path = NULL,
-                back_ocr_direction = ?,
-                back_ocr_text = NULL,
-                back_ocr_blocks_json = NULL,
-                back_ocr_duration_ms = NULL,
-                error_message = NULL,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (original_image_path, original_sha256, direction, now, card_id),
-        )
-        conn.execute(
-            """
-            INSERT INTO jobs (id, card_id, type, status, created_at)
-            VALUES (?, ?, 'process_card', 'queued', ?)
-            """,
-            (job_id, card_id, now),
-        )
+        return _enqueue_job(conn, card_id, "process_card")
+
+
+def _enqueue_job(conn, card_id: str, job_type: str) -> str:
+    active = conn.execute("SELECT id FROM jobs WHERE card_id = ? AND status IN ('queued', 'running') ORDER BY created_at LIMIT 1", (card_id,)).fetchone()
+    if active:
+        return active['id']
+    job_id = uuid4().hex
+    now = now_iso()
+    conn.execute("INSERT INTO jobs (id, card_id, type, status, created_at) VALUES (?, ?, ?, 'queued', ?)", (job_id, card_id, job_type, now))
+    conn.execute("UPDATE cards SET status = 'queued', error_message = NULL, updated_at = ? WHERE id = ?", (now, card_id))
     return job_id
 
 
 def enqueue_job(card_id: str, job_type: str) -> str:
-    job_id = uuid4().hex
-    now = now_iso()
     with connection() as conn:
-        conn.execute(
-            "INSERT INTO jobs (id, card_id, type, status, created_at) VALUES (?, ?, ?, 'queued', ?)",
-            (job_id, card_id, job_type, now),
-        )
-        conn.execute(
-            "UPDATE cards SET status = 'queued', error_message = NULL, updated_at = ? WHERE id = ?",
-            (now, card_id),
-        )
-    return job_id
+        conn.execute("BEGIN IMMEDIATE")
+        return _enqueue_job(conn, card_id, job_type)
 
 
 def get_active_job(card_id: str) -> dict | None:
-    with get_connection() as conn:
+    with connection() as conn:
         row = conn.execute(
             """
             SELECT * FROM jobs
             WHERE card_id = ? AND status IN ('queued', 'running')
-            ORDER BY created_at ASC
+            ORDER BY jobs.created_at ASC
             LIMIT 1
             """,
             (card_id,),
@@ -786,51 +593,30 @@ def get_active_job(card_id: str) -> dict | None:
         return row_to_dict(row)
 
 
-def list_cards(q: str | None = None, status: str | None = None) -> list[dict]:
-    sql = "SELECT * FROM cards"
-    where = []
-    params: list[str] = []
-    if status:
-        where.append("status = ?")
-        params.append(status)
-    if q:
-        search_clause, search_params = _search_filter(q)
-        if search_clause:
-            where.append(search_clause)
-            params.extend(search_params)
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY created_at DESC"
-    with get_connection() as conn:
-        rows = conn.execute(sql, params).fetchall()
-        return _cards_from_rows(conn, rows, q)
-
-
 def get_card(card_id: str) -> dict | None:
-    with get_connection() as conn:
+    with connection() as conn:
         return _hydrate_card(
             conn,
-            conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone(),
+            conn.execute("SELECT * FROM card_records WHERE id = ?", (card_id,)).fetchone(),
         )
 
 
 def list_user_cards(user_id: str, q: str | None = None, status: str | None = None) -> list[dict]:
-    sql = "SELECT * FROM cards"
-    where = ["owner_user_id = ?"]
-    params: list[str] = [user_id]
-    if status:
-        where.append("status = ?")
-        params.append(status)
-    if q:
-        search_clause, search_params = _search_filter(q)
-        if search_clause:
-            where.append(search_clause)
-            params.extend(search_params)
-    sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY created_at DESC"
-    with get_connection() as conn:
-        rows = conn.execute(sql, params).fetchall()
-        return _cards_from_rows(conn, rows, q)
+    where = "owner_user_id = ?" + (" AND status = ?" if status else "")
+    params = [user_id, status] if status else [user_id]
+    tokens = _prepare_contact_search(q)
+    with connection() as conn:
+        rows = conn.execute("SELECT * FROM card_records WHERE " + where + " ORDER BY created_at DESC", params).fetchall()
+        scored = []
+        for row in rows:
+            card = dict(row)
+            parts = _token_search_scores(card, tokens)
+            if tokens and not all(parts):
+                continue
+            scored.append((sum(parts), card['created_at'], _hydrate_card(conn, row, include_images=False)))
+    if tokens:
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [card for _score, _created, card in scored]
 
 
 def list_user_contacts(
@@ -852,29 +638,38 @@ def list_user_contacts(
         params.append(status)
     # List responses need no OCR blocks/extraction JSON or image metadata. Search
     # adds OCR text only when needed; keep all cards for cross-card matching.
-    columns = set(CONTACT_SUMMARY_FIELDS) | {"id", "email", "mobile"}
+    columns = set(CONTACT_SUMMARY_FIELDS) | {"id", "email", "mobile", "revision"}
     if q:
         columns.update(SEARCH_FIELDS)
     if include_cards:
         columns.update(CARD_FIELDS)
     projection = "*" if include_cards else ", ".join(sorted(columns))
-    sql = "SELECT " + projection + " FROM cards WHERE " + " AND ".join(where)
+    sql = "SELECT " + projection + " FROM card_records WHERE " + " AND ".join(where)
     search = _prepare_contact_search(q)
-    with get_connection() as conn:
+    with connection() as conn:
         rows = conn.execute(sql, params).fetchall()
         entries = []
         for row in rows:
             card = dict(row)
-            score = _contact_search_score(card, search) if search else 0
+            parts = _token_search_scores(card, search)
+            card["_token_scores"] = parts
+            score = sum(parts)
             for field in LIST_OMITTED_FIELDS:
                 card.pop(field, None)
             entries.append((card, score))
-    return _contacts_from_entries(entries, q, include_cards=include_cards)
+    matched = set()
+    if search:
+        for group in _contact_groups([card for card, _score in entries]):
+            if all(any(card["_token_scores"][i] for card in group) for i in range(len(search))):
+                matched.update(card["id"] for card in group)
+    for card, _score in entries:
+        card.pop("_token_scores", None)
+    return _contacts_from_entries(entries, q if search else None, include_cards=include_cards, matched_groups=matched)
 
 
 def get_user_contact(user_id: str, contact_id: str) -> dict | None:
     """Resolve a contact by its representative card ID or any member card ID."""
-    with get_connection() as conn:
+    with connection() as conn:
         # Only load identifiers to discover the connected group, then retrieve
         # full records for that group. Never materialize every person's details.
         identifiers = [dict(row) for row in conn.execute(
@@ -890,7 +685,7 @@ def get_user_contact(user_id: str, contact_id: str) -> dict | None:
             batch = ids[start:start + 500]
             placeholders = ",".join("?" for _ in batch)
             cards.extend(dict(row) for row in conn.execute(
-                f"SELECT * FROM cards WHERE owner_user_id = ? AND id IN ({placeholders})",
+                f"SELECT * FROM card_records WHERE owner_user_id = ? AND id IN ({placeholders})",
                 [user_id, *batch],
             ))
         if not cards:
@@ -904,11 +699,11 @@ def get_user_contact(user_id: str, contact_id: str) -> dict | None:
 
 
 def get_user_card(card_id: str, user_id: str) -> dict | None:
-    with get_connection() as conn:
+    with connection() as conn:
         return _hydrate_card(
             conn,
             conn.execute(
-                "SELECT * FROM cards WHERE id = ? AND owner_user_id = ?",
+                "SELECT * FROM card_records WHERE id = ? AND owner_user_id = ?",
                 (card_id, user_id),
             ).fetchone(),
         )
@@ -948,18 +743,19 @@ def _contacts_from_entries(
     entries: list[tuple[dict, int]],
     query: str | None,
     include_cards: bool = False,
+    matched_groups: set[str] | None = None,
 ) -> list[dict]:
     """Group by equal email/mobile, retaining transitive matching and ranking."""
     scores = {card["id"]: score for card, score in entries}
 
     contacts = []
     for cards in _contact_groups([card for card, _score in entries]):
-        if query and not any(scores[card["id"]] > 0 for card in cards):
+        if query and not any((card["id"] in matched_groups if matched_groups is not None else scores[card["id"]] > 0) for card in cards):
             continue
         cards.sort(key=lambda card: (card.get("created_at") or "", card["id"]), reverse=True)
         representative = cards[0]
         revision = hashlib.sha256(json.dumps([
-            [card["id"], card.get("updated_at"), card.get("status")]
+            [card["id"], card.get("revision"), card.get("updated_at"), card.get("status")]
             for card in cards
         ]).encode()).hexdigest()[:20]
         contact = {
@@ -1000,16 +796,6 @@ def _contact_identifiers(card: dict) -> set[tuple[str, str]]:
     return identifiers
 
 
-def _cards_are_same_contact(left: dict, right: dict) -> bool:
-    left_email, right_email = _contact_email(left.get("email")), _contact_email(right.get("email"))
-    left_mobile, right_mobile = _contact_mobile(left.get("mobile")), _contact_mobile(right.get("mobile"))
-    if left_email and left_email == right_email:
-        return True
-    if left_mobile and left_mobile == right_mobile:
-        return True
-    return False
-
-
 def _contact_email(value) -> str:
     return unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
 
@@ -1019,7 +805,7 @@ def _contact_mobile(value) -> str:
 
 
 def get_card_images(card_id: str) -> list[dict]:
-    with get_connection() as conn:
+    with connection() as conn:
         return [
             dict(row)
             for row in conn.execute(
@@ -1034,24 +820,9 @@ def get_card_images(card_id: str) -> list[dict]:
         ]
 
 
-def get_card_image(card_id: str, side: str) -> dict | None:
-    with get_connection() as conn:
-        return row_to_dict(
-            conn.execute(
-                "SELECT * FROM card_images WHERE card_id = ? AND side = ?",
-                (card_id, side),
-            ).fetchone()
-        )
-
-
-def get_job(job_id: str) -> dict | None:
-    with get_connection() as conn:
-        return row_to_dict(conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone())
-
-
 def get_user_job(job_id: str, user_id: str) -> dict | None:
     """Return a job only when its card belongs to the requesting user."""
-    with get_connection() as conn:
+    with connection() as conn:
         return row_to_dict(
             conn.execute(
                 """
@@ -1066,31 +837,18 @@ def get_user_job(job_id: str, user_id: str) -> dict | None:
 
 
 def update_card_fields(card_id: str, data: dict) -> dict | None:
-    fields = {k: v for k, v in data.items() if k in CARD_FIELDS}
+    fields = normalize_fields({k: v for k, v in data.items() if k in CARD_FIELDS})
     if not fields:
         return get_card(card_id)
-    if "person_name_kana" in fields:
-        fields["person_name_kana"] = _normalize_kana_field(fields["person_name_kana"])
-    if "address" in fields:
-        fields["address"] = _normalize_address(fields["address"])
-    if "postal_code" in fields:
-        fields["postal_code"] = _normalize_postal_code(fields["postal_code"])
-    if "company_name" in fields:
-        fields["company_name"] = _normalize_company_name(fields["company_name"])
-    if "tags" in fields:
-        fields["tags"] = _normalize_tags(fields["tags"])
-    for phone_field in ("tel", "mobile", "fax"):
-        if phone_field in fields:
-            fields[phone_field] = _normalize_phone_number(fields[phone_field])
-
     now = now_iso()
-    assignments = ", ".join(f"{field} = ?" for field in fields)
-    params = list(fields.values()) + [now, card_id]
     with connection() as conn:
-        conn.execute(
-            f"UPDATE cards SET {assignments}, updated_at = ? WHERE id = ?",
-            params,
-        )
+        conn.execute("BEGIN IMMEDIATE")
+        card = conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
+        if card is None:
+            return None
+        record_manual_changes(conn, card, fields)
+        assignments = ", ".join(f"{field} = ?" for field in fields)
+        conn.execute(f"UPDATE cards SET {assignments}, updated_at = ? WHERE id = ?", list(fields.values()) + [now, card_id])
         _sync_extracted_json(conn, card_id, fields, now)
     return get_card(card_id)
 
@@ -1113,10 +871,6 @@ def _sync_extracted_json(conn, card_id: str, fields: dict, now: str) -> None:
 
     for key, value in updates.items():
         extracted[key] = value or ""
-    raw = extracted.get("_raw")
-    if isinstance(raw, dict):
-        for key, value in updates.items():
-            raw[key] = value or ""
 
     conn.execute(
         "UPDATE cards SET extracted_json = ?, updated_at = ? WHERE id = ?",
@@ -1124,37 +878,21 @@ def _sync_extracted_json(conn, card_id: str, fields: dict, now: str) -> None:
     )
 
 
-def set_ocr_direction(card_id: str, direction: str) -> None:
-    now = now_iso()
+def set_image_ocr_direction(card_id: str, direction: str, side: str) -> None:
     with connection() as conn:
-        conn.execute(
-            "UPDATE cards SET ocr_direction = ?, updated_at = ? WHERE id = ?",
-            (direction, now, card_id),
-        )
-        conn.execute(
-            "UPDATE card_images SET ocr_direction = ?, updated_at = ? WHERE card_id = ? AND side = 'front'",
-            (direction, now, card_id),
-        )
+        conn.execute("UPDATE card_images SET ocr_direction = ?, updated_at = ? WHERE card_id = ? AND side = ?", (direction, now_iso(), card_id, side))
+
+
+def set_ocr_direction(card_id: str, direction: str) -> None:
+    set_image_ocr_direction(card_id, direction, "front")
 
 
 def set_back_ocr_direction(card_id: str, direction: str) -> None:
-    now = now_iso()
-    with connection() as conn:
-        conn.execute(
-            "UPDATE cards SET back_ocr_direction = ?, updated_at = ? WHERE id = ?",
-            (direction, now, card_id),
-        )
-        conn.execute(
-            "UPDATE card_images SET ocr_direction = ?, updated_at = ? WHERE card_id = ? AND side = 'back'",
-            (direction, now, card_id),
-        )
+    set_image_ocr_direction(card_id, direction, "back")
 
 
 def save_detected_ocr_direction(card_id: str, direction: str, side: str = "front") -> None:
-    if side == "back":
-        set_back_ocr_direction(card_id, direction)
-        return
-    set_ocr_direction(card_id, direction)
+    set_image_ocr_direction(card_id, direction, side)
 
 
 def delete_card(card_id: str) -> bool:
@@ -1186,61 +924,12 @@ def normalize_existing_company_names() -> int:
     return changed
 
 
-def set_card_processing_artifacts(
-    card_id: str,
-    processed_path: str,
-    thumbnail_path: str,
-    side: str = "front",
-) -> None:
+def set_card_processing_artifacts(card_id: str, processed_path: str, thumbnail_path: str, side: str = "front") -> None:
     now = now_iso()
-    if side == "back":
-        with connection() as conn:
-            conn.execute(
-                """
-                UPDATE card_images
-                SET processed_image_path = ?,
-                    thumbnail_path = ?,
-                    updated_at = ?
-                WHERE card_id = ? AND side = 'back'
-                """,
-                (processed_path, thumbnail_path, now, card_id),
-            )
-            conn.execute(
-                """
-                UPDATE cards
-                SET status = 'scanning',
-                    back_processed_image_path = ?,
-                    back_thumbnail_path = ?,
-                    error_message = NULL,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (processed_path, thumbnail_path, now, card_id),
-            )
-        return
     with connection() as conn:
-        conn.execute(
-            """
-            UPDATE card_images
-            SET processed_image_path = ?,
-                thumbnail_path = ?,
-                updated_at = ?
-            WHERE card_id = ? AND side = 'front'
-            """,
-            (processed_path, thumbnail_path, now, card_id),
-        )
-        conn.execute(
-            """
-            UPDATE cards
-            SET status = 'scanning',
-                processed_image_path = ?,
-                thumbnail_path = ?,
-                error_message = NULL,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (processed_path, thumbnail_path, now, card_id),
-        )
+        conn.execute("UPDATE card_images SET processed_image_path = ?, thumbnail_path = ?, updated_at = ? WHERE card_id = ? AND side = ?",
+                     (processed_path, thumbnail_path, now, card_id, side))
+        conn.execute("UPDATE cards SET status = 'scanning', error_message = NULL, updated_at = ? WHERE id = ?", (now, card_id))
 
 
 def set_card_status(card_id: str, status: str, error_message: str | None = None) -> None:
@@ -1252,219 +941,52 @@ def set_card_status(card_id: str, status: str, error_message: str | None = None)
         )
 
 
-def update_image_orientation_metadata(
-    card_id: str,
-    side: str,
-    original_sha256: str | None,
-    thumbnail_path: str,
-    width: int | None,
-    height: int | None,
-    file_size: int | None,
-    original_changed: bool,
-) -> dict | None:
+def update_image_orientation_metadata(card_id: str, side: str, degrees: int, thumbnail_path: str) -> dict | None:
+    with connection() as conn:
+        conn.execute("UPDATE card_images SET manual_rotation = (manual_rotation + ? + 360) % 360, thumbnail_path = ?, updated_at = ? WHERE card_id = ? AND side = ?",
+                     (degrees, thumbnail_path, now_iso(), card_id, side))
+    return get_card(card_id)
+
+
+def save_auto_rotation(card_id: str, side: str, degrees: int) -> None:
+    with connection() as conn:
+        conn.execute("UPDATE card_images SET auto_rotation = (auto_rotation + ? + 360) % 360, updated_at = ? WHERE card_id = ? AND side = ?",
+                     (degrees, now_iso(), card_id, side))
+
+
+def save_ocr_result(card_id: str, raw_text: str, blocks: list[dict], duration_ms: int, side: str = "front") -> None:
     now = now_iso()
     with connection() as conn:
-        if side == "back":
-            conn.execute(
-                """
-                UPDATE card_images
-                SET thumbnail_path = ?,
-                    original_sha256 = CASE WHEN ? THEN ? ELSE original_sha256 END,
-                    width = CASE WHEN ? THEN ? ELSE width END,
-                    height = CASE WHEN ? THEN ? ELSE height END,
-                    file_size = CASE WHEN ? THEN ? ELSE file_size END,
-                    updated_at = ?
-                WHERE card_id = ? AND side = 'back'
-                """,
-                (
-                    thumbnail_path,
-                    original_changed,
-                    original_sha256,
-                    original_changed,
-                    width,
-                    original_changed,
-                    height,
-                    original_changed,
-                    file_size,
-                    now,
-                    card_id,
-                ),
-            )
-            conn.execute(
-                """
-                UPDATE cards
-                SET back_thumbnail_path = ?,
-                    back_original_sha256 = CASE WHEN ? THEN ? ELSE back_original_sha256 END,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (thumbnail_path, original_changed, original_sha256, now, card_id),
-            )
-        else:
-            conn.execute(
-                """
-                UPDATE card_images
-                SET thumbnail_path = ?,
-                    original_sha256 = CASE WHEN ? THEN ? ELSE original_sha256 END,
-                    width = CASE WHEN ? THEN ? ELSE width END,
-                    height = CASE WHEN ? THEN ? ELSE height END,
-                    file_size = CASE WHEN ? THEN ? ELSE file_size END,
-                    updated_at = ?
-                WHERE card_id = ? AND side = 'front'
-                """,
-                (
-                    thumbnail_path,
-                    original_changed,
-                    original_sha256,
-                    original_changed,
-                    width,
-                    original_changed,
-                    height,
-                    original_changed,
-                    file_size,
-                    now,
-                    card_id,
-                ),
-            )
-            conn.execute(
-                """
-                UPDATE cards
-                SET thumbnail_path = ?,
-                    original_sha256 = CASE WHEN ? THEN ? ELSE original_sha256 END,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (thumbnail_path, original_changed, original_sha256, now, card_id),
-            )
-        row = conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
-    with get_connection() as conn:
-        return _hydrate_card(conn, row)
+        conn.execute("UPDATE card_images SET ocr_text = ?, ocr_blocks_json = ?, ocr_duration_ms = ?, updated_at = ? WHERE card_id = ? AND side = ?",
+                     (raw_text, json.dumps(blocks, ensure_ascii=False), duration_ms, now, card_id, side))
+        conn.execute("UPDATE cards SET status = 'extracting', updated_at = ? WHERE id = ?", (now, card_id))
 
 
-def save_ocr_result(
-    card_id: str,
-    raw_text: str,
-    blocks: list[dict],
-    duration_ms: int,
-    side: str = "front",
-) -> None:
-    now = now_iso()
-    if side == "back":
-        with connection() as conn:
-            conn.execute(
-                """
-                UPDATE card_images
-                SET ocr_text = ?,
-                    ocr_blocks_json = ?,
-                    ocr_duration_ms = ?,
-                    updated_at = ?
-                WHERE card_id = ? AND side = 'back'
-                """,
-                (raw_text, json.dumps(blocks, ensure_ascii=False), duration_ms, now, card_id),
-            )
-            conn.execute(
-                """
-                UPDATE cards
-                SET status = 'extracting',
-                    back_ocr_text = ?,
-                    back_ocr_blocks_json = ?,
-                    back_ocr_duration_ms = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (raw_text, json.dumps(blocks, ensure_ascii=False), duration_ms, now, card_id),
-            )
-        return
+def save_extraction_result(card_id: str, extracted: dict, duration_ms: int,
+                           ocr_text: str = "", blocks: list[dict] | None = None) -> None:
+    from ..config import settings
+    values = normalize_fields({key: extracted.get(key) or "" for key in SCHEMA_KEYS})
+    raw = extracted.get("_raw") or {}
+    automatic = normalize_fields(extracted.get("_automatic") or values)
+    final = {**extracted, **values}
+    now, run_id = now_iso(), uuid4().hex
+    model = {"provider": settings.llm_provider, "model": settings.llm_model if settings.llm_provider == "ollama" else settings.gemini_model,
+             "ocr": "yomitoku", "ocr_version": "0.14.0", "ocr_recognizer_model": settings.ocr_recognizer_model, **(extracted.get("_model") or {})}
     with connection() as conn:
-        conn.execute(
-            """
-            UPDATE card_images
-            SET ocr_text = ?,
-                ocr_blocks_json = ?,
-                ocr_duration_ms = ?,
-                updated_at = ?
-            WHERE card_id = ? AND side = 'front'
-            """,
-            (raw_text, json.dumps(blocks, ensure_ascii=False), duration_ms, now, card_id),
-        )
-        conn.execute(
-            """
-            UPDATE cards
-            SET status = 'extracting',
-                ocr_text = ?,
-                ocr_blocks_json = ?,
-                ocr_duration_ms = ?,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (raw_text, json.dumps(blocks, ensure_ascii=False), duration_ms, now, card_id),
-        )
-
-
-def save_extraction_result(
-    card_id: str,
-    extracted: dict,
-    duration_ms: int,
-) -> None:
-    now = now_iso()
-    extracted = dict(extracted)
-    extracted["postal_code"] = _normalize_postal_code(extracted.get("postal_code"))
-    values = {
-        "person_name": extracted.get("person_name") or extracted.get("name") or "",
-        "person_name_kana": _normalize_kana_field(extracted.get("person_name_kana") or ""),
-        "company_name": _normalize_company_name(extracted.get("company_name") or extracted.get("company") or ""),
-        "department": extracted.get("department") or "",
-        "title": extracted.get("title") or extracted.get("position") or "",
-        "postal_code": extracted.get("postal_code") or "",
-        "address": _normalize_address(extracted.get("address") or ""),
-        "tel": _normalize_phone_number(extracted.get("tel") or extracted.get("phone") or ""),
-        "mobile": _normalize_phone_number(extracted.get("mobile") or ""),
-        "fax": _normalize_phone_number(extracted.get("fax") or ""),
-        "email": extracted.get("email") or "",
-        "website": extracted.get("website") or extracted.get("url") or "",
-    }
-    with connection() as conn:
-        conn.execute(
-            """
-            UPDATE cards
-            SET status = 'ready',
-                extracted_json = ?,
-                person_name = ?,
-                person_name_kana = ?,
-                company_name = ?,
-                department = ?,
-                title = ?,
-                postal_code = ?,
-                address = ?,
-                tel = ?,
-                mobile = ?,
-                fax = ?,
-                email = ?,
-                website = ?,
-                extraction_duration_ms = ?,
-                error_message = NULL,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                json.dumps(extracted, ensure_ascii=False),
-                values["person_name"],
-                values["person_name_kana"],
-                values["company_name"],
-                values["department"],
-                values["title"],
-                values["postal_code"],
-                values["address"],
-                values["tel"],
-                values["mobile"],
-                values["fax"],
-                values["email"],
-                values["website"],
-                duration_ms,
-                now,
-                card_id,
-            ),
-        )
+        conn.execute("BEGIN IMMEDIATE")
+        card = conn.execute("SELECT owner_user_id FROM cards WHERE id = ?", (card_id,)).fetchone()
+        if card is None:
+            return
+        dump = lambda data: json.dumps(data, ensure_ascii=False)
+        conn.execute("""INSERT INTO extraction_runs (id, card_id, owner_user_id, ocr_text, ocr_blocks_json,
+            model_json, pipeline_version, raw_json, automatic_json, result_json, feedback_json, created_at, response_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (run_id, card_id, card["owner_user_id"], ocr_text, dump(blocks or []), dump(model), PIPELINE_VERSION,
+             dump(raw), dump(automatic), dump(values), dump(extracted.get("_feedback") or {}), now, extracted.get("_response_text") or ""))
+        assignments = ", ".join(f"{key} = ?" for key in values)
+        # Preserve the approved behavior: completion replaces current manual fields.
+        conn.execute(f"UPDATE cards SET {assignments}, status = 'ready', extracted_json = ?, latest_extraction_id = ?, extraction_duration_ms = ?, error_message = NULL, updated_at = ? WHERE id = ?",
+                     list(values.values()) + [dump(final), run_id, duration_ms, now, card_id])
 
 
 def _query_variants(value: str) -> list[str]:
@@ -1480,35 +1002,8 @@ def _query_variants(value: str) -> list[str]:
     return result
 
 
-def _cards_from_rows(conn, rows, query: str | None) -> list[dict]:
-    scored_cards = []
-    for row in rows:
-        card = _hydrate_card(conn, row, include_images=False)
-        if card is None:
-            continue
-        score = _search_score(row, query) if query else 0
-        scored_cards.append((score, row["created_at"] or "", card))
-
-    if query:
-        scored_cards.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return [card for _score, _created_at, card in scored_cards]
-
-
 def _search_score(row, query: str | None) -> int:
-    if not query:
-        return 0
-
-    score = 0
-    for token in _query_tokens(query):
-        token_score = 0
-        for variant in _query_variants(token):
-            for field in SEARCH_FIELDS:
-                token_score = max(
-                    token_score,
-                    _field_match_score(row[field], variant, _search_field_weight(field)),
-                )
-        score += token_score
-    return score
+    return _contact_search_score(dict(row), _prepare_contact_search(query))
 
 
 def _prepare_contact_search(query: str | None) -> list[list[tuple[str, str]]]:
@@ -1520,46 +1015,33 @@ def _prepare_contact_search(query: str | None) -> list[list[tuple[str, str]]]:
             for token in _query_tokens(query)]
 
 
-def _contact_search_score(card: dict, tokens: list[list[tuple[str, str]]]) -> int:
-    # Normalize each field once per card and query variants once per request.
+def _token_search_scores(card: dict, tokens: list[list[tuple[str, str]]]) -> list[int]:
     fields = []
     for field in SEARCH_FIELDS:
         value = _search_normalize(card.get(field))
         if value:
             fields.append((value, _remove_search_separators(value), _search_field_weight(field)))
-    score = 0
+    scores = []
     for variants in tokens:
         best = 0
         for token, compact_token in variants:
             for value, compact_value, weight in fields:
-                if value == token or compact_value == compact_token:
+                compact_match = bool(compact_token)
+                if value == token or (compact_match and compact_value == compact_token):
                     match = weight + 1000
-                elif value.startswith(token) or compact_value.startswith(compact_token):
+                elif value.startswith(token) or (compact_match and compact_value.startswith(compact_token)):
                     match = weight + 600
-                elif token in value or compact_token in compact_value:
+                elif token in value or (compact_match and compact_token in compact_value):
                     match = weight + 100
                 else:
                     match = 0
                 best = max(best, match)
-        score += best
-    return score
+        scores.append(best)
+    return scores
 
 
-def _field_match_score(value, variant: str, weight: int) -> int:
-    field = _search_normalize(value)
-    token = _search_normalize(variant)
-    if not field or not token:
-        return 0
-
-    compact_field = _remove_search_separators(field)
-    compact_token = _remove_search_separators(token)
-    if field == token or compact_field == compact_token:
-        return weight + 1000
-    if field.startswith(token) or compact_field.startswith(compact_token):
-        return weight + 600
-    if token in field or compact_token in compact_field:
-        return weight + 100
-    return 0
+def _contact_search_score(card: dict, tokens: list[list[tuple[str, str]]]) -> int:
+    return sum(_token_search_scores(card, tokens))
 
 
 def _search_field_weight(field: str) -> int:
@@ -1582,30 +1064,6 @@ def _search_normalize(value) -> str:
     return unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
 
 
-def _search_filter(query: str) -> tuple[str, list[str]]:
-    token_clauses = []
-    params: list[str] = []
-
-    for token in _query_tokens(query):
-        variants = _query_variants(token)
-        if not variants:
-            continue
-
-        expressions = []
-        for field in SEARCH_FIELDS:
-            compact_field = _sql_remove_search_separators(field)
-            for variant in variants:
-                expressions.append(f"{field} LIKE ?")
-                params.append(f"%{variant}%")
-                expressions.append(f"{compact_field} LIKE ?")
-                params.append(f"%{_remove_search_separators(variant)}%")
-        token_clauses.append("(" + " OR ".join(expressions) + ")")
-
-    if not token_clauses:
-        return "", []
-    return "(" + " AND ".join(token_clauses) + ")", params
-
-
 def _query_tokens(query: str) -> list[str]:
     normalized = unicodedata.normalize("NFKC", query).strip()
     tokens = []
@@ -1613,142 +1071,6 @@ def _query_tokens(query: str) -> list[str]:
         if token and token not in tokens:
             tokens.append(token)
     return tokens
-
-
-def _normalize_kana_field(value) -> str:
-    text = " ".join(unicodedata.normalize("NFKC", str(value or "")).strip().split())
-    if not text:
-        return ""
-    if not any(_is_kana(char) for char in text):
-        return ""
-    return _katakana_to_hiragana(text)
-
-
-def _normalize_postal_code(value) -> str:
-    text = unicodedata.normalize("NFKC", str(value or "")).strip()
-    digits = re.sub(r"[\s\-ー−]", "", text.removeprefix("〒").strip())
-    if re.fullmatch(r"[0-9]{7}", digits):
-        return f"{digits[:3]}-{digits[3:]}"
-    return text
-
-
-def _normalize_tags(value) -> str:
-    text = unicodedata.normalize("NFKC", str(value or "")).strip()
-    if not text:
-        return ""
-    raw_tags = re.split(r"[,、\n\r]+", text)
-    tags: list[str] = []
-    for raw_tag in raw_tags:
-        tag = re.sub(r"\s+", " ", raw_tag.strip().lstrip("#")).strip()
-        if tag and tag not in tags:
-            tags.append(tag)
-    return ", ".join(tags)
-
-
-def _normalize_company_name(value) -> str:
-    text = " ".join(unicodedata.normalize("NFKC", str(value or "")).strip().split())
-    if not text:
-        return ""
-    corporate_types = (
-        "株式会社",
-        "有限会社",
-        "合同会社",
-        "合名会社",
-        "合資会社",
-        "医療法人",
-        "学校法人",
-        "社会福祉法人",
-        "一般社団法人",
-        "公益社団法人",
-        "一般財団法人",
-        "公益財団法人",
-        "特定非営利活動法人",
-    )
-    types_pattern = "|".join(map(re.escape, sorted(corporate_types, key=len, reverse=True)))
-    text = re.sub(rf"^({types_pattern})\s*(?=\S)", r"\1 ", text)
-    text = re.sub(rf"(?<=\S)\s*({types_pattern})$", r" \1", text)
-    return text
-
-
-def _normalize_phone_number(value) -> str:
-    text = unicodedata.normalize("NFKC", str(value or "")).strip()
-    if not text:
-        return ""
-    text = text.replace("(", "-").replace(")", "-")
-    text = text.replace("[", "-").replace("]", "-")
-    text = text.replace("（", "-").replace("）", "-")
-    text = text.replace("ー", "-").replace("－", "-").replace("―", "-")
-    text = re.sub(r"[^0-9+\-]+", "-", text)
-    text = re.sub(r"-+", "-", text).strip("-")
-    text = re.sub(r"^\+?81-?0?", "0", text)
-    return text
-
-
-def _normalize_address(value) -> str:
-    text = unicodedata.normalize("NFKC", str(value or "")).strip()
-    if not text:
-        return ""
-
-    kanji_digits = "〇零一二三四五六七八九十百千万壱弐参"
-
-    def replace_match(match: re.Match) -> str:
-        number = _kanji_number_to_int(match.group("number"))
-        if number is None:
-            return match.group(0)
-        return f"{number}{match.group('suffix')}"
-
-    return re.sub(
-        rf"(?P<number>[{kanji_digits}]+)(?P<suffix>丁目|番地|番(?!町)|号)",
-        replace_match,
-        text,
-    )
-
-
-def _kanji_number_to_int(value: str) -> int | None:
-    digits = {
-        "〇": 0,
-        "零": 0,
-        "一": 1,
-        "二": 2,
-        "三": 3,
-        "四": 4,
-        "五": 5,
-        "六": 6,
-        "七": 7,
-        "八": 8,
-        "九": 9,
-        "壱": 1,
-        "弐": 2,
-        "参": 3,
-    }
-    units = {"十": 10, "百": 100, "千": 1000, "万": 10000}
-
-    if not value:
-        return None
-    if not any(char in units for char in value):
-        numbers = [digits.get(char) for char in value]
-        if any(number is None for number in numbers):
-            return None
-        return int("".join(str(number) for number in numbers))
-
-    total = 0
-    section = 0
-    current = 0
-    for char in value:
-        if char in digits:
-            current = digits[char]
-            continue
-        unit = units.get(char)
-        if unit is None:
-            return None
-        if unit == 10000:
-            section = (section + (current or 1)) * unit
-            total += section
-            section = 0
-        else:
-            section += (current or 1) * unit
-        current = 0
-    return total + section + current
 
 
 def _remove_spaces(value: str) -> str:
@@ -1766,40 +1088,6 @@ def _remove_search_separators(value: str) -> str:
     return text
 
 
-def _sql_remove_search_separators(field: str) -> str:
-    expression = field
-    for char in SEARCH_SEPARATOR_CHARS:
-        expression = f"REPLACE({expression}, '{char}', '')"
-    return expression
-
-
-def _katakana_to_hiragana(value: str) -> str:
-    chars = []
-    for char in value:
-        code = ord(char)
-        if 0x30A1 <= code <= 0x30F6:
-            chars.append(chr(code - 0x60))
-        else:
-            chars.append(char)
-    return "".join(chars)
-
-
-def _hiragana_to_katakana(value: str) -> str:
-    chars = []
-    for char in value:
-        code = ord(char)
-        if 0x3041 <= code <= 0x3096:
-            chars.append(chr(code + 0x60))
-        else:
-            chars.append(char)
-    return "".join(chars)
-
-
-def _is_kana(char: str) -> bool:
-    code = ord(char)
-    return 0x3041 <= code <= 0x3096 or 0x30A1 <= code <= 0x30F6
-
-
 def claim_next_job() -> dict | None:
     now = now_iso()
     conn = get_connection()
@@ -1807,9 +1095,9 @@ def claim_next_job() -> dict | None:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             """
-            SELECT * FROM jobs
-            WHERE status = 'queued'
-            ORDER BY created_at ASC
+            SELECT jobs.* FROM jobs JOIN cards ON cards.id = jobs.card_id JOIN users ON users.id = cards.owner_user_id
+            WHERE jobs.status = 'queued'
+            ORDER BY jobs.created_at ASC
             LIMIT 1
             """
         ).fetchone()
@@ -1827,6 +1115,7 @@ def claim_next_job() -> dict | None:
         conn.commit()
         job = dict(row)
         job["status"] = "running"
+        job["attempts"] = row["attempts"] + 1
         return job
     except Exception:
         conn.rollback()
@@ -1847,11 +1136,77 @@ def finish_job(job_id: str) -> None:
 def fail_job(job_id: str, card_id: str, message: str) -> None:
     now = now_iso()
     with connection() as conn:
-        conn.execute(
-            "UPDATE jobs SET status = 'error', finished_at = ?, error_message = ? WHERE id = ?",
-            (now, message, job_id),
-        )
-        conn.execute(
-            "UPDATE cards SET status = 'error', error_message = ?, updated_at = ? WHERE id = ?",
-            (message, now, card_id),
-        )
+        row = conn.execute("SELECT attempts FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        retry = row is not None and row["attempts"] < 3
+        conn.execute("UPDATE jobs SET status = ?, finished_at = ?, error_message = ? WHERE id = ?",
+                     ("queued" if retry else "error", None if retry else now, message, job_id))
+        conn.execute("UPDATE cards SET status = ?, error_message = ?, updated_at = ? WHERE id = ?",
+                     ("queued" if retry else "error", message, now, card_id))
+
+
+def recover_interrupted_work() -> None:
+    """Only call while holding the worker leader lock; no other worker is alive."""
+    now = now_iso()
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for job in conn.execute("SELECT * FROM jobs WHERE status = 'running'").fetchall():
+            status = "queued" if job["attempts"] < 3 else "error"
+            message = "前回の処理が中断されました" if status == "queued" else "処理が繰り返し中断されました。再処理してください"
+            conn.execute("UPDATE jobs SET status = ?, error_message = ?, finished_at = ? WHERE id = ?", (status, message, None if status == "queued" else now, job["id"]))
+            conn.execute("UPDATE cards SET status = ?, error_message = ?, updated_at = ? WHERE id = ?", (status, message, now, job["card_id"]))
+        conn.execute("UPDATE line_events SET status = CASE WHEN attempts < 3 THEN 'pending' ELSE 'error' END, available_at = ?, updated_at = ? WHERE status = 'running'", (now, now))
+
+
+def queue_line_events(events: list[dict], connector: dict) -> None:
+    """Acknowledge only after all events are durably registered."""
+    now = now_iso()
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for event in events:
+            message = event.get("message") or {}
+            raw_id = event.get("webhookEventId") or message.get("id")
+            if not raw_id:
+                continue
+            event_id = f"{connector['id']}:{raw_id}"
+            payload = json.dumps(event, ensure_ascii=False)
+            conn.execute("""INSERT OR IGNORE INTO line_events (id, event_type, line_sender_id, message_id,
+                connection_id, payload_json, status, available_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)""",
+                (event_id, event.get("type"), (event.get("source") or {}).get("userId"), message.get("id"),
+                 connector["id"], payload, now, now, now))
+            # Legacy failed events had no recoverable payload. Redelivery repairs
+            # them once; exhausted new events remain terminal until a new upload.
+            conn.execute("""UPDATE line_events SET connection_id = ?, payload_json = ?, status = 'pending',
+                available_at = ?, updated_at = ? WHERE id = ? AND status IN ('error', 'received')
+                AND payload_json IS NULL AND card_id IS NULL""", (connector["id"], payload, now, now, event_id))
+
+
+def claim_next_line_event() -> dict | None:
+    now = now_iso()
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM line_events WHERE status = 'pending' AND available_at <= ? ORDER BY created_at, rowid LIMIT 1", (now,)).fetchone()
+        if row is None:
+            return None
+        conn.execute("UPDATE line_events SET status = 'running', attempts = attempts + 1, updated_at = ? WHERE id = ?", (now, row["id"]))
+        return {**dict(row), "status": "running", "attempts": row["attempts"] + 1}
+
+
+def reserve_line_card(event_id: str) -> str:
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT pending_card_id FROM line_events WHERE id = ?", (event_id,)).fetchone()
+        if row is None:
+            raise ValueError("LINEイベントが削除されました")
+        card_id = row["pending_card_id"] or uuid4().hex
+        conn.execute("UPDATE line_events SET pending_card_id = ? WHERE id = ?", (card_id, event_id))
+        return card_id
+
+
+def retry_line_event(event: dict, error: str) -> None:
+    from datetime import datetime, timedelta, timezone
+    terminal = event["attempts"] >= 3
+    available = (datetime.now(timezone.utc) + timedelta(seconds=2 ** event["attempts"])).isoformat(timespec="seconds")
+    with connection() as conn:
+        conn.execute("UPDATE line_events SET status = ?, error_message = ?, available_at = ?, updated_at = ? WHERE id = ? AND status = 'running'",
+                     ("error" if terminal else "pending", error[:2000], available, now_iso(), event["id"]))

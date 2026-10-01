@@ -8,6 +8,13 @@ from dataclasses import dataclass
 import requests
 
 from ..config import settings
+from .fields import SCHEMA_KEYS
+from .normalization import normalize_fields, _normalize_address, _normalize_kana_field
+from .feedback import relevant_corrections, prompt_examples, apply_known_reading
+
+
+class ModelResponse(str):
+    model_info: dict
 
 
 @dataclass
@@ -16,30 +23,40 @@ class ExtractionResult:
     duration_ms: int
 
 
-SCHEMA_KEYS = [
-    "person_name",
-    "person_name_kana",
-    "company_name",
-    "department",
-    "title",
-    "postal_code",
-    "address",
-    "tel",
-    "mobile",
-    "fax",
-    "email",
-    "website",
-]
 
 
-def extract_card_fields(raw_text: str, blocks: list[dict]) -> ExtractionResult:
+def extract_card_fields(raw_text: str, blocks: list[dict], owner_user_id: str | None = None) -> ExtractionResult:
     started = time.perf_counter()
     # OCR sometimes reads a visually continuous name as separate blocks.  Keep
     # the original OCR text, but add only geometry-backed candidates so both the
     # extractor and the evidence check can use the reconstructed spelling.
     source_text = _with_spatial_name_candidates(raw_text, blocks)
-    prompt = _build_prompt(source_text, blocks)
+    corrections = relevant_corrections(owner_user_id, source_text)
+    base_prompt = _build_prompt(source_text, blocks)
+    prompt = base_prompt + prompt_examples(corrections)
     raw = _generate_structured_response(prompt)
+    data, normalized = _normalize_response(raw, source_text, blocks)
+    fallback = {}
+    if any(c.get("reading_rules") for c in corrections) and not normalized.get("person_name"):
+        # Small models can confuse a component's reading with its kanji name.
+        # Retry the original task once, then apply only grounded reading rules.
+        fallback = {"rejected_response_text": str(raw), "rejected_model": getattr(raw, "model_info", {})}
+        raw = _generate_structured_response(base_prompt)
+        data, normalized = _normalize_response(raw, source_text, blocks)
+    automatic = dict(normalized)
+    applied = apply_known_reading(normalized, source_text, blocks, corrections)
+    normalized["_automatic"] = automatic
+    normalized["_feedback"] = {"example_ids": [c["id"] for c in corrections], "applied_ids": applied}
+    if fallback:
+        normalized["_feedback"]["fallback"] = fallback
+    normalized["_raw"] = data
+    normalized["_response_text"] = str(raw)
+    normalized["_model"] = getattr(raw, "model_info", {})
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    return ExtractionResult(data=normalized, duration_ms=duration_ms)
+
+
+def _normalize_response(raw: str, source_text: str, blocks: list[dict]) -> tuple[dict, dict]:
     data = _parse_json_object(raw)
     normalized = {key: _string_or_empty(data.get(key)) for key in SCHEMA_KEYS}
     _recover_printed_identity(normalized, source_text)
@@ -48,9 +65,7 @@ def extract_card_fields(raw_text: str, blocks: list[dict]) -> ExtractionResult:
     _separate_department_and_title(normalized, source_text)
     _prefer_labeled_phone_numbers(normalized, source_text)
     _remove_ungrounded_values(normalized, source_text)
-    normalized["_raw"] = data
-    duration_ms = int((time.perf_counter() - started) * 1000)
-    return ExtractionResult(data=normalized, duration_ms=duration_ms)
+    return data, normalize_fields(normalized)
 
 
 def _generate_structured_response(prompt: str) -> str:
@@ -78,7 +93,10 @@ def _generate_with_ollama(prompt: str) -> str:
     )
     response.raise_for_status()
     body = response.json()
-    return body.get("response") or "{}"
+    from .model_info import _llm_version_info
+    response_text = ModelResponse(body.get("response") or "{}")
+    response_text.model_info = _llm_version_info()
+    return response_text
 
 
 def _generate_with_gemini(prompt: str) -> str:
@@ -101,7 +119,10 @@ def _generate_with_gemini(prompt: str) -> str:
         timeout=180,
     )
     response.raise_for_status()
-    return _extract_gemini_text(response.json())
+    body = response.json()
+    result = ModelResponse(_extract_gemini_text(body))
+    result.model_info = {"provider": "gemini", "model": settings.gemini_model, "model_version": body.get("modelVersion")}
+    return result
 
 
 def _extraction_schema() -> dict:
@@ -467,13 +488,15 @@ def _refine_person_name_kana(data: dict, raw_text: str, blocks: list[dict] | Non
 
     current_parts = _kana_parts(kana)
     valid_kana = len(current_parts) == 2 and all(re.fullmatch(r"[ぁ-ゖー]+", part) for part in current_parts)
-    for printed_name, given_roman, family_roman in _printed_identity(raw_text):
+    for printed_name, first_roman, second_roman in _printed_identity(raw_text):
         if _compact_for_evidence(printed_name) != _compact_for_evidence(name):
             continue
-        given = _roman_to_hiragana(given_roman)
-        family = _roman_to_hiragana(family_roman)
-        if given and family and (not valid_kana or not set(current_parts) & {family, given}):
-            data["person_name_kana"] = f"{family} {given}"
+        ordered = _ordered_roman_reading(first_roman, second_roman, current_parts)
+        if ordered is None:
+            continue
+        family, given = ordered
+        if given and family:
+            data["person_name_kana"] = f"{_prefer_printed_kana(current_parts[0], family) if valid_kana else family} {_prefer_printed_kana(current_parts[1], given) if valid_kana else given}"
             return
     for given_roman, family_roman in _roman_name_pairs(raw_text):
         given = _roman_to_hiragana(given_roman)
@@ -494,6 +517,23 @@ def _refine_person_name_kana(data: dict, raw_text: str, blocks: list[dict] | Non
             return
     if not valid_kana:
         data["person_name_kana"] = ""
+
+
+def _ordered_roman_reading(first: str, second: str, current: list[str]) -> tuple[str, str] | None:
+    a, b = _roman_to_hiragana(first), _roman_to_hiragana(second)
+    if not a or not b:
+        return None
+    if len(current) == 2:
+        same = current[0] == a or current[1] == b
+        reversed_order = current[0] == b or current[1] == a
+        if same != reversed_order:
+            return (a, b) if same else (b, a)
+    # An ambiguous pair is left to the model, never blindly reversed.
+    given_names = {"taro", "tarou", "hanako", "ayaka", "tomoko", "yumi", "takuya", "mayu", "daisuke",
+                   "shota", "shouta", "makoto", "ryo", "ryou", "hiroshi", "kenichi", "yoko", "yuko", "yosuke"}
+    if (first in given_names) != (second in given_names):
+        return (b, a) if first in given_names else (a, b)
+    return None
 
 
 def _prefer_printed_kana(current: str, roman: str) -> str:
@@ -518,48 +558,55 @@ def _surname_roman_hint(raw_text: str) -> str:
 def _explicit_kana_for_name(raw_text: str, name: str) -> str:
     compact_name = re.sub(r"\s+", "", name)
     for line in raw_text.splitlines():
-        if compact_name not in re.sub(r"\s+", "", line):
+        # Remove the entire name first so a kana given name cannot become ruby.
+        compact_line = re.sub(r"\s+", "", line)
+        if compact_name not in compact_line:
             continue
-        readings = re.findall(r"[ぁ-ゖァ-ヶー]+(?:[\s　]+[ぁ-ゖァ-ヶー]+)?", line)
-        if readings:
-            return _normalize_kana_evidence(readings[-1])
+        match = re.search(r"[（(]([ぁ-ゖァ-ヶー]+[\s　]+[ぁ-ゖァ-ヶー]+)[）)]", line)
+        if match and _normalize_kana_field(match.group(1)):
+            return _normalize_kana_field(match.group(1))
+        # Unlabelled fragments such as 'カナ' are not a full-name reading.
+        suffix = re.sub(r"\s+", "", compact_line.split(compact_name, 1)[1])
+        labelled = re.match(r"(?:ふりがな|フリガナ|かな|カナ)[:：]?([ぁ-ゖァ-ヶー]+)", suffix)
+        if labelled:
+            return _normalize_kana_field(labelled.group(1))
     return ""
 
 
 def _ruby_kana_for_name(blocks: list[dict], name: str) -> str:
-    """Read kana blocks positioned directly above or below the printed name."""
     compact_name = re.sub(r"\s+", "", name)
-    name_boxes = []
-    kana_blocks = []
-    for block in blocks:
-        text = str(block.get("text") or "").strip()
-        box = _box_coordinates(block.get("box"))
-        if not text or box is None:
+    results = set()
+    for name_block in blocks:
+        if re.sub(r"\s+", "", str(name_block.get("text") or "")) != compact_name:
             continue
-        if re.sub(r"\s+", "", text) == compact_name:
-            name_boxes.append(box)
-        elif re.fullmatch(r"[ぁ-ゖァ-ヶー]+", re.sub(r"\s+", "", text)):
-            kana_blocks.append((text, box))
-    if not name_boxes:
-        return ""
-
-    name_x1 = min(box[0] for box in name_boxes)
-    name_y1 = min(box[1] for box in name_boxes)
-    name_x2 = max(box[2] for box in name_boxes)
-    name_y2 = max(box[3] for box in name_boxes)
-    name_height = name_y2 - name_y1
-    nearby = []
-    for text, (x1, y1, x2, y2) in kana_blocks:
-        overlap = min(name_x2, x2) - max(name_x1, x1)
-        if overlap <= 0:
+        name_box = _box_coordinates(name_block.get("box"))
+        if name_box is None:
             continue
-        vertical_gap = min(abs(name_y1 - y2), abs(y1 - name_y2))
-        if vertical_gap <= name_height * 1.25:
-            nearby.append((x1, text))
-    if len(nearby) != 2:
-        return ""
-    nearby.sort(key=lambda item: item[0])
-    return " ".join(_normalize_kana_evidence(text) for _x, text in nearby)
+        nx1, ny1, nx2, ny2 = name_box
+        height = ny2 - ny1
+        nearby = []
+        for block in blocks:
+            if block is name_block or block.get("_side") != name_block.get("_side"):
+                continue
+            text = str(block.get("text") or "").strip()
+            box = _box_coordinates(block.get("box"))
+            if not box or not _normalize_kana_field(text):
+                continue
+            x1, y1, x2, y2 = box
+            # Ruby is smaller, on a distinct row, and overlaps the name.
+            if y2 - y1 >= height * .8 or min(nx2, x2) <= max(nx1, x1):
+                continue
+            if not (y2 <= ny1 or y1 >= ny2):
+                continue
+            gap = min(abs(ny1 - y2), abs(y1 - ny2))
+            if gap <= height * 1.25:
+                nearby.append((x1, y1, text))
+        if len(nearby) == 2 and abs(nearby[0][1] - nearby[1][1]) <= height * .4:
+            nearby.sort()
+            results.add(" ".join(_normalize_kana_field(text) for _x, _y, text in nearby))
+        elif len(nearby) == 1 and len(nearby[0][2].split()) == 2:
+            results.add(_normalize_kana_field(nearby[0][2]))
+    return results.pop() if len(results) == 1 else ""
 
 
 def _roman_name_pairs(raw_text: str) -> list[tuple[str, str]]:
@@ -743,4 +790,8 @@ def _numbers_on_labeled_lines(raw_text: str, label_pattern: str) -> set[str]:
 
 
 def _compact_address_for_evidence(value: str) -> str:
-    return re.sub(r"[\s()（）\-ー－−./:：0-9０-９〇一二三四五六七八九十百千万億兆]", "", value).casefold()
+    # Normalize only street numbers, preserving both place names and digits.
+    normalized = _normalize_address(value)
+    normalized = re.sub(r"(\d+)(?:丁目|番地?|号)", r"\1-", normalized)
+    normalized = re.sub(r"[ー－−]", "-", normalized)
+    return re.sub(r"[\s()（）./:：]", "", normalized).strip("-").casefold()

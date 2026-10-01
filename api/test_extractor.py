@@ -1,5 +1,6 @@
 import json
 import unittest
+from src.services.normalization import _normalize_company_name
 from unittest.mock import patch
 
 from src.services.extractor import (
@@ -191,7 +192,7 @@ class SpatialNameCandidateTests(unittest.TestCase):
                     result = extract_card_fields(ocr, []).data
                 self.assertEqual(
                     (result["person_name"], result["person_name_kana"], result["company_name"]),
-                    (name, kana, company),
+                    (name, kana, _normalize_company_name(company)),
                 )
 
     def test_ruby_blocks_near_the_name_override_a_kana_guess(self):

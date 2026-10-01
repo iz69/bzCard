@@ -13,7 +13,7 @@ def owned_image_directories(conn, user_id):
     cards_root = root / "cards"
     if cards_root.is_symlink():
         raise ValueError("画像保存先がシンボリックリンクのため削除を中止しました")
-    cards = conn.execute("SELECT * FROM cards").fetchall()
+    cards = conn.execute("SELECT * FROM card_records").fetchall()
     directories = {}
     owners = {row["id"]: row["owner_user_id"] for row in cards}
     for card in cards:
@@ -26,6 +26,19 @@ def owned_image_directories(conn, user_id):
         if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
             raise ValueError("名刺の保存先が不正なため削除を中止しました")
         directories[card_id] = directory
+    pending = conn.execute("SELECT e.pending_card_id, lc.owner_user_id FROM line_events e JOIN line_connections lc ON lc.id = e.connection_id WHERE e.pending_card_id IS NOT NULL").fetchall()
+    for event in pending:
+        card_id = event["pending_card_id"]
+        if card_id in owners and owners[card_id] != event["owner_user_id"]:
+            raise ValueError("LINE画像の所有者が一致しないため削除を中止しました")
+        owners[card_id] = event["owner_user_id"]
+        if event["owner_user_id"] == user_id:
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", card_id):
+                raise ValueError("LINE画像の保存先が不正です")
+            directory = cards_root / card_id
+            if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+                raise ValueError("LINE画像の保存先が不正です")
+            directories[card_id] = directory
     target_paths = set(directories.values())
 
     def check(card_id, path):

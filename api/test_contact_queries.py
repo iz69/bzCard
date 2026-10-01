@@ -25,9 +25,10 @@ class ContactQueryTests(unittest.TestCase):
                 ("private", self.other, "a@example.jp", "09011112222", "4", "秘密"),
             ):
                 conn.execute("""INSERT INTO cards
-                    (id, owner_user_id, status, email, mobile, created_at, updated_at, original_image_path, ocr_text, ocr_blocks_json)
-                    VALUES (?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?)""",
-                    (card_id, owner, email, mobile, created, created, f"cards/{card_id}/original.jpg", ocr, "large OCR blocks"))
+                    (id, owner_user_id, status, email, mobile, created_at, updated_at)
+                    VALUES (?, ?, 'ready', ?, ?, ?, ?)""",
+                    (card_id, owner, email, mobile, created, created))
+                conn.execute("INSERT INTO card_images (id, card_id, side, original_image_path, ocr_text, ocr_blocks_json, created_at, updated_at) VALUES (?, ?, 'front', ?, ?, ?, ?, ?)", (card_id, card_id, f"cards/{card_id}/original.jpg", ocr, "large OCR blocks", created, created))
 
     def tearDown(self):
         database.DB_PATH = self.old_path

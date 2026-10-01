@@ -23,6 +23,7 @@ import { mergeServerCard } from './cardSync';
 type Card = {
   id: string;
   status: string;
+  revision?: string | number;
   ocr_direction?: string;
   thumbnail_path?: string;
   back_original_image_path?: string;
@@ -134,11 +135,29 @@ function loadSession(): Session {
 }
 
 function App() {
-  if (isLiffRoute()) {
-    return <LiffRegistration />;
-  }
-
   const [session, setSession] = useState<Session>(loadSession);
+  const activeSession = useRef(session);
+  activeSession.current = session;
+  useEffect(() => {
+    const changed = () => setSession(loadSession());
+    window.addEventListener('storage', changed);
+    return () => window.removeEventListener('storage', changed);
+  }, []);
+  if (isLiffRoute()) return <LiffRegistration />;
+  function saveSession(next: Session) {
+    // An old account's outstanding callback cannot replace the new session.
+    if (activeSession.current !== session) return;
+    localStorage.setItem('bzcard.apiBase', next.apiBase);
+    for (const key of ['bzcard.token', 'bzcard.lineSessionToken', 'bzcard.lineSessionExpiresAt']) localStorage.removeItem(key);
+    if (next.token) localStorage.setItem('bzcard.sessionToken', next.token);
+    else localStorage.removeItem('bzcard.sessionToken');
+    activeSession.current = next;
+    setSession(next);
+  }
+  return <Workspace key={`${session.apiBase}:${session.token}`} session={session} saveSession={saveSession} />;
+}
+
+function Workspace({ session, saveSession }: { session: Session; saveSession: (next: Session) => void }) {
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [selectedContactId, setSelectedContactId] = useState<string>('');
   const [selectedCardId, setSelectedCardId] = useState<string>('');
@@ -189,6 +208,7 @@ function App() {
   const trailingContacts = Math.max(0, contacts.length - firstVisibleContact - visibleContacts.length);
 
   const api = useMemo(() => makeApi(session), [session]);
+  useEffect(() => () => api.dispose(), [api]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setDebouncedQuery(query), 300);
@@ -362,9 +382,11 @@ function App() {
 
   useEffect(() => {
     if (!authed) return;
+    let active = true;
     api.get('/api/auth/me')
-      .then((r) => setCurrentUser({ ...r.user, multiUserEnabled: Boolean(r.multi_user_enabled) }))
-      .catch(() => setCurrentUser(null));
+      .then((r) => { if (active) setCurrentUser({ ...r.user, multiUserEnabled: Boolean(r.multi_user_enabled) }); })
+      .catch(() => { if (active) setCurrentUser(null); });
+    return () => { active = false; };
   }, [api, authed]);
 
   useEffect(() => {
@@ -382,19 +404,6 @@ function App() {
       document.removeEventListener('keydown', closeOnEscape);
     };
   }, [accountMenuOpen]);
-
-  function saveSession(next: Session) {
-    localStorage.setItem('bzcard.apiBase', next.apiBase);
-    localStorage.removeItem('bzcard.token');
-    localStorage.removeItem('bzcard.lineSessionToken');
-    localStorage.removeItem('bzcard.lineSessionExpiresAt');
-    if (next.token) {
-      localStorage.setItem('bzcard.sessionToken', next.token);
-    } else {
-      localStorage.removeItem('bzcard.sessionToken');
-    }
-    setSession(next);
-  }
 
   if (!authed) {
     return <Login onLoggedIn={saveSession} />;
@@ -497,7 +506,7 @@ function App() {
                       setSelectedCardId(contact.representative_card_id);
                     }}
                   >
-                    <td className="thumbCell"><ThumbImage api={api} cardId={contact.representative_card_id} version={contact.updated_at} /></td>
+                    <td className="thumbCell"><ThumbImage api={api} cardId={contact.representative_card_id} version={contact.revision || contact.updated_at} /></td>
                     <td><StatusBadge status={contact.status} /></td>
                     <td>{contact.person_name || '-'}</td>
                     <td>{contact.company_name || '-'}</td>
@@ -563,13 +572,14 @@ function runtimeVersionLabel(versions: RuntimeVersions | null) {
 }
 
 function LiffRegistration() {
-  const targetCardId = getLiffTargetCardId();
+  const [targetCardId, setTargetCardId] = useState(getLiffTargetCardId);
   const connectionId = getLiffParameter('connection');
   const linkToken = getLiffParameter('link');
   const [profile, setProfile] = useState<LiffProfile | null>(null);
   const [lineSessionToken, setLineSessionToken] = useState('');
   const [status, setStatus] = useState<'loading' | 'active' | 'error'>('loading');
   const [message, setMessage] = useState('LINE認証を確認しています');
+  const [authAttempt, setAuthAttempt] = useState(0);
 
   useEffect(() => {
     document.body.classList.add('liffBody');
@@ -582,6 +592,8 @@ function LiffRegistration() {
     let cancelled = false;
 
     async function init() {
+      setStatus('loading');
+      setLineSessionToken('');
       try {
         if (!connectionId) {
           throw new Error('LIFF接続先が指定されていません。公式LINEから届いたリンクを開いてください。');
@@ -648,7 +660,7 @@ function LiffRegistration() {
 
         {status === 'active' && (
           targetCardId && lineSessionToken ? (
-            <LiffCardDetail cardId={targetCardId} sessionToken={lineSessionToken} />
+            <LiffCardDetail key={targetCardId} cardId={targetCardId} sessionToken={lineSessionToken} onBack={() => setTargetCardId('')} />
           ) : (
             <LiffCardList sessionToken={lineSessionToken} />
           )
@@ -657,6 +669,7 @@ function LiffRegistration() {
         {status === 'error' && (
           <div className="liffError">
             <p>{message}</p>
+            <button onClick={() => setAuthAttempt((n) => n + 1)}>認証を再試行</button>
           </div>
         )}
       </section>
@@ -687,98 +700,77 @@ function LiffHeader({
 }
 
 function LiffCardList({ sessionToken }: { sessionToken: string }) {
+  const api = useMemo(() => makeApi({ apiBase: defaultApiBase, token: sessionToken }), [sessionToken]);
+  useEffect(() => () => api.dispose(), [api]);
   const [cards, setCards] = useState<Card[]>([]);
   const [selectedCardId, setSelectedCardId] = useState('');
+  const [query, setQuery] = useState('');
+  const [limit, setLimit] = useState(12);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState('');
-
+  const [refresh, setRefresh] = useState(0);
   useEffect(() => {
-    let cancelled = false;
-    getLineCards(sessionToken)
-      .then((items) => {
-        if (!cancelled) setCards(items);
-      })
-      .catch((error) => {
-        if (!cancelled) setMessage(errorMessage(error));
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
+    let active = true;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    const load = async () => {
+      try {
+        const response = await api.get(`/api/cards?q=${encodeURIComponent(query)}`, controller.signal);
+        if (!active) return;
+        setCards(response.items || []);
+        setMessage('');
+        if ((response.items || []).some((card: Card) => !terminalCardStatuses.has(card.status))) timer = setTimeout(load, 5000);
+      } catch (error) {
+        if (active) setMessage(errorMessage(error));
+      } finally { if (active) setLoading(false); }
     };
-  }, [sessionToken]);
-
-  useEffect(() => {
-    if (!selectedCardId && cards.length === 1) {
-      setSelectedCardId(cards[0].id);
-    }
-  }, [cards, selectedCardId]);
-
-  if (selectedCardId) {
-    return <LiffCardDetail cardId={selectedCardId} sessionToken={sessionToken} />;
-  }
-
-  if (loading) {
-    return (
-      <div className="liffStatus">
-        <Loader2 className="spin" />
-        <span>名刺を読み込んでいます</span>
-      </div>
-    );
-  }
-
-  if (message) {
-    return <div className="liffError"><p>{message}</p></div>;
-  }
-
-  if (!cards.length) {
-    return (
-      <div className="liffComplete">
-        <p>このLINEアカウントで名刺登録を利用できます。</p>
-        <p>公式LINEのトーク画面に戻り、名刺画像を送ってください。</p>
-      </div>
-    );
-  }
-
-  return (
-    <div className="liffCards">
-      {cards.slice(0, 12).map((card) => (
-        <button key={card.id} type="button" className="liffCardRow" onClick={() => setSelectedCardId(card.id)}>
-          <LineThumb sessionToken={sessionToken} cardId={card.id} />
-          <div>
-            <strong>{card.person_name || card.company_name || '処理中の名刺'}</strong>
-            <span>{card.company_name || card.status}</span>
-            <TagList tags={card.tags} showEmpty={false} />
-          </div>
-          <StatusBadge status={card.status} />
-        </button>
-      ))}
-    </div>
-  );
+    const debounce = setTimeout(load, query ? 300 : 0);
+    return () => { active = false; clearTimeout(debounce); clearTimeout(timer); controller.abort(); };
+  }, [api, query, refresh]);
+  if (selectedCardId) return <LiffCardDetail key={selectedCardId} cardId={selectedCardId} sessionToken={sessionToken} onBack={() => { setSelectedCardId(''); setRefresh((r) => r + 1); }} />;
+  return <div className="liffCards">
+    <label className="searchBox"><Search size={16} /><input value={query} placeholder="氏名・会社名を検索" onChange={(e) => { setQuery(e.target.value); setLimit(12); }} /></label>
+    {loading && <div className="liffStatus"><Loader2 className="spin" />読み込み中</div>}
+    {message && <div className="liffError"><p>{message}</p><button onClick={() => setRefresh((r) => r + 1)}>再試行</button></div>}
+    {!loading && !message && !cards.length && <p>{query ? '一致する名刺はありません。' : '公式LINEのトーク画面から名刺画像を送ってください。'}</p>}
+    {cards.slice(0, limit).map((card) => <button key={card.id} type="button" className="liffCardRow" onClick={() => setSelectedCardId(card.id)}>
+      <LineThumb sessionToken={sessionToken} cardId={card.id} />
+      <div><strong>{card.person_name || card.company_name || '処理中の名刺'}</strong><span>{card.company_name || card.status}</span><TagList tags={card.tags} showEmpty={false} /></div>
+      <StatusBadge status={card.status} />
+    </button>)}
+    {cards.length > limit && <button onClick={() => setLimit((n) => n + 12)}>さらに表示（残り{cards.length - limit}件）</button>}
+  </div>;
 }
 
-function LiffCardDetail({ cardId, sessionToken }: { cardId: string; sessionToken: string }) {
+function LiffCardDetail({ cardId, sessionToken, onBack }: { cardId: string; sessionToken: string; onBack: () => void }) {
+  const api = useMemo(() => makeApi({ apiBase: defaultApiBase, token: sessionToken }), [sessionToken]);
+  useEffect(() => () => api.dispose(), [api]);
+  const previous = useRef<Card | null>(null);
+  const [imageSide, setImageSide] = useState<'front' | 'back'>('front');
+  const [refresh, setRefresh] = useState(0);
   const [card, setCard] = useState<Card | null>(null);
   const [draft, setDraft] = useState<Card | null>(null);
   const [message, setMessage] = useState('');
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    let cancelled = false;
-    getLineCard(sessionToken, cardId)
-      .then((nextCard) => {
-        if (cancelled) return;
-        setCard(nextCard);
-        setDraft(nextCard);
-      })
-      .catch((error) => {
-        if (!cancelled) setMessage(errorMessage(error));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [sessionToken, cardId]);
+    let active = true;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    async function load() {
+      try {
+        const next: Card = await api.get(`/api/cards/${cardId}`, controller.signal);
+        if (!active) return;
+        setDraft((current) => current && previous.current ? mergeServerCard(current, previous.current, next, fields.map(([key]) => key)) : next);
+        previous.current = next;
+        setCard(next);
+        setMessage('');
+        if (!terminalCardStatuses.has(next.status)) timer = setTimeout(load, 5000);
+      } catch (error) { if (active) setMessage(errorMessage(error)); }
+    }
+    void load();
+    return () => { active = false; clearTimeout(timer); controller.abort(); };
+  }, [api, cardId, refresh]);
 
   async function save() {
     if (!draft) return;
@@ -788,7 +780,8 @@ function LiffCardDetail({ cardId, sessionToken }: { cardId: string; sessionToken
     });
     setSaving(true);
     try {
-      const updated = await patchLineCard(sessionToken, cardId, payload);
+      const updated = await api.patch(`/api/cards/${cardId}`, payload);
+      previous.current = updated;
       setCard(updated);
       setDraft(updated);
       setMessage('保存しました');
@@ -799,19 +792,21 @@ function LiffCardDetail({ cardId, sessionToken }: { cardId: string; sessionToken
     }
   }
 
-  if (!card || !draft) {
-    return (
-      <div className="liffStatus">
-        <Loader2 className="spin" />
-        <span>名刺を読み込んでいます</span>
-      </div>
-    );
-  }
+  if (!card || !draft) return <div>
+    <button onClick={onBack}>一覧へ戻る</button>
+    {message ? <div className="liffError"><p>{message}</p><button onClick={() => { setMessage(''); setRefresh((r) => r + 1); }}>再試行</button></div>
+      : <div className="liffStatus"><Loader2 className="spin" />名刺を読み込んでいます</div>}
+  </div>;
 
   return (
     <div className="liffDetail">
+      <button onClick={onBack}>一覧へ戻る</button>
       {message && <div className="liffMessage">{message}</div>}
-      <LineCardImage sessionToken={sessionToken} cardId={card.id} status={card.status} />
+      {message && <button onClick={() => setRefresh((r) => r + 1)}>更新・再試行</button>}
+      {card.error_message && <div className="liffError">{card.error_message}<button onClick={async () => { try { await api.post(`/api/cards/${cardId}/reprocess`, {}); setRefresh((r) => r + 1); } catch (e) { setMessage(errorMessage(e)); } }}>画像を再解析</button></div>}
+      {card.back_original_image_path && <div className="imageTabs"><button className={imageSide === 'front' ? 'active' : ''} onClick={() => setImageSide('front')}>表</button><button className={imageSide === 'back' ? 'active' : ''} onClick={() => setImageSide('back')}>裏</button></div>}
+      <LineCardImage sessionToken={sessionToken} cardId={card.id} status={String(card.revision ?? card.status)} side={imageSide} />
+      <CorrectionHistory api={api} cardId={card.id} revision={card.revision} />
       <label className="imageTagEditor liffTagEditor">
         タグ
         <TagsInput
@@ -855,29 +850,32 @@ function LineCardImage({
   sessionToken,
   cardId,
   status,
+  side,
 }: {
   sessionToken: string;
   cardId: string;
   status: string;
+  side: 'front' | 'back';
 }) {
   const [src, setSrc] = useState('');
 
   useEffect(() => {
     let active = true;
     let url = '';
-    lineBlob(sessionToken, `/api/cards/${cardId}/processed-image`)
-      .catch(() => lineBlob(sessionToken, `/api/cards/${cardId}/original-image`))
+    setSrc('');
+    lineBlob(sessionToken, `/api/cards/${cardId}/${side === 'back' ? 'back-' : ''}processed-image?v=${encodeURIComponent(status)}`)
+      .catch(() => lineBlob(sessionToken, `/api/cards/${cardId}/${side === 'back' ? 'back-' : ''}original-image?v=${encodeURIComponent(status)}`))
       .then((blob) => {
         if (!active) return;
         url = URL.createObjectURL(blob);
         setSrc(url);
       })
-      .catch(() => setSrc(''));
+      .catch(() => { if (active) setSrc(''); });
     return () => {
       active = false;
       if (url) URL.revokeObjectURL(url);
     };
-  }, [sessionToken, cardId, status]);
+  }, [sessionToken, cardId, status, side]);
 
   if (!src) return <div className="liffImageEmpty">画像処理中</div>;
   return <img className="liffCardImage" src={src} alt="business card" />;
@@ -889,13 +887,14 @@ function LineThumb({ sessionToken, cardId }: { sessionToken: string; cardId: str
   useEffect(() => {
     let active = true;
     let url = '';
+    setSrc('');
     lineBlob(sessionToken, `/api/cards/${cardId}/thumbnail`)
       .then((blob) => {
         if (!active) return;
         url = URL.createObjectURL(blob);
         setSrc(url);
       })
-      .catch(() => setSrc(''));
+      .catch(() => { if (active) setSrc(''); });
     return () => {
       active = false;
       if (url) URL.revokeObjectURL(url);
@@ -1478,6 +1477,7 @@ function CardDetail({
           <pre>{formatJson(card.extracted_json)}</pre>
         </section>
       </div>
+      <CorrectionHistory api={api} cardId={card.id} revision={card.revision} />
       {zoomPath && (
         <ImageModal
           api={api}
@@ -1587,13 +1587,14 @@ function AuthedImage({
   useEffect(() => {
     let active = true;
     let url = '';
+    setSrc('');
     api.blob(path)
       .then((blob) => {
         if (!active) return;
         url = URL.createObjectURL(blob);
         setSrc(url);
       })
-      .catch(() => setSrc(''));
+      .catch(() => { if (active) setSrc(''); });
     return () => {
       active = false;
       if (url) URL.revokeObjectURL(url);
@@ -1657,7 +1658,7 @@ function ThumbImage({
 }: {
   api: ReturnType<typeof makeApi>;
   cardId: string;
-  version?: string;
+  version?: string | number;
 }) {
   const [src, setSrc] = useState('');
   const [visible, setVisible] = useState(false);
@@ -1686,13 +1687,14 @@ function ThumbImage({
     if (!visible) return;
     let active = true;
     let url = '';
-    api.blob(`/api/cards/${cardId}/thumbnail${version ? `?v=${encodeURIComponent(version)}` : ''}`)
+    setSrc('');
+    api.blob(`/api/cards/${cardId}/thumbnail${version ? `?v=${encodeURIComponent(String(version))}` : ''}`)
       .then((blob) => {
         if (!active) return;
         url = URL.createObjectURL(blob);
         setSrc(url);
       })
-      .catch(() => setSrc(''));
+      .catch(() => { if (active) setSrc(''); });
     return () => {
       active = false;
       if (url) URL.revokeObjectURL(url);
@@ -1711,6 +1713,7 @@ function StatusBadge({ status }: { status: string }) {
 }
 
 function makeApi(session: Session) {
+  const lifetime = new AbortController();
   const headers = {
     Authorization: `Bearer ${session.token}`,
   };
@@ -1718,6 +1721,7 @@ function makeApi(session: Session) {
   async function request(path: string, init: RequestInit = {}) {
     const response = await fetch(`${session.apiBase}${path}`, {
       ...init,
+      signal: init.signal ? AbortSignal.any([init.signal, lifetime.signal]) : lifetime.signal,
       headers: {
         ...headers,
         ...(init.headers || {}),
@@ -1732,6 +1736,7 @@ function makeApi(session: Session) {
   }
 
   return {
+    dispose: () => lifetime.abort(),
     get: (path: string, signal?: AbortSignal) => request(path, { signal }),
     post: (path: string, body: unknown) =>
       request(path, {
@@ -1763,7 +1768,7 @@ function makeApi(session: Session) {
         body,
       }),
     blob: async (path: string) => {
-      const response = await fetch(`${session.apiBase}${path}`, { headers });
+      const response = await fetch(`${session.apiBase}${path}`, { headers, signal: lifetime.signal });
       if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
       return response.blob();
     },
@@ -1796,7 +1801,7 @@ function directionLabel(value?: string) {
 }
 
 function imagePathFor(card: Card, side: 'front' | 'back', mode: 'processed' | 'original') {
-  const version = card.updated_at ? `?v=${encodeURIComponent(card.updated_at)}` : '';
+  const version = `?v=${encodeURIComponent(String(card.revision ?? card.updated_at))}`;
   if (side === 'back') {
     return `/api/cards/${card.id}/${mode === 'processed' ? 'back-processed-image' : 'back-original-image'}${version}`;
   }
@@ -1881,7 +1886,7 @@ async function loadLiffSdk() {
     script.async = true;
     script.dataset.liffSdk = 'true';
     script.onload = () => resolve();
-    script.onerror = () => reject(new Error('LIFF SDKの読み込みに失敗しました'));
+    script.onerror = () => { script.remove(); reject(new Error('LIFF SDKの読み込みに失敗しました')); };
     document.head.appendChild(script);
   });
 }
@@ -1907,44 +1912,44 @@ async function postLineLogin(idToken: string, connectionId: string, linkToken: s
   return response.json();
 }
 
-async function getLineCards(sessionToken: string) {
-  const data = await lineJson('/api/cards', sessionToken);
-  return data.items || [];
-}
-
-async function getLineCard(sessionToken: string, cardId: string) {
-  return lineJson(`/api/cards/${cardId}`, sessionToken);
-}
-
-async function patchLineCard(sessionToken: string, cardId: string, payload: Record<string, string | undefined>) {
-  return lineJson(`/api/cards/${cardId}`, sessionToken, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-}
-
-async function lineJson(path: string, sessionToken: string, init: RequestInit = {}) {
-  const response = await fetch(`${defaultApiBase}${path}`, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${sessionToken}`,
-      ...(init.headers || {}),
-    },
-  });
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(formatHttpError(response, text));
-  }
-  return response.json();
-}
-
 async function lineBlob(sessionToken: string, path: string) {
   const response = await fetch(`${defaultApiBase}${path}`, {
     headers: { Authorization: `Bearer ${sessionToken}` },
   });
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
   return response.blob();
+}
+
+
+
+type Correction = {
+  id: string; field: string; before_value: string; corrected_value: string;
+  model_value: string; automatic_value: string; eligible: number; active: number; superseded: number;
+  cause: string; created_at: string;
+};
+
+function CorrectionHistory({ api, cardId, revision }: { api: ReturnType<typeof makeApi>; cardId: string; revision?: string | number }) {
+  const [items, setItems] = useState<Correction[]>([]);
+  const [message, setMessage] = useState('');
+  const [refresh, setRefresh] = useState(0);
+  useEffect(() => {
+    let active = true;
+    api.get(`/api/cards/${cardId}/corrections`).then((r) => { if (active) { setItems(r.items || []); setMessage(''); } })
+      .catch((e) => { if (active) setMessage(errorMessage(e)); });
+    return () => { active = false; };
+  }, [api, cardId, revision, refresh]);
+  if (!items.length && !message) return null;
+  return <details className="correctionHistory"><summary>補正履歴（{items.length}件）</summary>
+    {message && <div className="errorBox">{message}</div>}
+    {items.map((item) => <div className="correctionRow" key={item.id}>
+      <strong>{fields.find(([key]) => key === item.field)?.[1] || item.field}：{item.before_value || '空欄'} → {item.corrected_value || '空欄'}</strong>
+      <small>LLM推測：{item.model_value || '空欄'} ／ 自動採用：{item.automatic_value || '空欄'} ／ {formatDate(item.created_at)}</small>
+      {item.superseded ? <span>再訂正済み</span> : item.eligible ? <label><input type="checkbox" checked={Boolean(item.active)} onChange={async (e) => {
+        try { await api.patch(`/api/corrections/${item.id}`, { active: e.target.checked }); setRefresh((r) => r + 1); }
+        catch (error) { setMessage(errorMessage(error)); }
+      }} />読み取りの参考にする</label> : <span>変更履歴として保存</span>}
+    </div>)}
+  </details>;
 }
 
 createRoot(document.getElementById('root')!).render(<App />);

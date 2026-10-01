@@ -16,7 +16,7 @@ class Settings:
     gemini_model: str
     gemini_base_url: str
     ocr_device: str
-    yomitoku_lite: bool
+    ocr_recognizer_model: str
     max_upload_mb: int
     multi_user_enabled: bool
     session_ttl_hours: int
@@ -41,7 +41,7 @@ def load_settings() -> Settings:
         gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip(),
         gemini_base_url=os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").rstrip("/"),
         ocr_device=os.getenv("OCR_DEVICE", "cpu").strip(),
-        yomitoku_lite=_bool_env("YOMITOKU_LITE", True),
+        ocr_recognizer_model=os.getenv("OCR_RECOGNIZER_MODEL", "parseq-large-v4_1").strip(),
         max_upload_mb=int(os.getenv("MAX_UPLOAD_MB", "20")),
         multi_user_enabled=_bool_env("MULTI_USER_ENABLED", False),
         session_ttl_hours=int(os.getenv("SESSION_TTL_HOURS", "720")),

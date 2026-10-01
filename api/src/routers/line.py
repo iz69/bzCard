@@ -66,20 +66,18 @@ def _liff_login(payload: dict) -> dict:
 
 @router.post("/webhook")
 async def webhook(request: Request) -> dict:
+    from starlette.concurrency import run_in_threadpool
     body = await request.body()
     signature = request.headers.get("x-line-signature", "")
-    connection = _connection_for_signature(body, signature)
-    if connection is None:
+    connector = await run_in_threadpool(_connection_for_signature, body, signature)
+    if connector is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid LINE signature")
-    owner = repository.get_user_by_id(connection["owner_user_id"])
-    if owner is None or owner["status"] != "active" or not user_allowed_in_current_mode(owner):
-        logger.info("ignored LINE webhook for a disabled user connection")
-        return {"status": "disabled"}
-    for event in (await request.json()).get("events", []):
-        try:
-            _handle(event, connection)
-        except Exception:
-            logger.exception("LINE event failed")
+    payload = await request.json()
+    events = payload.get("events", [])
+    if not isinstance(events, list) or not all(isinstance(event, dict) for event in events):
+        raise HTTPException(400, "Invalid LINE events")
+    # Do not swallow persistence failures: LINE must be able to redeliver.
+    await run_in_threadpool(repository.queue_line_events, events, connector)
     return {"status": "ok"}
 
 
@@ -110,65 +108,7 @@ def _handle(event: dict, connection: dict) -> None:
 
 
 def _handle_owned_event(event: dict, connection: dict) -> None:
-    message = event.get("message") or {}
-    raw_id = event.get("webhookEventId") or message.get("id")
-    if not raw_id:
-        return
-    event_id = f"{connection['id']}:{raw_id}"
-    sender = (event.get("source") or {}).get("userId")
-    if not repository.claim_line_event(event_id, event.get("type"), sender, message.get("id")):
-        return
-
-    reply_token = event.get("replyToken")
-    # The webhook signature proves the official account, not the LINE sender.
-    # A connector is usable only by its explicitly linked LINE account.
-    if not sender or sender != connection.get("line_user_id"):
-        repository.finish_line_event(event_id, "unauthorized")
-        _reply(reply_token, "この公式LINEは、連携済みのLINEアカウントのみ利用できます。", connection)
-        return
-    if event.get("type") != "message":
-        repository.finish_line_event(event_id, "ignored")
-        return
-
-    owner = connection["owner_user_id"]
-    if message.get("type") == "text":
-        query = str(message.get("text") or "").strip()
-        if not query:
-            repository.finish_line_event(event_id, "ignored")
-            _reply(reply_token, "検索したい氏名または会社名を送ってください。", connection)
-            return
-        contacts = repository.list_user_contacts(owner, q=query)
-        repository.finish_line_event(event_id, "searched")
-        _reply(reply_token, _search_contacts(contacts, connection), connection)
-        return
-    if message.get("type") != "image" or not message.get("id"):
-        repository.finish_line_event(event_id, "ignored")
-        _reply(reply_token, "名刺画像を送ってください。", connection)
-        return
-
-    card_id = make_card_id()
-    try:
-        data, content_type = _download(message["id"], connection)
-        original = save_original_bytes(data, content_type, card_id)
-        digest = sha256_file(original)
-        duplicate = repository.get_user_owned_card_by_original_sha256(digest, owner)
-        if duplicate:
-            shutil.rmtree(card_dir(card_id), ignore_errors=True)
-            repository.finish_line_event(event_id, "duplicate", duplicate["id"])
-            _reply(reply_token, _link_message("すでに登録済みの名刺でした。", duplicate["id"], connection), connection)
-            return
-        try:
-            repository.create_card(card_id, relative_path(original), digest, "auto", owner)
-        except ValueError:
-            shutil.rmtree(card_dir(card_id))
-            raise
-        repository.set_card_source(card_id, "line", message["id"])
-        repository.finish_line_event(event_id, "queued", card_id)
-        _reply(reply_token, _link_message("名刺画像を受け付けました。", card_id, connection), connection)
-    except Exception as exc:
-        repository.finish_line_event(event_id, "error", error_message=str(exc))
-        _reply(reply_token, "画像を取り込めませんでした。", connection)
-        raise
+    repository.queue_line_events([event], connection)
 
 
 def _download(message_id: str, connection: dict) -> tuple[bytes, str]:
@@ -212,3 +152,79 @@ def _search_contacts(contacts: list[dict], connection: dict) -> str:
         history = f"（名刺 {count}枚）" if count > 1 else ""
         lines += ["", f"{index}. {title}{history}", f"   {company}", _liff_url(connection, contact["representative_card_id"])]
     return "\n".join(lines)
+
+
+def line_worker_loop() -> None:
+    import time
+    while True:
+        try:
+            event = repository.claim_next_line_event()
+            if event is None:
+                time.sleep(1)
+                continue
+            process_line_event(event)
+        except Exception:
+            logger.exception("LINE queue worker failed")
+            time.sleep(3)
+
+
+def process_line_event(queued: dict) -> None:
+    connector = repository.get_line_connection(queued["connection_id"])
+    if connector is None:
+        return
+    try:
+        with user_data_lock(connector["owner_user_id"]):
+            # Reload under the user lock; credentials and link may have changed.
+            connector = repository.get_line_connection(queued["connection_id"])
+            owner = repository.get_user_by_id(connector["owner_user_id"])
+            if not owner or owner["status"] != "active" or not user_allowed_in_current_mode(owner):
+                repository.finish_line_event(queued["id"], "disabled")
+                return
+            _process_owned_line_event(queued, connector)
+    except Exception as exc:
+        logger.exception("LINE event processing failed: %s", queued["id"])
+        repository.retry_line_event(queued, str(exc))
+        if queued["attempts"] >= 3:
+            import json
+            event = json.loads(queued["payload_json"])
+            _reply(event.get("replyToken"), "画像を取り込めませんでした。しばらく待ってから画像を再送してください。", connector)
+
+
+def _process_owned_line_event(queued: dict, connector: dict) -> None:
+    import json
+    event = json.loads(queued["payload_json"])
+    message = event.get("message") or {}
+    event_id, reply_token = queued["id"], event.get("replyToken")
+    sender = (event.get("source") or {}).get("userId")
+    if not sender or sender != connector.get("line_user_id"):
+        repository.finish_line_event(event_id, "unauthorized")
+        _reply(reply_token, "この公式LINEは、連携済みのLINEアカウントのみ利用できます。", connector)
+        return
+    if event.get("type") != "message":
+        repository.finish_line_event(event_id, "ignored")
+        return
+    owner = connector["owner_user_id"]
+    if message.get("type") == "text":
+        query = str(message.get("text") or "").strip()
+        text = _search_contacts(repository.list_user_contacts(owner, q=query), connector) if query else "検索したい氏名または会社名を送ってください。"
+        repository.finish_line_event(event_id, "searched" if query else "ignored")
+        _reply(reply_token, text, connector)
+        return
+    if message.get("type") != "image" or not message.get("id"):
+        repository.finish_line_event(event_id, "ignored")
+        _reply(reply_token, "名刺画像を送ってください。", connector)
+        return
+    card_id = repository.reserve_line_card(event_id)
+    data, content_type = _download(message["id"], connector)
+    original = save_original_bytes(data, content_type, card_id)
+    digest = sha256_file(original)
+    duplicate = repository.get_user_owned_card_by_original_sha256(digest, owner)
+    if duplicate:
+        # The reserved id is not yet a registered card and belongs to this event.
+        if duplicate["id"] != card_id:
+            shutil.rmtree(card_dir(card_id), ignore_errors=True)
+        repository.finish_line_event(event_id, "duplicate", duplicate["id"])
+        _reply(reply_token, _link_message("すでに登録済みの名刺でした。", duplicate["id"], connector), connector)
+        return
+    repository.create_card(card_id, relative_path(original), digest, "auto", owner, line_event_id=event_id)
+    _reply(reply_token, _link_message("名刺画像を受け付けました。", card_id, connector), connector)

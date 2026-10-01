@@ -567,6 +567,7 @@ tbody tr:not(.virtualSpacer) {
   border-top: 1px solid #e4e8ee;
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 6px;
   background: #f8fafc;
 }
@@ -1304,3 +1305,9 @@ pre {
     grid-template-columns: 1fr;
   }
 }
+
+.correctionHistory { margin: 12px 0; padding: 12px; border: 1px solid #dce2ea; border-radius: 8px; }
+.correctionHistory summary { cursor: pointer; font-weight: 600; }
+.correctionRow { display: grid; gap: 6px; padding: 10px 0; border-top: 1px solid #e5e7eb; overflow-wrap: anywhere; }
+.correctionRow small { color: #606b7b; }
+.correctionRow input[type="checkbox"] { width: auto; margin-right: 6px; }

@@ -15,7 +15,7 @@ services:
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.5-flash}
       - OCR_DEVICE=cpu
-      - YOMITOKU_LITE=true
+      - OCR_RECOGNIZER_MODEL=${OCR_RECOGNIZER_MODEL:-parseq-large-v4_1}
       - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-50}
       - MULTI_USER_ENABLED=${MULTI_USER_ENABLED:-false}
       # Connector credentials are saved per bzCard user in the database.

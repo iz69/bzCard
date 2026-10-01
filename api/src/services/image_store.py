@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-import shutil
+import os
 from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
@@ -55,20 +55,24 @@ async def save_original_upload(file: UploadFile, card_id: str, side: str = "fron
     directory.mkdir(parents=True, exist_ok=True)
 
     suffix = ".png" if file.content_type == "image/png" else ".jpg"
-    stem = "original" if side == "front" else f"original_{side}"
+    stem = "original" if side == "front" else f"original_{side}_{uuid4().hex}"
     original_path = directory / f"{stem}{suffix}"
+    temporary = directory / f".upload-{uuid4().hex}{suffix}"
 
     size = 0
     max_bytes = settings.max_upload_mb * 1024 * 1024
-    with original_path.open("wb") as out:
-        while chunk := await file.read(1024 * 1024):
-            size += len(chunk)
-            if size > max_bytes:
-                _cleanup_failed_upload(directory, original_path, side)
-                raise HTTPException(status_code=413, detail="Uploaded image is too large")
-            out.write(chunk)
-
-    _validate_original_image(directory, original_path, side)
+    try:
+        with temporary.open("xb") as out:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > max_bytes:
+                    raise HTTPException(status_code=413, detail="Uploaded image is too large")
+                out.write(chunk)
+        _validate_original_image(directory, temporary, side)
+        os.replace(temporary, original_path)
+    except BaseException:
+        _cleanup_failed_upload(directory, temporary, side)
+        raise
 
     return original_path
 
@@ -91,11 +95,16 @@ def save_original_bytes(
     directory.mkdir(parents=True, exist_ok=True)
 
     suffix = ".png" if content_type == "image/png" else ".jpg"
-    stem = "original" if side == "front" else f"original_{side}"
+    stem = "original" if side == "front" else f"original_{side}_{uuid4().hex}"
     original_path = directory / f"{stem}{suffix}"
-    original_path.write_bytes(data)
-
-    _validate_original_image(directory, original_path, side)
+    temporary = directory / f".upload-{uuid4().hex}{suffix}"
+    try:
+        temporary.write_bytes(data)
+        _validate_original_image(directory, temporary, side)
+        os.replace(temporary, original_path)
+    except BaseException:
+        _cleanup_failed_upload(directory, temporary, side)
+        raise
 
     return original_path
 
@@ -107,16 +116,18 @@ def _detect_content_type(data: bytes) -> str:
                 return "image/jpeg"
             if image.format == "PNG":
                 return "image/png"
-    except UnidentifiedImageError as exc:
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
         raise HTTPException(status_code=415, detail="Invalid image file") from exc
     raise HTTPException(status_code=415, detail="Only JPEG and PNG images are supported")
 
 
 def _cleanup_failed_upload(directory: Path, original_path: Path, side: str) -> None:
+    original_path.unlink(missing_ok=True)
     if side == "front":
-        shutil.rmtree(directory, ignore_errors=True)
-    else:
-        original_path.unlink(missing_ok=True)
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
 
 
 def _validate_original_image(directory: Path, original_path: Path, side: str) -> None:
@@ -128,12 +139,12 @@ def _validate_original_image(directory: Path, original_path: Path, side: str) ->
     except HTTPException:
         _cleanup_failed_upload(directory, original_path, side)
         raise
-    except UnidentifiedImageError as exc:
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError) as exc:
         _cleanup_failed_upload(directory, original_path, side)
         raise HTTPException(status_code=415, detail="Invalid image file") from exc
 
 
-def create_processed_images(original_path: Path, card_id: str, side: str = "front") -> tuple[Path, Path]:
+def create_processed_images(original_path: Path, card_id: str, side: str = "front", rotation: int = 0) -> tuple[Path, Path]:
     directory = card_dir(card_id)
     processed_name = "processed.jpg" if side == "front" else f"processed_{side}.jpg"
     thumbnail_name = "thumbnail.jpg" if side == "front" else f"thumbnail_{side}.jpg"
@@ -144,11 +155,10 @@ def create_processed_images(original_path: Path, card_id: str, side: str = "fron
         image = ImageOps.exif_transpose(source).convert("RGB")
         processed = _autocrop_and_correct(image)
         processed = _enhance_processed_image(processed)
-        processed.save(processed_path, "JPEG", quality=92, optimize=True)
-
-        thumb = processed.copy()
-        thumb.thumbnail((720, 720))
-        thumb.save(thumbnail_path, "JPEG", quality=84, optimize=True)
+        if rotation % 360:
+            processed = processed.rotate(-rotation, expand=True)
+        _save_page_image(processed, processed_path)
+        _save_thumbnail(processed, thumbnail_path)
 
     return processed_path, thumbnail_path
 
@@ -156,7 +166,7 @@ def create_processed_images(original_path: Path, card_id: str, side: str = "fron
 def rotate_processed_images(processed_path: Path, thumbnail_path: Path, degrees: int) -> None:
     with Image.open(processed_path) as source:
         rotated = source.convert("RGB").rotate(degrees, expand=True)
-        rotated.save(processed_path, "JPEG", quality=92, optimize=True)
+        _save_page_image(rotated, processed_path)
         _save_thumbnail(rotated, thumbnail_path)
 
 
@@ -172,10 +182,15 @@ def rotate_page_image(image_path: Path, thumbnail_path: Path, degrees: int) -> N
 
 
 def _save_page_image(image: Image.Image, path: Path) -> None:
-    if path.suffix.lower() == ".png":
-        image.save(path, "PNG", optimize=True)
-        return
-    image.save(path, "JPEG", quality=92, optimize=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        if path.suffix.lower() == ".png":
+            image.save(temporary, "PNG", optimize=True)
+        else:
+            image.save(temporary, "JPEG", quality=92, optimize=True)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def image_metadata(path: Path) -> tuple[int | None, int | None, int | None]:
@@ -205,7 +220,7 @@ def save_rotated_candidate(source_path: Path, degrees: int) -> Path:
 def _save_thumbnail(image: Image.Image, thumbnail_path: Path) -> None:
     thumb = image.copy()
     thumb.thumbnail((720, 720))
-    thumb.save(thumbnail_path, "JPEG", quality=84, optimize=True)
+    _save_page_image(thumb, thumbnail_path)
 
 
 def _enhance_processed_image(image: Image.Image) -> Image.Image:

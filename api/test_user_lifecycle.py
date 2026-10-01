@@ -52,11 +52,12 @@ class UserLifecycleRepositoryTests(unittest.TestCase):
         with database.connection() as conn:
             conn.execute(
                 """
-                INSERT INTO cards (id, status, original_image_path, owner_user_id, created_at, updated_at)
-                VALUES (?, 'ready', ?, ?, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')
+                INSERT INTO cards (id, status, owner_user_id, created_at, updated_at)
+                VALUES (?, 'ready', ?, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')
                 """,
-                (card_id, f"cards/{card_id}/original.jpg", owner_id),
+                (card_id, owner_id),
             )
+            conn.execute("INSERT INTO card_images (id, card_id, side, original_image_path, created_at, updated_at) VALUES (?, ?, 'front', ?, 'now', 'now')", (card_id + "-front", card_id, f"cards/{card_id}/original.jpg"))
             conn.execute("INSERT INTO jobs (id, card_id, type, status, created_at) VALUES (?, ?, 'process_card', 'queued', 'now')", (card_id, card_id))
             conn.execute("INSERT INTO card_images (id, card_id, side, original_image_path, created_at, updated_at) VALUES (?, ?, 'back', ?, 'now', 'now')", (card_id, card_id, f"cards/{card_id}/original.jpg"))
 
@@ -198,26 +199,27 @@ class UserLifecycleRepositoryTests(unittest.TestCase):
     def test_shared_image_reference_aborts_before_deleting_anything(self):
         self._insert_card("target-card", self.target["id"])
         self._insert_card("other-card", self.other["id"])
-        for table in ("cards", "card_images"):
-            with self.subTest(table=table):
+        for image_id in ("other-card-front", "other-card"):
+            with self.subTest(image_id=image_id):
                 with database.connection() as conn:
-                    conn.execute(f"UPDATE {table} SET original_image_path = 'cards/target-card/original.jpg' WHERE id = 'other-card'")
+                    conn.execute("UPDATE card_images SET original_image_path = 'cards/target-card/original.jpg' WHERE id = ?", (image_id,))
                 before = self._snapshot_other_data()
                 self.assertEqual(self._delete().status_code, 409)
                 self.assertEqual(before, self._snapshot_other_data())
                 with database.connection() as conn:
-                    conn.execute(f"UPDATE {table} SET original_image_path = 'cards/other-card/original.jpg' WHERE id = 'other-card'")
+                    conn.execute("UPDATE card_images SET original_image_path = 'cards/other-card/original.jpg' WHERE id = ?", (image_id,))
 
     def test_symlink_and_external_path_abort(self):
         self._insert_card("other-card", self.other["id"])
         with database.connection() as conn:
-            conn.execute("INSERT INTO cards (id, status, original_image_path, owner_user_id, created_at, updated_at) VALUES ('target-card', 'ready', 'cards/target-card/original.jpg', ?, 'now', 'now')", (self.target["id"],))
+            conn.execute("INSERT INTO cards (id, status, owner_user_id, created_at, updated_at) VALUES ('target-card', 'ready', ?, 'now', 'now')", (self.target["id"],))
+            conn.execute("INSERT INTO card_images (id, card_id, side, original_image_path, created_at, updated_at) VALUES ('target-card', 'target-card', 'front', 'cards/target-card/original.jpg', 'now', 'now')")
         (settings.data_dir / "cards/target-card").symlink_to(settings.data_dir / "cards/other-card", target_is_directory=True)
         self.assertEqual(self._delete().status_code, 409)
         self.assertTrue((settings.data_dir / "cards/other-card/original.jpg").exists())
         (settings.data_dir / "cards/target-card").unlink()
         with database.connection() as conn:
-            conn.execute("UPDATE cards SET original_image_path = '../outside.jpg' WHERE id = 'target-card'")
+            conn.execute("UPDATE card_images SET original_image_path = '../outside.jpg' WHERE id = 'target-card'")
         self.assertEqual(self._delete().status_code, 409)
 
     def test_file_failure_preserves_user_for_retry_and_never_reports_success(self):

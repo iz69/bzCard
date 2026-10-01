@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sys
 import time
 from dataclasses import dataclass
@@ -33,14 +32,11 @@ def _get_engine():
     sys.setrecursionlimit(max(sys.getrecursionlimit(), 5000))
     from yomitoku import OCR
 
-    try:
-        _engine = OCR(
-            configs={"lite": settings.yomitoku_lite},
-            device=settings.ocr_device,
-            visualize=False,
-        )
-    except TypeError:
-        _engine = OCR(device=settings.ocr_device, visualize=False)
+    _engine = OCR(
+        configs={"text_recognizer": {"model_name": settings.ocr_recognizer_model}},
+        device=settings.ocr_device,
+        visualize=False,
+    )
     return _engine
 
 
@@ -130,128 +126,14 @@ def _box_value(box: Any, index: int) -> float:
 
 
 def _extract_blocks(results: Any) -> list[dict]:
-    data = _to_plain_data(results)
-    candidates: list[dict] = []
-    _walk_for_blocks(data, candidates)
-
-    normalized = []
-    seen = set()
-    for item in candidates:
-        text = str(item.get("text") or "").strip()
+    """Yomitoku 0.14.0 returns OCRSchema.words (WordPrediction instances)."""
+    blocks = []
+    for word in results.words:
+        text = word.content.strip()
         if not text:
             continue
-        box = _normalize_box(item.get("box"))
-        key = (text, tuple(box) if box else None)
-        if key in seen:
-            continue
-        seen.add(key)
-        normalized.append(
-            {
-                "text": text,
-                "box": box,
-                "font_size": item.get("font_size") or _estimate_font_size(box),
-            }
-        )
-    return normalized
-
-
-def _to_plain_data(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, (list, tuple)):
-        return [_to_plain_data(v) for v in value]
-    if isinstance(value, dict):
-        return {str(k): _to_plain_data(v) for k, v in value.items()}
-
-    for attr in ("to_json", "json"):
-        method = getattr(value, attr, None)
-        if callable(method):
-            try:
-                raw = method()
-                return json.loads(raw) if isinstance(raw, str) else _to_plain_data(raw)
-            except Exception:
-                pass
-
-    for attr in ("to_dict", "dict", "model_dump"):
-        method = getattr(value, attr, None)
-        if callable(method):
-            try:
-                return _to_plain_data(method())
-            except Exception:
-                pass
-
-    if hasattr(value, "__dict__"):
-        return _to_plain_data(vars(value))
-    return str(value)
-
-
-def _walk_for_blocks(value: Any, out: list[dict]) -> None:
-    if isinstance(value, list):
-        for item in value:
-            _walk_for_blocks(item, out)
-        return
-
-    if not isinstance(value, dict):
-        return
-
-    text = _first_text(value)
-    if text:
-        box = _first_box(value)
-        out.append({"text": text, "box": box})
-
-    for child in value.values():
-        if isinstance(child, (dict, list)):
-            _walk_for_blocks(child, out)
-
-
-def _first_text(value: dict) -> str | None:
-    for key in ("text", "content", "transcription", "value", "label"):
-        raw = value.get(key)
-        if isinstance(raw, str) and raw.strip():
-            return raw.strip()
-    return None
-
-
-def _first_box(value: dict) -> Any:
-    for key in ("box", "bbox", "bounding_box", "points", "polygon", "quad"):
-        raw = value.get(key)
-        if raw:
-            return raw
-    return None
-
-
-def _normalize_box(box: Any) -> list[float] | None:
-    if box is None:
-        return None
-    if isinstance(box, dict):
-        if all(k in box for k in ("x", "y", "width", "height")):
-            x = float(box["x"])
-            y = float(box["y"])
-            return [x, y, x + float(box["width"]), y + float(box["height"])]
-        return None
-    if isinstance(box, (list, tuple)):
-        flat: list[float] = []
-        for item in box:
-            if isinstance(item, (list, tuple)) and len(item) >= 2:
-                try:
-                    flat.extend([float(item[0]), float(item[1])])
-                except (TypeError, ValueError):
-                    pass
-            else:
-                try:
-                    flat.append(float(item))
-                except (TypeError, ValueError):
-                    pass
-        if len(flat) >= 4:
-            xs = flat[0::2]
-            ys = flat[1::2]
-            if len(box) == 4 and not any(isinstance(item, (list, tuple)) for item in box):
-                return flat[:4]
-            return [min(xs), min(ys), max(xs), max(ys)]
-    return None
-
-
-def _estimate_font_size(box: list[float] | None) -> float:
-    if not box or len(box) < 4:
-        return 0
-    return max(0, float(box[3]) - float(box[1]))
+        xs = [point[0] for point in word.points]
+        ys = [point[1] for point in word.points]
+        box = [min(xs), min(ys), max(xs), max(ys)]
+        blocks.append({"text": text, "box": box, "font_size": max(0, box[3] - box[1])})
+    return blocks
