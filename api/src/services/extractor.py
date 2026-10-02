@@ -11,6 +11,7 @@ from ..config import settings
 from .fields import SCHEMA_KEYS
 from .normalization import normalize_fields, _normalize_address, _normalize_kana_field
 from .feedback import relevant_corrections, prompt_examples, apply_known_reading
+from .kana_reading import apply_specialist_reading
 
 
 class ModelResponse(str):
@@ -43,6 +44,7 @@ def extract_card_fields(raw_text: str, blocks: list[dict], owner_user_id: str | 
         fallback = {"rejected_response_text": str(raw), "rejected_model": getattr(raw, "model_info", {})}
         raw = _generate_structured_response(base_prompt)
         data, normalized = _normalize_response(raw, source_text, blocks)
+    kana_info = apply_specialist_reading(normalized, source_text, blocks)
     automatic = dict(normalized)
     applied = apply_known_reading(normalized, source_text, blocks, corrections)
     normalized["_automatic"] = automatic
@@ -51,7 +53,7 @@ def extract_card_fields(raw_text: str, blocks: list[dict], owner_user_id: str | 
         normalized["_feedback"]["fallback"] = fallback
     normalized["_raw"] = data
     normalized["_response_text"] = str(raw)
-    normalized["_model"] = getattr(raw, "model_info", {})
+    normalized["_model"] = {**getattr(raw, "model_info", {}), "kana": kana_info}
     duration_ms = int((time.perf_counter() - started) * 1000)
     return ExtractionResult(data=normalized, duration_ms=duration_ms)
 

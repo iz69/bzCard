@@ -23,6 +23,7 @@ Androidネイティブアプリは開発済みですが、実際の使用感を�
 - LINEやスマホ撮影で画像が90度回転して届いた場合の自動補正
 - `yomitoku` によるOCR
 - Ollama上のローカルLLMによる項目抽出
+- デジタル庁の氏名漢字カナ突合モデルによる、印刷された読みがない氏名のふりがな推論
 - 表面・裏面画像の管理
 - 画像ハッシュによる簡易重複検出
 - ログインID・パスワードによるユーザー認証
@@ -35,6 +36,7 @@ Androidネイティブアプリは開発済みですが、実際の使用感を�
 - `api`: FastAPI、SQLite、バックグラウンドワーカー、OCR/LLM処理
 - `ui`: React + Vite、nginx配信
 - `ollama`: ローカルLLM実行環境
+- `kana`: 氏名の読みを推論するローカルPyTorchサービス（1.9o）
 - `data/`: SQLite DBとアップロード画像の永続化ディレクトリ
 
 ローカル確認用ポート:
@@ -42,7 +44,7 @@ Androidネイティブアプリは開発済みですが、実際の使用感を�
 - WebUI: `http://localhost:15174/bzcard/`
 - API: `http://localhost:18081/`
 
-Ollamaはホストへポート公開せず、APIコンテナからだけ利用します。確認やモデル操作は
+Ollamaとkanaはホストへポート公開せず、APIコンテナからだけ利用します。Ollamaの確認やモデル操作は
 `docker compose exec ollama ...` で行います。
 
 標準では、ホスト側nginxなどで次のサブパスへproxyする想定です。
@@ -100,6 +102,14 @@ docker compose exec ollama ollama create bzcard-lfm-jp:202606 -f /root/.ollama/i
 rm /tmp/LFM2.5-1.2B-JP-202606-Q4_K_M.gguf
 ```
 
+氏名ふりがなモデルの重みを公式配布先から取得します。約861 MiBです。モデルのコードはMITライセンスですが、別配布の重みの利用条件は公式サイトで確認してください。
+
+```sh
+mkdir -p data/models/kanjikana-1.9o
+curl -fL https://kktg.digital.go.jp/public/core/1.9o/ai/checkpoint_best.pt -o data/models/kanjikana-1.9o/checkpoint_best.pt
+echo 'cd9d29ad7ecf33afb02a14b807716fbf07fc6d535b9fa385bc431cdf7e53850f  data/models/kanjikana-1.9o/checkpoint_best.pt' | sha256sum -c -
+```
+
 続いて、APIとWebUIを含む全コンテナを起動します。
 
 ```sh
@@ -131,7 +141,7 @@ http://localhost:15174/bzcard/
 
 ```sh
 git pull --ff-only
-docker compose build api ui
+docker compose build api ui kana
 ```
 
 新しいコンテナを起動する前にAPIを停止し、DB・画像・暗号化鍵を含む `data/` 全体を
@@ -147,7 +157,7 @@ docker compose stop api
 docker compose up -d
 ```
 
-初回設定済みの `.env`、`data/`、`ollama/` は引き続き使います。
+初回設定済みの `.env`、`data/`、`ollama/` は引き続き使います。kanaモデルの重みをまだ配置していない環境では、上記の取得手順を先に実行してください。
 モデルを変更しない場合、Ollamaモデルの再取得・登録は不要です。
 通常の再起動ではclone・pull・checkoutは不要です。ソースを更新したときに再ビルドし、
 特定のタグやコミットへ切り替える場合だけcheckoutで対象を選んでから再ビルドしてください。
@@ -324,7 +334,8 @@ LINE連携の流れ:
 5. LINE/スマホ画像が90度回転して届いた可能性がある場合、回転候補を試して補正
 6. 明らかに名刺ではなさそうな画像は `not_card` として停止
 7. OCRテキストをOllama上のLLMに渡してJSON項目抽出
-8. SQLiteへ保存
+8. 印刷された読み・ローマ字がない氏名は、kanaモデルで姓名全体の読みを推論
+9. SQLiteへ保存
 
 ## 補正履歴と読み取りへの反映
 

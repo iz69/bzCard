@@ -11,7 +11,7 @@ from .fields import SCHEMA_KEYS
 from .normalization import normalize_fields, _normalize_kana_field
 from .timeutil import now_iso
 
-PIPELINE_VERSION = "3"
+PIPELINE_VERSION = "4"
 
 
 def _compact(value: str) -> str:

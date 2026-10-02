@@ -12,6 +12,7 @@ services:
       - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
       - LLM_BASE_URL=${LLM_BASE_URL:-http://bzcard-ollama:11434}
       - LLM_MODEL=${LLM_MODEL:-bzcard-lfm-jp:202606}
+      - KANA_BASE_URL=${KANA_BASE_URL:-http://bzcard-kana:8001}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.5-flash}
       - OCR_DEVICE=cpu
@@ -25,6 +26,24 @@ services:
     volumes:
       - ./data:/data
     mem_limit: 3g
+
+  kana:
+    container_name: bzcard-kana
+    build:
+      context: ./api
+      dockerfile: Dockerfile.kana
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Tokyo
+      - KANA_CHECKPOINT=/model/checkpoint_best.pt
+    volumes:
+      - ./data/models/kanjikana-1.9o/checkpoint_best.pt:/model/checkpoint_best.pt:ro
+    mem_limit: 2500m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
 
   ui:
     container_name: bzcard-ui

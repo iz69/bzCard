@@ -78,6 +78,10 @@ type RuntimeVersions = {
     status?: string;
     server_version?: string | null;
   };
+  kana?: {
+    model?: string;
+    status?: string;
+  };
 };
 
 type LiffProfile = {
@@ -568,7 +572,8 @@ function runtimeVersionLabel(versions: RuntimeVersions | null) {
   const model = versions.llm?.model || 'model unknown';
   const serverVersion = versions.llm?.server_version;
   const service = serverVersion ? `${provider} ${serverVersion}` : `${provider} unavailable`;
-  return `yomitoku ${ocrVersion} + local LLM verification console · ${service} / ${model}`;
+  const kana = versions.kana?.status === 'ok' ? versions.kana.model : `unavailable (${versions.kana?.status || 'unknown'})`;
+  return `yomitoku ${ocrVersion} + local LLM verification console · ${service} / ${model} · kana ${kana}`;
 }
 
 function LiffRegistration() {

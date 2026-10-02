@@ -48,3 +48,19 @@ def _llm_version_info() -> dict:
         result["status"] = "unavailable"
 
     return result
+
+
+def _kana_version_info() -> dict:
+    result = {"model": "kanjikana-1.9o", "status": "unavailable"}
+    if not settings.kana_base_url:
+        result["status"] = "not_configured"
+        return result
+    try:
+        response = requests.get(f"{settings.kana_base_url}/health", timeout=3)
+        response.raise_for_status()
+        body = response.json()
+        result["model"] = body.get("model") or result["model"]
+        result["status"] = body.get("status") or "unavailable"
+    except (requests.RequestException, ValueError):
+        pass
+    return result

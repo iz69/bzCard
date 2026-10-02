@@ -12,6 +12,7 @@ class Settings:
     llm_provider: str
     llm_base_url: str
     llm_model: str
+    kana_base_url: str
     gemini_api_key: str
     gemini_model: str
     gemini_base_url: str
@@ -37,6 +38,7 @@ def load_settings() -> Settings:
         llm_provider=os.getenv("LLM_PROVIDER", "ollama").strip().lower(),
         llm_base_url=os.getenv("LLM_BASE_URL", "http://ollama:11434").rstrip("/"),
         llm_model=os.getenv("LLM_MODEL", "bzcard-lfm-jp:202606").strip(),
+        kana_base_url=os.getenv("KANA_BASE_URL", "").rstrip("/"),
         gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
         gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip(),
         gemini_base_url=os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta").rstrip("/"),
