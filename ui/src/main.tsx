@@ -69,9 +69,6 @@ type Session = {
 };
 
 type RuntimeVersions = {
-  ocr: {
-    version?: string | null;
-  };
   llm: {
     provider?: string;
     model?: string;
@@ -565,15 +562,14 @@ function Workspace({ session, saveSession }: { session: Session; saveSession: (n
 }
 
 function runtimeVersionLabel(versions: RuntimeVersions | null) {
-  if (!versions) return 'yomitoku + local LLM verification console';
+  if (!versions) return 'local LLM verification console';
 
-  const ocrVersion = versions.ocr?.version || 'unknown';
   const provider = versions.llm?.provider || 'LLM';
   const model = versions.llm?.model || 'model unknown';
   const serverVersion = versions.llm?.server_version;
   const service = serverVersion ? `${provider} ${serverVersion}` : `${provider} unavailable`;
   const kana = versions.kana?.status === 'ok' ? versions.kana.model : `unavailable (${versions.kana?.status || 'unknown'})`;
-  return `yomitoku ${ocrVersion} + local LLM verification console · ${service} / ${model} · kana ${kana}`;
+  return `local LLM verification console · ${service} / ${model} · kana ${kana}`;
 }
 
 function LiffRegistration() {
