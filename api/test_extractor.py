@@ -1,4 +1,5 @@
 import json
+import random
 import unittest
 from src.services.normalization import _normalize_company_name
 from unittest.mock import patch
@@ -14,6 +15,30 @@ from src.services.extractor import (
     _with_spatial_name_candidates,
     extract_card_fields,
 )
+
+
+def _generated_identity(seed: int) -> dict[str, str]:
+    """Build reproducible, fictitious OCR fields without copying a card."""
+    rng = random.Random(seed)
+
+    def kanji(start: int) -> str:
+        return "".join(chr(start + rng.randrange(256)) for _ in range(2))
+
+    def roman() -> str:
+        return "".join(rng.choice("kmnr") + rng.choice("aeiou") for _ in range(2)).upper()
+
+    family, given = kanji(0x4E00), kanji(0x5200)
+    family_roman, given_roman = roman(), roman()
+    return {
+        "name": f"{family} {given}",
+        "kana": f"{_roman_to_hiragana(family_roman)} {_roman_to_hiragana(given_roman)}",
+        "roman": f"{family_roman} {given_roman}",
+        "family_roman": family_roman,
+        "given_roman": given_roman,
+        "email": f"{given_roman[0].lower()}.{family_roman.lower()}@example.test",
+        "store": f"{kanji(0x5600)}店",
+        "company": f"{kanji(0x5A00)}サービス",
+    }
 
 
 class SpatialNameCandidateTests(unittest.TestCase):
@@ -96,6 +121,79 @@ class SpatialNameCandidateTests(unittest.TestCase):
         _recover_printed_identity(data, "こもれびサービス株式会社\n木森 拓也\nTAKUYA KIMORI\ninfo@example.com")
 
         self.assertEqual(data["person_name"], "こもれびサービス株式会社")
+
+    def test_store_name_is_replaced_using_printed_name_and_email_initial(self):
+        case = _generated_identity(1)
+        ocr = "\n".join((case["store"], "営業担当", case["name"], case["roman"],
+                         case["company"], case["email"]))
+        output = json.dumps({
+            "person_name": case["store"], "person_name_kana": case["kana"].split()[0] + " てん",
+            "company_name": case["company"], "department": case["store"].replace("店", "部"),
+            "title": "営業担当",
+        }, ensure_ascii=False)
+        with patch("src.services.extractor._generate_structured_response", return_value=output):
+            result = extract_card_fields(ocr, []).data
+
+        self.assertEqual(result["person_name"], case["name"])
+        self.assertEqual(result["person_name_kana"], case["kana"])
+        self.assertEqual(result["company_name"], case["company"])
+        self.assertEqual(result["department"], case["store"])
+
+    def test_store_name_moves_to_empty_department(self):
+        case = _generated_identity(2)
+        store = case["store"].replace("店", "支店")
+        data = {"person_name": store, "department": ""}
+        _recover_printed_identity(data, "\n".join((store, case["name"], case["roman"], case["email"])))
+        self.assertEqual(data["person_name"], case["name"])
+        self.assertEqual(data["department"], store)
+
+    def test_existing_department_is_preserved(self):
+        case = _generated_identity(3)
+        department = case["store"].replace("店", "部")
+        data = {"person_name": case["store"], "department": department}
+        _recover_printed_identity(data, "\n".join((case["store"], department, case["name"],
+                                                    case["roman"], case["email"])))
+        self.assertEqual(data["department"], department)
+
+    def test_reversed_email_name_order_corroborates_printed_name(self):
+        case = _generated_identity(4)
+        data = {"person_name": case["store"]}
+        email = f"{case['given_roman'].lower()}.{case['family_roman'].lower()}@example.test"
+        _recover_printed_identity(data, "\n".join((case["store"], case["name"],
+                                                    case["roman"], email)))
+        self.assertEqual(data["person_name"], case["name"])
+
+    def test_family_first_email_does_not_reverse_a_known_reading(self):
+        case = _generated_identity(5)
+        data = {"person_name": case["name"], "person_name_kana": case["kana"]}
+        email = f"{case['family_roman'].lower()}.{case['given_roman'].lower()}@example.test"
+        _refine_person_name_kana(data, "\n".join((case["name"], case["roman"], email)))
+        self.assertEqual(data["person_name_kana"], case["kana"])
+
+    def test_mismatched_initial_does_not_recover_a_name(self):
+        case = _generated_identity(6)
+        data = {"person_name": case["store"]}
+        wrong_initial = "z" if case["given_roman"][0] != "Z" else "q"
+        email = f"{wrong_initial}.{case['family_roman'].lower()}@example.test"
+        _recover_printed_identity(data, "\n".join((case["store"], case["name"],
+                                                    case["roman"], email)))
+        self.assertEqual(data["person_name"], case["store"])
+
+    def test_ambiguous_printed_people_do_not_replace_a_store(self):
+        first, second = _generated_identity(7), _generated_identity(8)
+        data = {"person_name": first["store"]}
+        ocr = "\n".join((first["store"], first["name"], first["roman"], first["email"],
+                         second["name"], second["roman"], second["email"]))
+        _recover_printed_identity(data, ocr)
+        self.assertEqual(data["person_name"], first["store"])
+
+    def test_correct_person_is_preserved(self):
+        first, second = _generated_identity(9), _generated_identity(10)
+        data = {"person_name": second["name"], "person_name_kana": second["kana"]}
+        _recover_printed_identity(data, "\n".join((first["store"], first["name"],
+                                                    first["roman"], first["email"], second["name"])))
+        self.assertEqual(data["person_name"], second["name"])
+        self.assertEqual(data["person_name_kana"], second["kana"])
 
     def test_printed_department_and_title_remove_overlap(self):
         data = {"department": "経営企画室", "title": "経営企画室 室長"}

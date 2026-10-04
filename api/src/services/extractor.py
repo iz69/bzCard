@@ -209,6 +209,7 @@ def _build_prompt(raw_text: str, blocks: list[dict]) -> str:
 不明な項目は空文字にしてください。説明文、Markdown、コードブロックは不要です。
 OCRテキストにない値を補完・創作してはいけません。ただし person_name_kana の読みの推測だけは、下記の規則に従って許可します。
 株式会社などの法人格を含む行は会社名です。person_name に会社名や法人格を入れないでください。
+「店」「支店」「営業所」などの店舗名・拠点名は department に入れ、person_name に入れないでください。
 日本語の氏名の直後にローマ字の姓名が印刷されている場合、その日本語行を氏名として優先してください。
 email は @ を含むOCR上のメールアドレスだけを入れてください。email を mobile、fax、tel に入れてはいけません。
 tel と mobile には電話番号だけを入れてください。fax にはOCR上で FAX と明示された電話番号だけを入れてください。
@@ -405,7 +406,10 @@ def _printed_identity(raw_text: str) -> list[tuple[str, str, str]]:
     found = []
     for index, line in enumerate(lines):
         match = re.fullmatch(r"([A-Za-z]{3,})\s+([A-Za-z]{3,})", line)
-        if not match or tuple(part.casefold() for part in match.groups()) not in email_pairs:
+        if not match:
+            continue
+        roman = tuple(part.casefold() for part in match.groups())
+        if not any(_email_matches_roman_name(pair, roman) for pair in email_pairs):
             continue
         for previous in (index - 1, index - 2):
             if previous < 0:
@@ -413,12 +417,31 @@ def _printed_identity(raw_text: str) -> list[tuple[str, str, str]]:
             candidate = lines[previous]
             if previous == index - 2 and not re.fullmatch(r"\d+", lines[index - 1]):
                 continue
-            if _CORPORATE_MARKER.search(candidate):
+            if _is_organization_name(candidate):
                 continue
             if re.fullmatch(r"[一-龯々〆ヵヶ]{1,4}[\s　]+[一-龯々〆ヵヶ]{1,4}", candidate):
                 found.append((" ".join(candidate.split()), *[part.casefold() for part in match.groups()]))
                 break
     return found
+
+
+def _email_matches_roman_name(email_parts: tuple[str, ...], roman: tuple[str, str]) -> bool:
+    """Require two matching name components, allowing one printed initial."""
+    if len(email_parts) != 2:
+        return False
+    for ordered in (roman, roman[::-1]):
+        if email_parts == ordered:
+            return True
+        for initial, full in ((0, 1), (1, 0)):
+            if (len(email_parts[initial]) == 1
+                    and email_parts[initial] == ordered[initial][0]
+                    and email_parts[full] == ordered[full]):
+                return True
+    return False
+
+
+def _is_organization_name(name: str) -> bool:
+    return bool(_CORPORATE_MARKER.search(name) or re.search(r"(?:店|営業所|事業所)$", name.strip()))
 
 
 def _recover_printed_identity(data: dict, raw_text: str) -> None:
@@ -430,12 +453,19 @@ def _recover_printed_identity(data: dict, raw_text: str) -> None:
         data["company_name"] = companies[0]
 
     name = data.get("person_name") or ""
-    if not name or _CORPORATE_MARKER.search(name) or (
+    if not name or _is_organization_name(name) or (
         data.get("company_name") and _compact_for_evidence(name) == _compact_for_evidence(data["company_name"])
     ):
         identities = _printed_identity(raw_text)
         if len(identities) == 1:
             data["person_name"] = identities[0][0]
+            if _compact_for_evidence(name) != _compact_for_evidence(data["person_name"]):
+                data["person_name_kana"] = ""
+            department = data.get("department") or ""
+            if re.search(r"(?:店|営業所|事業所)$", name.strip()) and (
+                not department or _compact_for_evidence(department) not in _compact_for_evidence(raw_text)
+            ):
+                data["department"] = name
 
 
 _ROLE_TITLES = {
@@ -494,6 +524,10 @@ def _refine_person_name_kana(data: dict, raw_text: str, blocks: list[dict] | Non
         if _compact_for_evidence(printed_name) != _compact_for_evidence(name):
             continue
         ordered = _ordered_roman_reading(first_roman, second_roman, current_parts)
+        family_hint = _surname_roman_hint(raw_text)
+        if ordered is None and family_hint in (first_roman, second_roman) and first_roman != second_roman:
+            given_roman = second_roman if family_hint == first_roman else first_roman
+            ordered = (_roman_to_hiragana(family_hint), _roman_to_hiragana(given_roman))
         if ordered is None:
             continue
         family, given = ordered
