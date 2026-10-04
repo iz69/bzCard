@@ -11,8 +11,12 @@ Androidネイティブアプリは開発済みですが、実際の使用感を�
 各利用者はローカルID・パスワードでログインし、自身のLINE公式アカウントを設定できます。
 公開環境に置く場合は、必ずHTTPSとリバースプロキシ側のアクセス制限を併用してください。
 
-<img width="712" height="460" alt="1" src="https://github.com/user-attachments/assets/732272e4-e999-4ca4-881b-f7b64fe66c9b" />
-<img width="405" height="228" alt="2" src="https://github.com/user-attachments/assets/d76cc500-73fe-4ab1-9e20-8f5e94fa5a41" />
+左一覧・右詳細（表示データはサンプルです）
+<img width="1653" height="863" alt="image" src="https://github.com/user-attachments/assets/b71c509b-52a5-4024-bbc8-a77fb17f0e6a" />
+
+AIによるOCRとデータ抽出結果（表示データはサンプルです）
+<img width="929" height="468" alt="image" src="https://github.com/user-attachments/assets/f5658148-93e1-4b8c-a3a8-a189bcbb7647" />
+
 
 ## 主な機能
 
