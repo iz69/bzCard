@@ -233,6 +233,28 @@ def _enhance_processed_image(image: Image.Image) -> Image.Image:
     if luminance < 155:
         factor = min(1.65, max(1.0, 172 / max(luminance, 1)))
         image = ImageEnhance.Brightness(image).enhance(factor)
+    elif luminance < 200:
+        # A mostly neutral paper card can be underexposed even when its whole
+        # image average is above 155. Measure the brighter paper pixels so dark
+        # text and logos do not decide whether the card needs brightening.
+        try:
+            import numpy as np
+
+            sample = image.copy()
+            sample.thumbnail((320, 320))
+            pixels = np.asarray(sample, dtype=np.float32)
+            neutral = pixels.max(axis=2) - pixels.min(axis=2) < 25
+            if neutral.mean() > .7:
+                paper = np.percentile(
+                    pixels[:, :, 0][neutral] * .299
+                    + pixels[:, :, 1][neutral] * .587
+                    + pixels[:, :, 2][neutral] * .114,
+                    80,
+                )
+                if 145 <= paper < 200:
+                    image = ImageEnhance.Brightness(image).enhance(min(1.3, 225 / paper))
+        except ImportError:
+            pass
     elif luminance > 242:
         factor = max(0.94, 235 / luminance)
         image = ImageEnhance.Brightness(image).enhance(factor)

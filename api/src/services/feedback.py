@@ -9,9 +9,10 @@ import unicodedata
 from ..database import connection
 from .fields import SCHEMA_KEYS
 from .normalization import normalize_fields, _normalize_kana_field
+from .name_evidence import printed_reading
 from .timeutil import now_iso
 
-PIPELINE_VERSION = "5"
+PIPELINE_VERSION = "17"
 
 
 def _compact(value: str) -> str:
@@ -117,15 +118,15 @@ def prompt_examples(corrections: list[dict]) -> str:
         "今回の印刷されたかな・ローマ字を優先してください。\n"
 
 
-def apply_known_reading(data: dict, source: str, blocks: list[dict], corrections: list[dict]) -> list[str]:
-    from .extractor import _explicit_kana_for_name, _ruby_kana_for_name, _roman_name_pairs, _printed_identity
+def apply_known_reading(data: dict, source: str, blocks: list[dict], corrections: list[dict],
+                        allow_general: bool = True) -> list[str]:
     name = data.get("person_name", "")
     if not name or not corrections:
         return []
-    printed = _explicit_kana_for_name(source, name) or _ruby_kana_for_name(blocks, name)
+    printed = printed_reading(data, source, blocks)
     # The printed evidence was already handled by the extractor. General
     # reading preferences must not reinterpret it, including roman spelling.
-    if printed or _roman_name_pairs(source) or _printed_identity(source):
+    if printed:
         return []
     ids = _identifiers(data)
     matches = [c for c in corrections if _compact(c["context"].get("person_name", "")) == _compact(name)
@@ -136,6 +137,8 @@ def apply_known_reading(data: dict, source: str, blocks: list[dict], corrections
         return [c["id"] for c in matches]
     if matches:
         # Conflicting personal corrections cannot be resolved by general rules.
+        return []
+    if not allow_general:
         return []
     components = _name_components(name, data.get("person_name_kana", ""))
     applied = []

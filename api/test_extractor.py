@@ -1,19 +1,22 @@
 import json
 import random
 import unittest
+from types import SimpleNamespace
 from src.services.normalization import _normalize_company_name
 from unittest.mock import patch
 
 from src.services.extractor import (
-    _correct_person_name_order,
     _prefer_labeled_phone_numbers,
+    _remove_ungrounded_values,
+    _separate_department_and_title,
+    extract_card_fields,
+)
+from src.services.name_evidence import _roman_to_hiragana, _with_spatial_name_candidates
+from src.services.person_identity import (
+    _correct_person_name_order,
+    _join_spaced_person_name,
     _recover_printed_identity,
     _refine_person_name_kana,
-    _remove_ungrounded_values,
-    _roman_to_hiragana,
-    _separate_department_and_title,
-    _with_spatial_name_candidates,
-    extract_card_fields,
 )
 
 
@@ -42,6 +45,26 @@ def _generated_identity(seed: int) -> dict[str, str]:
 
 
 class SpatialNameCandidateTests(unittest.TestCase):
+    def test_partial_spacing_uses_printed_boundary_for_one_character_surname(self):
+        data = {"person_name": "林 太 一郎"}
+        blocks = [
+            {"text": "林", "box": [100, 100, 160, 160], "_side": "front"},
+            {"text": "太 一郎", "box": [190, 100, 370, 160], "_side": "front"},
+        ]
+        _join_spaced_person_name(data, "林\n太 一郎", blocks)
+        self.assertEqual(data["person_name"], "林 太一郎")
+
+    def test_partial_spacing_requires_name_blocks_on_same_side_and_line(self):
+        for side, y in (("back", 100), ("front", 300)):
+            with self.subTest(side=side, y=y):
+                data = {"person_name": "鶴 川 達也"}
+                blocks = [
+                    {"text": "鶴 川", "box": [100, 100, 220, 160], "_side": "front"},
+                    {"text": "達也", "box": [250, y, 370, y + 60], "_side": side},
+                ]
+                _join_spaced_person_name(data, "鶴 川\n達也", blocks)
+                self.assertEqual(data["person_name"], "鶴川達也")
+
     def test_joins_name_blocks_by_horizontal_position(self):
         blocks = [
             {"text": "橋", "box": [470, 376, 629, 478], "_side": "front"},
@@ -99,6 +122,22 @@ class SpatialNameCandidateTests(unittest.TestCase):
         self.assertEqual(_roman_to_hiragana("SHOTA"), "しょうた")
         self.assertEqual(_roman_to_hiragana("KENICHI"), "けんいち")
 
+    def test_romanized_n_before_i_keeps_the_nasal_in_given_names(self):
+        for roman, kana in (("SHINICHI", "しんいち"), ("JUNICHI", "じゅんいち"),
+                            ("SHUNICHI", "しゅんいち")):
+            with self.subTest(roman=roman):
+                self.assertEqual(_roman_to_hiragana(roman), kana)
+
+    def test_email_romanization_does_not_replace_correct_shinichi_reading(self):
+        ocr = "青葉 伸一\nshinichi.aoba@example.test"
+        output = json.dumps({"person_name": "青葉 伸一", "person_name_kana": "あおば しんいち"},
+                            ensure_ascii=False)
+        with patch("src.services.extractor._generate_structured_response", return_value=output):
+            result = extract_card_fields(ocr, []).data
+
+        self.assertEqual(result["person_name_kana"], "あおば しんいち")
+        self.assertEqual(result["_automatic"]["person_name_kana"], "あおば しんいち")
+
     def test_ocr_name_and_company_correct_model_role_confusion(self):
         data = {"person_name": "ひだまり メディア 株式会社", "company_name": "HIDAMARI MEDIA"}
         ocr = "ひだまりメディア株式会社\nHIDAMARI MEDIA\n編集部 編集者\n日向 京\nRYO HINATA\nryo.hinata@example.com"
@@ -115,12 +154,94 @@ class SpatialNameCandidateTests(unittest.TestCase):
 
         self.assertEqual(data["company_name"], "株式会社北斗エンジニアリング")
 
-    def test_unrelated_roman_words_do_not_replace_a_person(self):
+    def test_printed_person_is_recovered_independently_of_unmatched_roman_words(self):
         data = {"person_name": "こもれびサービス株式会社", "company_name": ""}
 
         _recover_printed_identity(data, "こもれびサービス株式会社\n木森 拓也\nTAKUYA KIMORI\ninfo@example.com")
 
-        self.assertEqual(data["person_name"], "こもれびサービス株式会社")
+        self.assertEqual(data["person_name"], "木森 拓也")
+        self.assertEqual(data["company_name"], "こもれびサービス株式会社")
+        _refine_person_name_kana(data, "木森 拓也\nTAKUYA KIMORI\ninfo@example.com")
+        self.assertEqual(data["person_name_kana"], "")
+
+    def test_split_name_with_ruby_replaces_a_company_in_person_field(self):
+        ocr = "株式会社エフアンドエム\nたけ\nや\nおお\nまさ\n将 矢\n大 竹\nmasaya_otake@example.test"
+        blocks = [
+            {"text": "おお", "box": [836, 739, 942, 795], "_side": "front"},
+            {"text": "たけ", "box": [1142, 737, 1248, 795], "_side": "front"},
+            {"text": "まさ", "box": [1523, 741, 1626, 791], "_side": "front"},
+            {"text": "や", "box": [1848, 737, 1906, 786], "_side": "front"},
+            {"text": "将 矢", "box": [1492, 777, 1955, 933], "_side": "front"},
+            {"text": "大 竹", "box": [812, 786, 1269, 933], "_side": "front"},
+        ]
+        output = json.dumps({"person_name": "株式会社 エフアンドエム",
+                             "person_name_kana": "エフアンドエム ジェイピーエックス",
+                             "company_name": "株式会社 エフアンドエム"}, ensure_ascii=False)
+        with patch("src.services.extractor._generate_structured_response", return_value=output):
+            result = extract_card_fields(ocr, blocks).data
+
+        self.assertEqual(result["person_name"], "大竹 将矢")
+        self.assertEqual(result["person_name_kana"], "おおたけ まさや")
+        self.assertEqual(result["company_name"], "株式会社 エフアンドエム")
+        self.assertEqual(result["_raw"]["person_name"], "株式会社 エフアンドエム")
+
+    def test_large_four_kanji_name_replaces_latin_logo_in_person_field(self):
+        ocr = "TOYOTA\n平塚営業所 秦野出張所 営業担当\nL&F\n三 木 洋 亮\n物流システム\nトヨタL&F神奈川株式会社\nmiki@toyota-if-kanagawa.co.jp"
+        blocks = [
+            {"text": "TOYOTA", "box": [807, 49, 1021, 99], "font_size": 50, "_side": "front"},
+            {"text": "三 木 洋 亮", "box": [126, 198, 527, 261], "font_size": 63, "_side": "front"},
+            {"text": "トヨタL&F神奈川株式会社", "box": [125, 324, 714, 375], "font_size": 51, "_side": "front"},
+        ]
+        output = json.dumps({"person_name": "TOYOTA", "person_name_kana": "トヨタ",
+                             "company_name": "L&F"}, ensure_ascii=False)
+        response = SimpleNamespace(raise_for_status=lambda: None, json=lambda: {
+            "candidates": [{"reading": "ミキヒロアキ"}], "family_candidates": [{"reading": "ミキ"}]})
+        with patch("src.services.extractor._generate_structured_response", return_value=output), \
+             patch("src.services.kana_reading.settings", SimpleNamespace(kana_base_url="http://kana:8001")), \
+             patch("src.services.kana_reading.requests.post", return_value=response):
+            result = extract_card_fields(ocr, blocks).data
+
+        self.assertEqual(result["person_name"], "三木 洋亮")
+        self.assertEqual(result["company_name"], "トヨタL&F神奈川 株式会社")
+        self.assertEqual(result["_raw"]["person_name"], "TOYOTA")
+
+    def test_rescan_retains_supported_reading_for_same_person(self):
+        ocr = "TOYOTA\n三 木 洋 亮\nトヨタL&F神奈川株式会社\nmiki@example.test"
+        blocks = [{"text": "三 木 洋 亮", "box": [126, 198, 527, 261],
+                   "font_size": 63, "_side": "front"}]
+        output = '{"person_name":"TOYOTA","person_name_kana":"トヨタ","email":"miki@example.test"}'
+        previous = {"person_name": "三木 洋亮", "person_name_kana": "みき ようすけ",
+                    "email": "miki@example.test", "mobile": ""}
+
+        response = SimpleNamespace(raise_for_status=lambda: None, json=lambda: {
+            "candidates": [{"reading": "ミキヒロアキ"}, {"reading": "ミキヨウスケ"}],
+            "family_candidates": [{"reading": "ミキ"}]})
+        with patch("src.services.extractor._generate_structured_response", return_value=output), \
+             patch("src.services.kana_reading.settings", SimpleNamespace(kana_base_url="http://kana:8001")), \
+             patch("src.services.kana_reading.requests.post", return_value=response):
+            result = extract_card_fields(ocr, blocks, previous=previous).data
+            unrelated = extract_card_fields(ocr, blocks, previous={**previous, "email": "other@example.test"}).data
+
+        self.assertEqual(result["person_name"], "三木 洋亮")
+        self.assertEqual(result["person_name_kana"], "みき ようすけ")
+        self.assertTrue(result["_model"]["kana"]["previous_reading_retained"])
+        self.assertEqual(unrelated["person_name_kana"], "みき ひろあき")
+
+    def test_parenthesized_area_code_keeps_printed_tel_and_fax(self):
+        data = {"tel": "0465-81-5877", "fax": "0465-81-5885"}
+
+        _remove_ungrounded_values(data, "TEL(0465)-81-5877 FAX(0465)-81-5885")
+
+        self.assertEqual(data["tel"], "0465-81-5877")
+        self.assertEqual(data["fax"], "0465-81-5885")
+
+    def test_printed_offices_replace_a_product_label_in_department(self):
+        data = {"department": "物流システム", "title": "営業担当"}
+
+        _separate_department_and_title(data, "平塚営業所 秦野出張所 営業担当\n物流システム")
+
+        self.assertEqual(data["department"], "平塚営業所 秦野出張所")
+        self.assertEqual(data["title"], "営業担当")
 
     def test_store_name_is_replaced_using_printed_name_and_email_initial(self):
         case = _generated_identity(1)
@@ -131,7 +252,12 @@ class SpatialNameCandidateTests(unittest.TestCase):
             "company_name": case["company"], "department": case["store"].replace("店", "部"),
             "title": "営業担当",
         }, ensure_ascii=False)
-        with patch("src.services.extractor._generate_structured_response", return_value=output):
+        response = SimpleNamespace(raise_for_status=lambda: None, json=lambda: {
+            "candidates": [{"reading": case["kana"].replace(" ", "")}],
+            "family_candidates": [{"reading": case["kana"].split()[0]}]})
+        with patch("src.services.extractor._generate_structured_response", return_value=output), \
+             patch("src.services.kana_reading.settings", SimpleNamespace(kana_base_url="http://kana:8001")), \
+             patch("src.services.kana_reading.requests.post", return_value=response):
             result = extract_card_fields(ocr, []).data
 
         self.assertEqual(result["person_name"], case["name"])
@@ -170,22 +296,24 @@ class SpatialNameCandidateTests(unittest.TestCase):
         _refine_person_name_kana(data, "\n".join((case["name"], case["roman"], email)))
         self.assertEqual(data["person_name_kana"], case["kana"])
 
-    def test_mismatched_initial_does_not_recover_a_name(self):
+    def test_mismatched_initial_does_not_supply_a_reading_for_the_printed_name(self):
         case = _generated_identity(6)
         data = {"person_name": case["store"]}
         wrong_initial = "z" if case["given_roman"][0] != "Z" else "q"
         email = f"{wrong_initial}.{case['family_roman'].lower()}@example.test"
         _recover_printed_identity(data, "\n".join((case["store"], case["name"],
                                                     case["roman"], email)))
-        self.assertEqual(data["person_name"], case["store"])
+        self.assertEqual(data["person_name"], case["name"])
+        _refine_person_name_kana(data, "\n".join((case["name"], case["roman"], email)))
+        self.assertEqual(data["person_name_kana"], "")
 
-    def test_ambiguous_printed_people_do_not_replace_a_store(self):
+    def test_ambiguous_printed_people_reject_a_store_as_person_name(self):
         first, second = _generated_identity(7), _generated_identity(8)
         data = {"person_name": first["store"]}
         ocr = "\n".join((first["store"], first["name"], first["roman"], first["email"],
                          second["name"], second["roman"], second["email"]))
         _recover_printed_identity(data, ocr)
-        self.assertEqual(data["person_name"], first["store"])
+        self.assertEqual(data["person_name"], "")
 
     def test_correct_person_is_preserved(self):
         first, second = _generated_identity(9), _generated_identity(10)
@@ -201,6 +329,24 @@ class SpatialNameCandidateTests(unittest.TestCase):
         _separate_department_and_title(data, "経営企画室 室長\n遠山 千佳")
 
         self.assertEqual(data, {"department": "経営企画室", "title": "室長"})
+
+    def test_skipped_middle_department_is_restored_from_printed_line(self):
+        ocr = "カスタマー営業部 ビジネスソリューション部 第二課\n大竹 将矢"
+        output = json.dumps({"person_name": "大竹 将矢", "department": "営業部 第二課"},
+                            ensure_ascii=False)
+        with patch("src.services.extractor._generate_structured_response", return_value=output):
+            result = extract_card_fields(ocr, []).data
+        self.assertEqual(result["department"], "カスタマー営業部 ビジネスソリューション部 第二課")
+
+    def test_tel_without_separator_is_not_taken_from_mobile_label(self):
+        ocr = "TEL03-6225-3009 FAX03-6225-3001\n携帯電話:080-4638-9063"
+        output = json.dumps({"tel": "03-6225-3009", "mobile": "080-4638-9063",
+                             "fax": "03-6225-3001"}, ensure_ascii=False)
+        with patch("src.services.extractor._generate_structured_response", return_value=output):
+            result = extract_card_fields(ocr, []).data
+        self.assertEqual(result["tel"], "03-6225-3009")
+        self.assertEqual(result["mobile"], "080-4638-9063")
+        self.assertEqual(result["fax"], "03-6225-3001")
 
     def test_printed_role_is_recovered_when_combined_title_was_rejected(self):
         data = {"department": "研究開発部 部長", "title": ""}

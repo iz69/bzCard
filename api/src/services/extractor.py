@@ -9,9 +9,16 @@ import requests
 
 from ..config import settings
 from .fields import SCHEMA_KEYS
-from .normalization import normalize_fields, _normalize_address, _normalize_kana_field
+from .normalization import normalize_fields, _normalize_address
 from .feedback import relevant_corrections, prompt_examples, apply_known_reading
 from .kana_reading import apply_specialist_reading
+from .name_evidence import (
+    _compact_for_evidence,
+    _is_organization_name,
+    _spatial_name_candidates,
+    _with_spatial_name_candidates,
+)
+from .person_identity import resolve_person_name
 
 
 class ModelResponse(str):
@@ -24,9 +31,8 @@ class ExtractionResult:
     duration_ms: int
 
 
-
-
-def extract_card_fields(raw_text: str, blocks: list[dict], owner_user_id: str | None = None) -> ExtractionResult:
+def extract_card_fields(raw_text: str, blocks: list[dict], owner_user_id: str | None = None,
+                        previous: dict | None = None) -> ExtractionResult:
     started = time.perf_counter()
     # OCR sometimes reads a visually continuous name as separate blocks.  Keep
     # the original OCR text, but add only geometry-backed candidates so both the
@@ -36,38 +42,50 @@ def extract_card_fields(raw_text: str, blocks: list[dict], owner_user_id: str | 
     base_prompt = _build_prompt(source_text, blocks)
     prompt = base_prompt + prompt_examples(corrections)
     raw = _generate_structured_response(prompt)
-    data, normalized = _normalize_response(raw, source_text, blocks)
+    data, normalized, identity_info = _normalize_response(raw, source_text, blocks, previous)
     fallback = {}
-    if any(c.get("reading_rules") for c in corrections) and not normalized.get("person_name"):
+    company_confusion = (_is_organization_name(data.get("person_name") or "")
+                         and bool(_spatial_name_candidates(blocks)))
+    if not normalized.get("person_name") and (company_confusion or any(c.get("reading_rules") for c in corrections)):
         # Small models can confuse a component's reading with its kanji name.
         # Retry the original task once, then apply only grounded reading rules.
         fallback = {"rejected_response_text": str(raw), "rejected_model": getattr(raw, "model_info", {})}
-        raw = _generate_structured_response(base_prompt)
-        data, normalized = _normalize_response(raw, source_text, blocks)
-    kana_info = apply_specialist_reading(normalized, source_text, blocks)
+        retry_prompt = base_prompt
+        if company_confusion:
+            retry_prompt += "\n前の応答では会社名が person_name に入っていました。会社名を氏名に使わず、OCRの氏名候補と座標を確認して人物名を抽出してください。確定できなければ空文字にしてください。\n"
+        raw = _generate_structured_response(retry_prompt)
+        data, normalized, identity_info = _normalize_response(raw, source_text, blocks, previous)
+    kana_info = apply_specialist_reading(normalized, source_text, blocks,
+                                         previous=previous, name_decision=identity_info)
+    if kana_info.get("segmentation") == "verified":
+        identity_info = {"status": "resolved", "source": "reading_verified_boundary"}
+    identity_info["selected"] = normalized.get("person_name") or ""
     automatic = dict(normalized)
-    applied = apply_known_reading(normalized, source_text, blocks, corrections)
+    applied = apply_known_reading(normalized, source_text, blocks, corrections,
+                                  allow_general=kana_info.get("source") != "previous")
+    if applied:
+        kana_info.update(status="corrected", selected=normalized["person_name_kana"], source="confirmed_correction")
     normalized["_automatic"] = automatic
     normalized["_feedback"] = {"example_ids": [c["id"] for c in corrections], "applied_ids": applied}
     if fallback:
         normalized["_feedback"]["fallback"] = fallback
     normalized["_raw"] = data
     normalized["_response_text"] = str(raw)
-    normalized["_model"] = {**getattr(raw, "model_info", {}), "kana": kana_info}
+    normalized["_model"] = {**getattr(raw, "model_info", {}), "identity": identity_info, "kana": kana_info}
     duration_ms = int((time.perf_counter() - started) * 1000)
     return ExtractionResult(data=normalized, duration_ms=duration_ms)
 
 
-def _normalize_response(raw: str, source_text: str, blocks: list[dict]) -> tuple[dict, dict]:
+def _normalize_response(raw: str, source_text: str, blocks: list[dict], previous: dict | None = None) -> tuple[dict, dict, dict]:
     data = _parse_json_object(raw)
     normalized = {key: _string_or_empty(data.get(key)) for key in SCHEMA_KEYS}
-    _recover_printed_identity(normalized, source_text)
-    _correct_person_name_order(normalized, blocks)
-    _refine_person_name_kana(normalized, source_text, blocks)
     _separate_department_and_title(normalized, source_text)
+    _recover_printed_department(normalized, source_text)
     _prefer_labeled_phone_numbers(normalized, source_text)
-    _remove_ungrounded_values(normalized, source_text)
-    return data, normalize_fields(normalized)
+    _remove_ungrounded_values(normalized, source_text, validate_person_name=False)
+    normalized = normalize_fields(normalized)
+    identity_info = resolve_person_name(normalized, source_text, blocks, previous)
+    return data, normalize_fields(normalized), identity_info
 
 
 def _generate_structured_response(prompt: str) -> str:
@@ -251,121 +269,6 @@ def _marked_text(blocks: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _with_spatial_name_candidates(raw_text: str, blocks: list[dict]) -> str:
-    """Append names reconstructed from adjacent, large kanji OCR blocks.
-
-    A frequent example is a surname split into two boxes while the given name is
-    in a third box.  Their top coordinates can differ by a few pixels, so OCR's
-    normal top-to-bottom sort produces ``橋 / 秀 明 / 口``.  The boxes themselves
-    still retain enough layout information to safely reconstruct ``橋口秀明``.
-    """
-    candidates = _spatial_name_candidates(blocks)
-    if not candidates:
-        return raw_text
-    lines = "\n".join(f"- {candidate}" for candidate in candidates)
-    return f"{raw_text}\n\n【座標補正による氏名候補】\n{lines}"
-
-
-def _spatial_name_candidates(blocks: list[dict]) -> list[str]:
-    """Return likely Japanese names formed by horizontally adjacent OCR boxes."""
-    by_side: dict[str, list[dict]] = {}
-    for block in blocks:
-        text = _kanji_text(block.get("text"))
-        box = _box_coordinates(block.get("box"))
-        if not text or box is None:
-            continue
-        x1, y1, x2, y2 = box
-        height = y2 - y1
-        # Small address/company text creates many accidental neighbours.  The
-        # name is normally among the prominent text on a business card.
-        if height < 40:
-            continue
-        by_side.setdefault(str(block.get("_side") or "unknown"), []).append(
-            {"text": text, "box": box}
-        )
-
-    candidates: list[str] = []
-    for side_blocks in by_side.values():
-        lines: list[list[dict]] = []
-        for block in sorted(side_blocks, key=lambda item: (item["box"][1] + item["box"][3]) / 2):
-            line = next((line for line in lines if _same_text_line(line[0], block)), None)
-            if line is None:
-                lines.append([block])
-            else:
-                line.append(block)
-        for line in lines:
-            line.sort(key=lambda item: item["box"][0])
-            run: list[dict] = []
-            for block in line:
-                if run and _is_horizontal_neighbour(run[-1], block):
-                    run.append(block)
-                    continue
-                _append_name_candidate(candidates, run)
-                run = [block]
-            _append_name_candidate(candidates, run)
-    return candidates
-
-
-def _same_text_line(left: dict, right: dict) -> bool:
-    left_y1, left_y2 = left["box"][1], left["box"][3]
-    right_y1, right_y2 = right["box"][1], right["box"][3]
-    return abs((left_y1 + left_y2) - (right_y1 + right_y2)) / 2 <= min(left_y2 - left_y1, right_y2 - right_y1) * 0.4
-
-
-def _correct_person_name_order(data: dict, blocks: list[dict]) -> None:
-    """Use the printed left-to-right order when the model reverses two name blocks."""
-    parts = (data.get("person_name") or "").split()
-    if len(parts) != 2:
-        return
-    candidates = _spatial_name_candidates(blocks)
-    if parts[1] + parts[0] in candidates and parts[0] + parts[1] not in candidates:
-        data["person_name"] = f"{parts[1]} {parts[0]}"
-
-
-def _append_name_candidate(candidates: list[str], blocks: list[dict]) -> None:
-    if len(blocks) < 2:
-        return
-    candidate = "".join(block["text"] for block in blocks)
-    # Two to six kanji covers ordinary Japanese full names while excluding most
-    # split department labels and sentences.
-    if 2 <= len(candidate) <= 6 and candidate not in candidates:
-        candidates.append(candidate)
-
-
-def _is_horizontal_neighbour(left: dict, right: dict) -> bool:
-    left_x1, left_y1, left_x2, left_y2 = left["box"]
-    right_x1, right_y1, right_x2, right_y2 = right["box"]
-    left_height = left_y2 - left_y1
-    right_height = right_y2 - right_y1
-    vertical_overlap = min(left_y2, right_y2) - max(left_y1, right_y1)
-    if vertical_overlap < min(left_height, right_height) * 0.4:
-        return False
-    center_difference = abs((left_y1 + left_y2) - (right_y1 + right_y2)) / 2
-    if center_difference > min(left_height, right_height) * 0.4:
-        return False
-    gap = right_x1 - left_x2
-    return -min(left_height, right_height) * 0.3 <= gap <= (left_height + right_height) * 0.7
-
-
-def _kanji_text(value) -> str:
-    text = re.sub(r"\s+", "", str(value or ""))
-    if re.fullmatch(r"[一-龯々〆ヵヶ]+", text):
-        return text
-    return ""
-
-
-def _box_coordinates(value) -> tuple[float, float, float, float] | None:
-    if not isinstance(value, (list, tuple)) or len(value) < 4:
-        return None
-    try:
-        x1, y1, x2, y2 = (float(value[index]) for index in range(4))
-    except (TypeError, ValueError):
-        return None
-    if x2 <= x1 or y2 <= y1:
-        return None
-    return x1, y1, x2, y2
-
-
 def _parse_json_object(raw: str) -> dict:
     text = raw.strip()
     if text.startswith("```"):
@@ -391,89 +294,12 @@ def _string_or_empty(value) -> str:
     return str(value).strip()
 
 
-_CORPORATE_MARKER = re.compile(
-    r"株式会社|有限会社|合同会社|合名会社|合資会社|医療法人|学校法人|社会福祉法人|社団法人|財団法人"
-)
-
-
-def _printed_identity(raw_text: str) -> list[tuple[str, str, str]]:
-    """Find a Japanese name followed by its roman spelling, corroborated by email."""
-    lines = [line.strip() for line in raw_text.splitlines()]
-    email_pairs = {
-        tuple(part.casefold() for part in re.split(r"[._-]", local))
-        for local in re.findall(r"\b([A-Za-z][A-Za-z0-9._-]*)@", raw_text)
-    }
-    found = []
-    for index, line in enumerate(lines):
-        match = re.fullmatch(r"([A-Za-z]{3,})\s+([A-Za-z]{3,})", line)
-        if not match:
-            continue
-        roman = tuple(part.casefold() for part in match.groups())
-        if not any(_email_matches_roman_name(pair, roman) for pair in email_pairs):
-            continue
-        for previous in (index - 1, index - 2):
-            if previous < 0:
-                continue
-            candidate = lines[previous]
-            if previous == index - 2 and not re.fullmatch(r"\d+", lines[index - 1]):
-                continue
-            if _is_organization_name(candidate):
-                continue
-            if re.fullmatch(r"[一-龯々〆ヵヶ]{1,4}[\s　]+[一-龯々〆ヵヶ]{1,4}", candidate):
-                found.append((" ".join(candidate.split()), *[part.casefold() for part in match.groups()]))
-                break
-    return found
-
-
-def _email_matches_roman_name(email_parts: tuple[str, ...], roman: tuple[str, str]) -> bool:
-    """Require two matching name components, allowing one printed initial."""
-    if len(email_parts) != 2:
-        return False
-    for ordered in (roman, roman[::-1]):
-        if email_parts == ordered:
-            return True
-        for initial, full in ((0, 1), (1, 0)):
-            if (len(email_parts[initial]) == 1
-                    and email_parts[initial] == ordered[initial][0]
-                    and email_parts[full] == ordered[full]):
-                return True
-    return False
-
-
-def _is_organization_name(name: str) -> bool:
-    return bool(_CORPORATE_MARKER.search(name) or re.search(r"(?:店|営業所|事業所)$", name.strip()))
-
-
-def _recover_printed_identity(data: dict, raw_text: str) -> None:
-    """Use unambiguous OCR labels when the model confuses a person and company."""
-    companies = [line.strip() for line in raw_text.splitlines()
-                 if _CORPORATE_MARKER.search(line) and len(line.strip()) <= 80]
-    companies = list(dict.fromkeys(companies))
-    if len(companies) == 1:
-        data["company_name"] = companies[0]
-
-    name = data.get("person_name") or ""
-    if not name or _is_organization_name(name) or (
-        data.get("company_name") and _compact_for_evidence(name) == _compact_for_evidence(data["company_name"])
-    ):
-        identities = _printed_identity(raw_text)
-        if len(identities) == 1:
-            data["person_name"] = identities[0][0]
-            if _compact_for_evidence(name) != _compact_for_evidence(data["person_name"]):
-                data["person_name_kana"] = ""
-            department = data.get("department") or ""
-            if re.search(r"(?:店|営業所|事業所)$", name.strip()) and (
-                not department or _compact_for_evidence(department) not in _compact_for_evidence(raw_text)
-            ):
-                data["department"] = name
-
-
 _ROLE_TITLES = {
     "代表取締役社長", "代表取締役", "取締役", "執行役員", "社長", "副社長",
     "部長", "課長", "室長", "係長", "主任", "技師", "編集者", "研究員",
-    "担当", "デザイナー", "リーダー", "エンジニア",
+    "担当", "営業担当", "デザイナー", "リーダー", "エンジニア",
 }
-_DEPARTMENT_END = re.compile(r"(?:本部|事業部|部|課|室|局|支店|営業所|センター|グループ|チーム)$")
+_DEPARTMENT_END = re.compile(r"(?:本部|事業部|部|課|室|局|支店|営業所|出張所|センター|グループ|チーム)$")
 
 
 def _separate_department_and_title(data: dict, raw_text: str) -> None:
@@ -506,233 +332,33 @@ def _separate_department_and_title(data: dict, raw_text: str) -> None:
     data["title"] = title
 
 
-def _refine_person_name_kana(data: dict, raw_text: str, blocks: list[dict] | None = None) -> None:
-    """Prefer printed phonetic evidence over an LLM's kanji-only guess."""
-    name = data.get("person_name") or ""
-    kana = data.get("person_name_kana") or ""
-    if not name:
+def _recover_printed_department(data: dict, raw_text: str) -> None:
+    """Restore a full printed hierarchy when the model skipped middle units."""
+    department = (data.get("department") or "").strip()
+    if not department or _compact_for_evidence(department) in _compact_for_evidence(raw_text):
         return
-
-    explicit_kana = _explicit_kana_for_name(raw_text, name) or _ruby_kana_for_name(blocks or [], name)
-    if explicit_kana:
-        data["person_name_kana"] = explicit_kana
+    parts = department.split()
+    if len(parts) < 2:
         return
-
-    current_parts = _kana_parts(kana)
-    valid_kana = len(current_parts) == 2 and all(re.fullmatch(r"[ぁ-ゖー]+", part) for part in current_parts)
-    for printed_name, first_roman, second_roman in _printed_identity(raw_text):
-        if _compact_for_evidence(printed_name) != _compact_for_evidence(name):
-            continue
-        ordered = _ordered_roman_reading(first_roman, second_roman, current_parts)
-        family_hint = _surname_roman_hint(raw_text)
-        if ordered is None and family_hint in (first_roman, second_roman) and first_roman != second_roman:
-            given_roman = second_roman if family_hint == first_roman else first_roman
-            ordered = (_roman_to_hiragana(family_hint), _roman_to_hiragana(given_roman))
-        if ordered is None:
-            continue
-        family, given = ordered
-        if given and family:
-            data["person_name_kana"] = f"{_prefer_printed_kana(current_parts[0], family) if valid_kana else family} {_prefer_printed_kana(current_parts[1], given) if valid_kana else given}"
-            return
-    for given_roman, family_roman in _roman_name_pairs(raw_text):
-        given = _roman_to_hiragana(given_roman)
-        family = _roman_to_hiragana(family_roman)
-        if not given or not family:
-            continue
-        # The common printed order is given-name first (HANAKO AOBA), while the
-        # Japanese field is family-name first.  Require one exact matching part
-        # so a generic email address cannot overwrite an unrelated name.
-        if valid_kana and (current_parts[0] == family or current_parts[1] == given):
-            data["person_name_kana"] = f"{_prefer_printed_kana(current_parts[0], family)} {_prefer_printed_kana(current_parts[1], given)}"
-            return
-        if valid_kana and (current_parts[0] == given or current_parts[1] == family):
-            data["person_name_kana"] = f"{_prefer_printed_kana(current_parts[0], given)} {_prefer_printed_kana(current_parts[1], family)}"
-            return
-        if not valid_kana and _surname_roman_hint(raw_text) == family_roman:
-            data["person_name_kana"] = f"{family} {given}"
-            return
-    if not valid_kana:
-        data["person_name_kana"] = ""
-
-
-def _ordered_roman_reading(first: str, second: str, current: list[str]) -> tuple[str, str] | None:
-    a, b = _roman_to_hiragana(first), _roman_to_hiragana(second)
-    if not a or not b:
-        return None
-    if len(current) == 2:
-        same = current[0] == a or current[1] == b
-        reversed_order = current[0] == b or current[1] == a
-        if same != reversed_order:
-            return (a, b) if same else (b, a)
-    # An ambiguous pair is left to the model, never blindly reversed.
-    given_names = {"taro", "tarou", "hanako", "ayaka", "tomoko", "yumi", "takuya", "mayu", "daisuke",
-                   "shota", "shouta", "makoto", "ryo", "ryou", "hiroshi", "kenichi", "yoko", "yuko", "yosuke"}
-    if (first in given_names) != (second in given_names):
-        return (b, a) if first in given_names else (a, b)
-    return None
-
-
-def _prefer_printed_kana(current: str, roman: str) -> str:
-    """Keep a plausible printed reading when roman letters omit one long vowel."""
-    if current == roman or (
-        current.count("う") == roman.count("う") + 1
-        and current.replace("う", "") == roman.replace("う", "")
-    ):
-        return current
-    return roman
-
-
-def _surname_roman_hint(raw_text: str) -> str:
-    """The final component of an email local part is often the family name."""
-    for local_part in re.findall(r"\b([A-Za-z][A-Za-z0-9._-]*)@", raw_text):
-        parts = re.split(r"[._-]+", local_part.casefold())
-        if len(parts) >= 2 and len(parts[-1]) >= 3 and parts[-1].isalpha():
-            return parts[-1]
-    return ""
-
-
-def _explicit_kana_for_name(raw_text: str, name: str) -> str:
-    compact_name = re.sub(r"\s+", "", name)
+    candidates = []
     for line in raw_text.splitlines():
-        # Remove the entire name first so a kana given name cannot become ruby.
-        compact_line = re.sub(r"\s+", "", line)
-        if compact_name not in compact_line:
+        tokens = line.strip().split()
+        if len(tokens) < 2 or not all(_DEPARTMENT_END.search(token) for token in tokens):
             continue
-        match = re.search(r"[（(]([ぁ-ゖァ-ヶー]+[\s　]+[ぁ-ゖァ-ヶー]+)[）)]", line)
-        if match and _normalize_kana_field(match.group(1)):
-            return _normalize_kana_field(match.group(1))
-        # Unlabelled fragments such as 'カナ' are not a full-name reading.
-        suffix = re.sub(r"\s+", "", compact_line.split(compact_name, 1)[1])
-        labelled = re.match(r"(?:ふりがな|フリガナ|かな|カナ)[:：]?([ぁ-ゖァ-ヶー]+)", suffix)
-        if labelled:
-            return _normalize_kana_field(labelled.group(1))
-    return ""
+        compact_line = _compact_for_evidence(line)
+        position = 0
+        for part in parts:
+            match_at = compact_line.find(_compact_for_evidence(part), position)
+            if match_at < 0:
+                break
+            position = match_at + len(_compact_for_evidence(part))
+        else:
+            candidates.append(" ".join(tokens))
+    if len(set(candidates)) == 1:
+        data["department"] = candidates[0]
 
 
-def _ruby_kana_for_name(blocks: list[dict], name: str) -> str:
-    compact_name = re.sub(r"\s+", "", name)
-    results = set()
-    for name_block in blocks:
-        if re.sub(r"\s+", "", str(name_block.get("text") or "")) != compact_name:
-            continue
-        name_box = _box_coordinates(name_block.get("box"))
-        if name_box is None:
-            continue
-        nx1, ny1, nx2, ny2 = name_box
-        height = ny2 - ny1
-        nearby = []
-        for block in blocks:
-            if block is name_block or block.get("_side") != name_block.get("_side"):
-                continue
-            text = str(block.get("text") or "").strip()
-            box = _box_coordinates(block.get("box"))
-            if not box or not _normalize_kana_field(text):
-                continue
-            x1, y1, x2, y2 = box
-            # Ruby is smaller, on a distinct row, and overlaps the name.
-            if y2 - y1 >= height * .8 or min(nx2, x2) <= max(nx1, x1):
-                continue
-            if not (y2 <= ny1 or y1 >= ny2):
-                continue
-            gap = min(abs(ny1 - y2), abs(y1 - ny2))
-            if gap <= height * 1.25:
-                nearby.append((x1, y1, text))
-        if len(nearby) == 2 and abs(nearby[0][1] - nearby[1][1]) <= height * .4:
-            nearby.sort()
-            results.add(" ".join(_normalize_kana_field(text) for _x, _y, text in nearby))
-        elif len(nearby) == 1 and len(nearby[0][2].split()) == 2:
-            results.add(_normalize_kana_field(nearby[0][2]))
-    return results.pop() if len(results) == 1 else ""
-
-
-def _roman_name_pairs(raw_text: str) -> list[tuple[str, str]]:
-    pairs: list[tuple[str, str]] = []
-
-    def add_pair(first: str, second: str) -> None:
-        pair = (first.casefold(), second.casefold())
-        if pair not in pairs and all(len(part) >= 3 for part in pair):
-            pairs.append(pair)
-
-    for line in raw_text.splitlines():
-        words = re.findall(r"[A-Za-z]+", line)
-        if len(words) == 2 and re.fullmatch(r"[A-Za-z\s.'’-]+", line.strip()):
-            add_pair(words[0], words[1])
-
-    for local_part in re.findall(r"\b([A-Za-z][A-Za-z0-9._-]*)@", raw_text):
-        words = [word for word in re.split(r"[._-]+", local_part) if word.isalpha()]
-        if len(words) == 2:
-            add_pair(words[0], words[1])
-    return pairs
-
-
-def _kana_parts(value: str) -> list[str]:
-    normalized = _normalize_kana_evidence(value)
-    return normalized.split() if normalized else []
-
-
-def _normalize_kana_evidence(value: str) -> str:
-    text = " ".join(str(value or "").strip().split())
-    chars = []
-    for char in text:
-        code = ord(char)
-        chars.append(chr(code - 0x60) if 0x30A1 <= code <= 0x30F6 else char)
-    return "".join(chars)
-
-
-def _roman_to_hiragana(value: str) -> str:
-    text = re.sub(r"[^a-z]", "", value.casefold())
-    if not text:
-        return ""
-    # Hepburn spellings often omit long vowels in common given names.  Keep
-    # these readings explicit rather than turning e.g. SHOTA into しょた.
-    common_given_names = {
-        "yosuke": "ようすけ", "yousuke": "ようすけ",
-        "shota": "しょうた", "shouta": "しょうた",
-        "ryo": "りょう", "ryou": "りょう",
-        "koji": "こうじ", "kouji": "こうじ",
-        "taro": "たろう", "tarou": "たろう",
-        "yuko": "ゆうこ", "yuuko": "ゆうこ",
-        "kyoko": "きょうこ", "kyouko": "きょうこ",
-        "kenichi": "けんいち",
-    }
-    if text in common_given_names:
-        return common_given_names[text]
-    syllables = {
-        "kya": "きゃ", "kyu": "きゅ", "kyo": "きょ", "sha": "しゃ", "shu": "しゅ", "sho": "しょ",
-        "cha": "ちゃ", "chu": "ちゅ", "cho": "ちょ", "nya": "にゃ", "nyu": "にゅ", "nyo": "にょ",
-        "hya": "ひゃ", "hyu": "ひゅ", "hyo": "ひょ", "mya": "みゃ", "myu": "みゅ", "myo": "みょ",
-        "rya": "りゃ", "ryu": "りゅ", "ryo": "りょ", "gya": "ぎゃ", "gyu": "ぎゅ", "gyo": "ぎょ",
-        "bya": "びゃ", "byu": "びゅ", "byo": "びょ", "pya": "ぴゃ", "pyu": "ぴゅ", "pyo": "ぴょ",
-        "shi": "し", "chi": "ち", "tsu": "つ", "fu": "ふ", "ji": "じ",
-        "ka": "か", "ki": "き", "ku": "く", "ke": "け", "ko": "こ",
-        "sa": "さ", "su": "す", "se": "せ", "so": "そ",
-        "ta": "た", "te": "て", "to": "と", "na": "な", "ni": "に", "nu": "ぬ", "ne": "ね", "no": "の",
-        "ha": "は", "hi": "ひ", "he": "へ", "ho": "ほ", "ma": "ま", "mi": "み", "mu": "む", "me": "め", "mo": "も",
-        "ya": "や", "yu": "ゆ", "yo": "よ", "ra": "ら", "ri": "り", "ru": "る", "re": "れ", "ro": "ろ",
-        "wa": "わ", "wo": "を", "ga": "が", "gi": "ぎ", "gu": "ぐ", "ge": "げ", "go": "ご",
-        "za": "ざ", "zu": "ず", "ze": "ぜ", "zo": "ぞ", "da": "だ", "de": "で", "do": "ど",
-        "ba": "ば", "bi": "び", "bu": "ぶ", "be": "べ", "bo": "ぼ", "pa": "ぱ", "pi": "ぴ", "pu": "ぷ", "pe": "ぺ", "po": "ぽ",
-        "a": "あ", "i": "い", "u": "う", "e": "え", "o": "お",
-    }
-    result = []
-    while text:
-        if len(text) >= 2 and text[0] == text[1] and text[0] not in "aeioun":
-            result.append("っ")
-            text = text[1:]
-            continue
-        if text[0] == "n" and (len(text) == 1 or text[1] not in "aiueoy"):
-            result.append("ん")
-            text = text[1:]
-            continue
-        match = next((token for token in sorted(syllables, key=len, reverse=True) if text.startswith(token)), None)
-        if match is None:
-            return ""
-        result.append(syllables[match])
-        text = text[len(match):]
-    return "".join(result)
-
-
-def _remove_ungrounded_values(data: dict, raw_text: str) -> None:
+def _remove_ungrounded_values(data: dict, raw_text: str, validate_person_name: bool = True) -> None:
     """Do not persist contact details or labels invented by the extraction model.
 
     OCR can be wrong, but a local model must not manufacture an address or a phone
@@ -743,6 +369,8 @@ def _remove_ungrounded_values(data: dict, raw_text: str) -> None:
     numeric_values = _number_candidates(raw_text)
 
     for key in ("person_name", "company_name", "department", "title", "email", "website"):
+        if key == "person_name" and not validate_person_name:
+            continue
         value = data.get(key, "")
         if value and _compact_for_evidence(value) not in compact_source:
             data[key] = ""
@@ -770,17 +398,13 @@ def _remove_ungrounded_values(data: dict, raw_text: str) -> None:
         data["person_name_kana"] = ""
 
 
-def _compact_for_evidence(value: str) -> str:
-    return re.sub(r"[\s()（）\-ー－−./:：・·･]", "", value).casefold()
-
-
 def _normalized_digits(value: str) -> str:
     return re.sub(r"\D", "", value.translate(str.maketrans("０１２３４５６７８９", "0123456789")))
 
 
 def _number_candidates(raw_text: str) -> set[str]:
     # Keep each printed number separate even when several appear on one line.
-    pattern = r"(?<![0-9０-９])(?:\+?[0-9０-９]{1,4}[-ー－−()（）]){1,4}[0-9０-９]{2,4}(?![0-9０-９])|(?<![0-9０-９])[0-9０-９]{7,11}(?![0-9０-９])"
+    pattern = r"(?<![0-9０-９])(?:\+?[0-9０-９]{1,4}[-ー－−()（）]{1,2}){1,4}[0-9０-９]{2,4}(?![0-9０-９])|(?<![0-9０-９])[0-9０-９]{7,11}(?![0-9０-９])"
     return {_normalized_digits(match) for match in re.findall(pattern, raw_text)}
 
 
@@ -790,7 +414,8 @@ def _number_has_evidence(value: str, candidates: set[str]) -> bool:
 
 
 def _prefer_labeled_phone_numbers(data: dict, raw_text: str) -> None:
-    for key, label in (("tel", r"\btel\b|電話"), ("fax", r"\bfax\b|ファックス")):
+    for key, label in (("tel", r"\btel(?=\d|[^A-Za-z])|(?<!携帯)電話"),
+                       ("fax", r"\bfax(?=\d|[^A-Za-z])|ファックス")):
         numbers = {_local_japanese_number(value) for value in _numbers_on_labeled_lines(raw_text, label)}
         if len(numbers) == 1:
             digits = numbers.pop()

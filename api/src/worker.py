@@ -85,7 +85,7 @@ def _run_locked_job(job: dict) -> None:
             raw_text = _combined_ocr_text(images)
             if not raw_text.strip():
                 raise RuntimeError("OCR text is empty; run full reprocess first")
-            extracted = extract_card_fields(raw_text, _combined_ocr_blocks(images), owner_user_id=card["owner_user_id"])
+            extracted = extract_card_fields(raw_text, _combined_ocr_blocks(images), owner_user_id=card["owner_user_id"], previous=card)
             repository.save_extraction_result(card_id, extracted.data, extracted.duration_ms, raw_text, _combined_ocr_blocks(images))
             repository.finish_job(job["id"])
             return
@@ -105,7 +105,7 @@ def _run_locked_job(job: dict) -> None:
             repository.finish_job(job["id"])
             return
 
-        extracted = extract_card_fields(raw_text, _combined_ocr_blocks(images), owner_user_id=card["owner_user_id"])
+        extracted = extract_card_fields(raw_text, _combined_ocr_blocks(images), owner_user_id=card["owner_user_id"], previous=card)
         repository.save_extraction_result(card_id, extracted.data, extracted.duration_ms, raw_text, _combined_ocr_blocks(images))
         repository.finish_job(job["id"])
     except Exception as exc:

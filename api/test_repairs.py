@@ -19,7 +19,8 @@ from src.routers.cards import router as cards_router
 from src.routers.line import process_line_event, router as line_router
 from src.services import feedback, repository
 from src.services.card_data_lock import card_data_lock
-from src.services.extractor import extract_card_fields, _refine_person_name_kana, _remove_ungrounded_values
+from src.services.extractor import extract_card_fields, _remove_ungrounded_values
+from src.services.person_identity import _refine_person_name_kana
 from src.services.image_store import save_original_bytes, relative_path, sha256_file, resolve_data_path
 from src.services.secret_store import encrypt, decrypt
 
@@ -201,6 +202,19 @@ class RepairTests(unittest.TestCase):
         with database.connection() as conn:
             self.assertEqual(conn.execute('SELECT count(*) FROM extraction_runs').fetchone()[0], 0)
 
+    def test_unrelated_english_lines_do_not_disable_confirmed_personal_reading(self):
+        self.card()
+        self.extraction()
+        repository.update_card_fields('a', {'person_name_kana': 'かくた たろう'})
+        raw = {'person_name': '角田 太郎', 'person_name_kana': 'つのだ たろう', 'email': 'a@example.jp'}
+        source = '角田 太郎\nBUREAU VERITAS\na@example.jp'
+        with patch('src.services.extractor._generate_structured_response', return_value=json.dumps(raw)):
+            result = extract_card_fields(source, [], self.owner).data
+        self.assertEqual(result['person_name_kana'], 'かくた たろう')
+        self.assertTrue(result['_feedback']['applied_ids'])
+        self.assertEqual(result['_model']['kana']['selected'], 'かくた たろう')
+        self.assertEqual(result['_model']['kana']['source'], 'confirmed_correction')
+
     def test_surname_correction_transfers_to_another_person_and_enters_prompt(self):
         self.card()
         self.extraction(name='須藤 太郎', kana='すど たろう')
@@ -239,7 +253,7 @@ class RepairTests(unittest.TestCase):
         wrong = json.dumps({'person_name': 'すどう 花子', 'person_name_kana': 'すどう はなこ'})
         good = json.dumps({'person_name': '須藤 花子', 'person_name_kana': 'すど はなこ'})
         with patch('src.services.extractor._generate_structured_response', side_effect=[wrong, good]) as generate:
-            result = extract_card_fields('須藤 花子\nb@example.jp', [], self.owner).data
+            result = extract_card_fields('須藤 花子\n山田 太郎\nb@example.jp', [], self.owner).data
         self.assertEqual(generate.call_count, 2)
         self.assertNotIn('姓・名の読み推測の参考', generate.call_args_list[1].args[0])
         self.assertEqual(result['person_name'], '須藤 花子')

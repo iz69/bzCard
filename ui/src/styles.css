@@ -410,6 +410,17 @@ tbody tr:not(.virtualSpacer) {
   padding: 18px;
 }
 
+.cardTimestamps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 24px;
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid #d8dee6;
+  color: #667085;
+  font-size: 12px;
+}
+
 .detailHeader {
   display: flex;
   justify-content: space-between;

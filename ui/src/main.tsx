@@ -489,7 +489,7 @@ function Workspace({ session, saveSession }: { session: Session; saveSession: (n
                   <th>氏名</th>
                   <th>会社</th>
                   <th>タグ</th>
-                  <th>更新</th>
+                  <th>登録日</th>
                 </tr>
               </thead>
               <tbody>
@@ -512,7 +512,7 @@ function Workspace({ session, saveSession }: { session: Session; saveSession: (n
                     <td>{contact.person_name || '-'}</td>
                     <td>{contact.company_name || '-'}</td>
                     <td><TagList tags={contact.tags} /></td>
-                    <td>{formatDate(contact.updated_at)}{contact.card_count > 1 ? ` · ${contact.card_count}枚` : ''}</td>
+                    <td>{formatDate(contact.created_at)}</td>
                   </tr>
                 ))}
                 {trailingContacts > 0 && (
@@ -1479,6 +1479,10 @@ function CardDetail({
         </section>
       </div>
       <CorrectionHistory api={api} cardId={card.id} revision={card.revision} />
+      <div className="cardTimestamps">
+        <span>登録日時: {formatDate(card.created_at)}</span>
+        <span>最終更新日時: {formatDate(card.updated_at)}</span>
+      </div>
       {zoomPath && (
         <ImageModal
           api={api}
