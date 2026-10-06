@@ -330,6 +330,54 @@ class SpatialNameCandidateTests(unittest.TestCase):
 
         self.assertEqual(data, {"department": "経営企画室", "title": "室長"})
 
+    def test_role_only_department_is_cleared_and_missing_title_is_recovered(self):
+        cases = [
+            ("専務取締役", "専務取締役"),
+            ("常務取締役", "常務取締役"),
+            ("代表取締役", "代表取締役"),
+            ("代表取締役会長", "代表取締役会長"),
+            ("専務執行役員", "専務執行役員"),
+            ("部長", "部長"),
+            ("専務 取締役", "専務取締役"),
+            ("エンジニア", "エンジニア"),
+            ("リーダー", "リーダー"),
+        ]
+        for department, role in cases:
+            for title in (role, ""):
+                with self.subTest(department=department, title=title):
+                    output = json.dumps({"department": department, "title": title}, ensure_ascii=False)
+                    with patch("src.services.extractor._generate_structured_response", return_value=output):
+                        result = extract_card_fields(department, []).data
+                    self.assertEqual((result["department"], result["title"]), ("", role))
+
+    def test_role_only_department_does_not_replace_a_distinct_title(self):
+        data = {"department": "専務取締役", "title": "専務執行役員"}
+
+        _separate_department_and_title(data, "専務取締役\n専務執行役員")
+
+        self.assertEqual(data, {"department": "", "title": "専務執行役員"})
+
+    def test_role_without_ocr_evidence_is_not_moved_to_title(self):
+        output = json.dumps({"department": "専務取締役", "title": ""}, ensure_ascii=False)
+        with patch("src.services.extractor._generate_structured_response", return_value=output):
+            result = extract_card_fields("営業部", []).data
+
+        self.assertEqual((result["department"], result["title"]), ("", ""))
+
+    def test_department_containing_role_words_is_preserved(self):
+        for department in ("取締役会事務局", "専務室", "部長室", "営業部"):
+            with self.subTest(department=department):
+                data = {"department": department, "title": "専務取締役"}
+                _separate_department_and_title(data, f"{department}\n専務取締役")
+                self.assertEqual(data, {"department": department, "title": "専務取締役"})
+
+    def test_executive_title_is_separated_from_printed_department(self):
+        data = {"department": "経営企画室 専務取締役", "title": "経営企画室 専務取締役"}
+
+        _separate_department_and_title(data, "経営企画室 専務取締役")
+
+        self.assertEqual(data, {"department": "経営企画室", "title": "専務取締役"})
+
     def test_skipped_middle_department_is_restored_from_printed_line(self):
         ocr = "カスタマー営業部 ビジネスソリューション部 第二課\n大竹 将矢"
         output = json.dumps({"person_name": "大竹 将矢", "department": "営業部 第二課"},

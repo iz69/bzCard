@@ -232,6 +232,7 @@ OCRテキストにない値を補完・創作してはいけません。ただ�
 email は @ を含むOCR上のメールアドレスだけを入れてください。email を mobile、fax、tel に入れてはいけません。
 tel と mobile には電話番号だけを入れてください。fax にはOCR上で FAX と明示された電話番号だけを入れてください。
 department には部署名だけを入れ、部・課・グループなどが複数行に分かれている場合は上位から順にすべて含めてください。title には役職名だけを入れてください。同じ行に「営業部 課長」と印刷されている場合、department は「営業部」、title は「課長」です。OCR上にない項目は空文字にしてください。
+「専務取締役」「常務取締役」「代表取締役」「部長」などは役職です。役職だけが印刷され、部署名がない場合は department を空文字にし、役職を title だけに入れてください。
 person_name_kana は氏名の読みをひらがなだけで入れてください。漢字や別人の名前を混ぜないでください。姓名の間には半角スペースを1つ入れてください。
 OCRテキスト内にふりがな・フリガナがある場合はそれを優先してください。
 ふりがながない場合でも、日本人名として自然で一般的な読みを推測してください。
@@ -295,7 +296,9 @@ def _string_or_empty(value) -> str:
 
 
 _ROLE_TITLES = {
-    "代表取締役社長", "代表取締役", "取締役", "執行役員", "社長", "副社長",
+    "代表取締役社長", "代表取締役会長", "代表取締役副社長", "代表取締役",
+    "専務取締役", "常務取締役", "取締役", "専務執行役員", "常務執行役員", "執行役員",
+    "社長", "副社長", "会長", "副会長", "専務", "常務",
     "部長", "課長", "室長", "係長", "主任", "技師", "編集者", "研究員",
     "担当", "営業担当", "デザイナー", "リーダー", "エンジニア",
 }
@@ -303,7 +306,13 @@ _DEPARTMENT_END = re.compile(r"(?:本部|事業部|部|課|室|局|支店|営業
 
 
 def _separate_department_and_title(data: dict, raw_text: str) -> None:
-    """Use a printed department/role line when the model combines both fields."""
+    """Keep printed roles out of departments and split combined department/role lines."""
+    department = re.sub(r"\s+", "", data.get("department") or "")
+    if department in _ROLE_TITLES and _compact_for_evidence(department) in _compact_for_evidence(raw_text):
+        data["department"] = ""
+        if not data.get("title"):
+            data["title"] = department
+
     candidates = set()
     for line in raw_text.splitlines():
         parts = line.strip().split()
