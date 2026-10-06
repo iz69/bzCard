@@ -34,7 +34,7 @@ def load_settings() -> Settings:
     data_dir = Path(os.getenv("DATA_DIR", "/data"))
     return Settings(
         data_dir=data_dir,
-        base_path=os.getenv("BASE_PATH", "/").rstrip("/") or "/",
+        base_path=os.getenv("BASE_PATH", "/").strip().rstrip("/") or "/",
         llm_provider=os.getenv("LLM_PROVIDER", "ollama").strip().lower(),
         llm_base_url=os.getenv("LLM_BASE_URL", "http://ollama:11434").rstrip("/"),
         llm_model=os.getenv("LLM_MODEL", "bzcard-lfm-jp:202606").strip(),

@@ -84,7 +84,7 @@ docker run --rm -v "$PWD/api:/app:ro" -w /app bzcard-api \
 保存済みのOCRとLLM応答を使い、現在の処理で全解析履歴を再生する:
 
 ```sh
-docker compose run --rm -T --no-deps -v "$PWD/api:/app:ro" api \
+docker compose -f docker-compose.develop.yml run --rm -T --no-deps -v "$PWD/api:/app:ro" api \
   python replay_person_identity.py --check --fresh
 ```
 

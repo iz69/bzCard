@@ -56,11 +56,22 @@ Ollamaとkanaはホストへポート公開せず、APIコンテナからだけ�
 - WebUI: `/bzcard/`
 - API: `/bzcard-api/`
 
-## 起動手順
+## イメージでの配布
+
+[docker-compose.yml](docker-compose.yml) は、GHCRからUI・API・kanaを取得する
+配布用構成です。配置先でのビルドは不要で、公開パスは `UI_BASE_PATH` と
+`API_BASE_PATH` をコンテナ起動時に指定できます。ルートや複数階層のサブパスも使えます。
+
+`.env` とモデルを準備した後、通常の `docker compose up -d` で起動します。
+
+公開・導入・更新の手順は [イメージ配布](docs/container-distribution.md) を参照してください。
+初回のGHCR公開には、変更をGitHubへ反映し、バージョンタグをpushする必要があります。
+
+## ソースからの起動手順
 
 Git、Docker、Docker Compose（`docker compose` コマンド）を用意してください。
-現在の構成では、APIとWebUIは配布済みイメージを取得するのではなく、配置先で
-ソースからビルドします。`docker-compose.yml` だけでなく、リポジトリ全体が必要です。
+この手順ではAPI・WebUI・kanaを配置先でソースからビルドします。
+`docker-compose.develop.yml` だけでなく、リポジトリ全体が必要です。
 Ollamaは公開イメージを取得し、モデルは別途登録します。
 
 初回はリポジトリをcloneし、取得したディレクトリへ移動します。
@@ -69,7 +80,11 @@ Ollamaは公開イメージを取得し、モデルは別途登録します。
 ```sh
 git clone https://github.com/iz69/bzCard.git bzcard
 cd bzcard
+export COMPOSE_FILE=docker-compose.develop.yml
 ```
+
+この節では `COMPOSE_FILE` でソースビルド用の構成を選びます。
+新しいシェルでは再指定するか、各コマンドに `-f docker-compose.develop.yml` を付けてください。
 
 `.env.example` から `.env` を作成します。
 
@@ -137,7 +152,13 @@ http://localhost:15174/bzcard/
 初回は管理者IDとパスワードを作成します。以後は、WebUIでは同じサーバのAPI URL、
 ログインID、パスワードでログインします。Androidも同じ認証情報を使います。
 
-## 更新手順
+API URLに "/" を指定すると、同じドメインのルートで公開したAPIへ接続します。
+WebUIの接続先とログイン情報は、公開パスと初期API接続先ごとに保存します。
+初期API接続先を変更した配置では、以前の認証情報を使わず再ログインします。
+従来の "/bzcard/"・"/bzcard-api" 構成では、保存済みの接続先とログイン情報を
+初回アクセス時に自動で引き継ぎます。
+
+## ソースからの更新手順
 
 インストール済みのリポジトリで、ソースを更新してAPIとWebUIを再ビルドします。
 標準の `main` ブランチを使っている場合は、次を実行してください。
@@ -145,20 +166,20 @@ http://localhost:15174/bzcard/
 
 ```sh
 git pull --ff-only
-docker compose build api ui kana
+docker compose -f docker-compose.develop.yml build api ui kana
 ```
 
 新しいコンテナを起動する前にAPIを停止し、DB・画像・暗号化鍵を含む `data/` 全体を
 別途バックアップしてください。詳細は [DB移行・処理復旧](#db移行処理復旧) を参照してください。
 
 ```sh
-docker compose stop api
+docker compose -f docker-compose.develop.yml stop api
 ```
 
 バックアップ後、ビルドしたイメージでコンテナを更新します。
 
 ```sh
-docker compose up -d
+docker compose -f docker-compose.develop.yml up -d
 ```
 
 初回設定済みの `.env`、`data/`、`ollama/` は引き続き使います。kanaモデルの重みをまだ配置していない環境では、上記の取得手順を先に実行してください。
@@ -168,7 +189,17 @@ docker compose up -d
 
 ## 環境変数
 
-`docker-compose.yml` は `.env` から設定値を読みます。
+`docker-compose.yml` と `docker-compose.develop.yml` は `.env` から設定値を読みます。
+公開パスはビルド時ではなく、コンテナ起動時に反映されます。
+
+```env
+UI_BASE_PATH=/bzcard/
+API_BASE_PATH=/bzcard-api
+```
+
+`UI_BASE_PATH` は末尾に `/` を付けた絶対パスです。APIをルートで公開する場合は
+`API_BASE_PATH=/` とします。UI・APIの設定と外側のプロキシ設定を合わせてください。
+設定変更後は `docker compose up -d` でコンテナを再作成します。
 
 OCR/LLMの任意設定:
 
@@ -266,13 +297,18 @@ location /bzcard-api/ {
 }
 
 location /bzcard/ {
-    proxy_pass http://127.0.0.1:15174/;
+    proxy_pass http://127.0.0.1:15174;
     proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
 }
 ```
+
+UI側の `proxy_pass` には末尾の `/` を付けず、公開パスを保持します。
+API側は公開プレフィックスを除いて転送します。UIコンテナはAPIを中継しないため、
+プロキシを使わずローカルで確認する場合は、ログイン画面のAPI URLに
+`http://localhost:18081` を指定してください。
 
 ## API例
 
@@ -423,7 +459,7 @@ WebUI・Android・LIFFの名刺更新API (`PATCH /api/cards/{id}`) で、実際�
 
 ## メモリ制限
 
-`docker-compose.yml` では、LFM2.5-1.2B-JP のQ4量子化モデルを使う8GB程度のホストを
+両方のCompose構成では、LFM2.5-1.2B-JP のQ4量子化モデルを使う8GB程度のホストを
 想定して次の制限を入れています。
 
 - `api`: `3g`
@@ -449,15 +485,30 @@ cd ui
 npm ci
 npm run typecheck
 npm test
+npm run test:runtime
 npm run build
 ```
 
 ブラウザ回帰テストは、検証用UIとChromiumを用意して実行します。
 API通信はすべて架空のレスポンスに置き換えます。
 
+公開パスの異なる配置を検証するときは、UIとAPIのURL設定をその配置に合わせます。
+すでに起動したChromiumへ接続する場合は、BROWSER_EXECUTABLEの代わりに
+BROWSER_CDP_URLを指定できます。
+
 ```sh
 BZCARD_TEST_UI_URL=http://127.0.0.1:15175/bzcard/ \
+BZCARD_TEST_API_BASE_PATH=/bzcard-api \
 BROWSER_EXECUTABLE=/path/to/chromium npm run test:browser
+```
+
+同じDockerイメージを6種類の公開パスで検証する場合:
+
+```sh
+# リポジトリのルートでビルド
+docker build -t bzcard-ui:distribution-test ui
+cd ui
+BROWSER_EXECUTABLE=/path/to/chromium npm run test:container
 ```
 
 実LLMの補正参照評価は `api/evaluate_feedback.py` を実行します。常に一時DBを使い、
@@ -474,7 +525,7 @@ python3 -m compileall api/src
 コンテナビルド:
 
 ```sh
-docker compose build api ui
+docker compose -f docker-compose.develop.yml build api ui
 ```
 
 APIヘルスチェック:

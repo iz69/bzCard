@@ -26,9 +26,9 @@ swagger_enabled = True
 
 app = FastAPI(
     title="bzcard API",
+    root_path=settings.base_path.rstrip("/"),
     docs_url="/docs" if swagger_enabled else None,
     redoc_url="/redoc" if swagger_enabled else None,
-    swagger_ui_parameters={"url": f"{settings.base_path}/openapi.json"},
     servers=[{"url": settings.base_path}],
 )
 

@@ -2,11 +2,6 @@ FROM node:22-alpine AS build
 
 WORKDIR /app
 
-ARG VITE_BASE_PATH=/bzcard/
-ARG VITE_API_BASE_PATH=/bzcard-api
-ENV VITE_BASE_PATH=${VITE_BASE_PATH}
-ENV VITE_API_BASE_PATH=${VITE_API_BASE_PATH}
-
 COPY package*.json ./
 RUN npm ci
 
@@ -15,10 +10,15 @@ RUN npm run typecheck && npm run build
 
 FROM nginx:1.27-alpine
 
-ARG VITE_BASE_PATH=/bzcard/
-COPY nginx.conf /etc/nginx/conf.d/default.conf
-RUN base_path="${VITE_BASE_PATH%/}" \
-    && sed -i "s|__BASE_PATH__|${base_path}|g" /etc/nginx/conf.d/default.conf
-COPY --from=build /app/dist /usr/share/nginx/html
+LABEL org.opencontainers.image.source="https://github.com/iz69/bzCard"
+
+ENV UI_BASE_PATH=/bzcard/ \
+    API_BASE_PATH=/bzcard-api
+
+RUN apk add --no-cache python3
+COPY --from=build /app/dist /opt/bzcard/dist
+COPY runtime/generate_config.py /opt/bzcard/generate_config.py
+COPY docker-entrypoint.d/40-bzcard-runtime.sh /docker-entrypoint.d/40-bzcard-runtime.sh
+RUN chmod +x /docker-entrypoint.d/40-bzcard-runtime.sh
 
 EXPOSE 5173

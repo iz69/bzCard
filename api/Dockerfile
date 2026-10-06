@@ -22,6 +22,7 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src ./src
+LABEL org.opencontainers.image.source="https://github.com/iz69/bzCard"
 
 EXPOSE 8000
 

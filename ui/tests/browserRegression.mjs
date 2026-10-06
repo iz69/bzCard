@@ -1,26 +1,44 @@
 // Run against the separately built UI; every API request is synthetic.
 import assert from 'node:assert/strict';
 import { chromium } from 'playwright-core';
+import { createSessionStore, normalizeApiBase } from '../src/deployment.ts';
 
 const base = process.env.BZCARD_TEST_UI_URL || 'http://127.0.0.1:15175/bzcard/';
-const browser = await chromium.launch({
-  executablePath: process.env.BROWSER_EXECUTABLE,
-  args: process.env.BROWSER_ARGS ? JSON.parse(process.env.BROWSER_ARGS) : ['--no-sandbox', '--disable-dev-shm-usage'],
-  headless: true,
-});
+const apiBase = normalizeApiBase(process.env.BZCARD_TEST_API_BASE_PATH ?? '/bzcard-api');
+const uiUrl = new URL(base);
+const publicApiUrl = new URL(apiBase || '/', uiUrl);
+const publicApiPath = publicApiUrl.pathname.replace(/\/+$/, '');
+const sessionKey = createSessionStore(localStorageStub(), uiUrl.pathname, apiBase, uiUrl.origin).key;
+const migrateLegacy = uiUrl.pathname === '/bzcard/' && apiBase === '/bzcard-api';
+const apiRoute = url => url.origin === publicApiUrl.origin
+  && (url.pathname.startsWith(publicApiPath + '/api/') || url.pathname.startsWith(publicApiPath + '/line/'));
+const browser = process.env.BROWSER_CDP_URL
+  ? await chromium.connectOverCDP(process.env.BROWSER_CDP_URL)
+  : await chromium.launch({
+    executablePath: process.env.BROWSER_EXECUTABLE,
+    args: process.env.BROWSER_ARGS ? JSON.parse(process.env.BROWSER_ARGS) : ['--no-sandbox', '--disable-dev-shm-usage'],
+    headless: true,
+  });
+const context = await browser.newContext();
 const errors = [];
 const card = { id: 'card-a', person_name: 'USER_A_PRIVATE_NAME', company_name: 'USER_A_PRIVATE_COMPANY', status: 'ready', revision: 1, created_at: '2026-01-01', updated_at: '2026-01-01' };
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aGxkAAAAASUVORK5CYII=', 'base64');
 function watch(page) { page.on('pageerror', e => errors.push(e.message)); }
 async function fulfill(route, body, status = 200) { await route.fulfill({status, contentType: 'application/json', body: JSON.stringify(body)}); }
+function localStorageStub() { return {getItem:()=>null,setItem:()=>{},removeItem:()=>{}}; }
 try {
-  const page = await browser.newPage(); watch(page);
-  await page.addInitScript(() => {
-    localStorage.setItem('bzcard.apiBase', '/bzcard-api');
-    localStorage.setItem('bzcard.sessionToken', 'user-a');
-  });
+  const page = await context.newPage(); watch(page);
+  await page.addInitScript(({key,apiBase,legacy}) => {
+    if (localStorage.getItem(key) !== null) return;
+    if (legacy) {
+      localStorage.setItem('bzcard.apiBase', apiBase);
+      localStorage.setItem('bzcard.sessionToken', 'user-a');
+    } else {
+      localStorage.setItem(key, JSON.stringify({apiBase,token:'user-a'}));
+    }
+  }, {key:sessionKey,apiBase,legacy:migrateLegacy});
   let bRequests = 0;
-  await page.route('**/bzcard-api/**', async route => {
+  await page.route(apiRoute, async route => {
     const path = new URL(route.request().url()).pathname;
     const userB = route.request().headers().authorization === 'Bearer user-b';
     if (path.endsWith('/bootstrap-status')) return fulfill(route, {needs_bootstrap: false});
@@ -40,6 +58,11 @@ try {
   });
   await page.goto(base);
   await page.getByText(card.person_name,{exact:true}).first().waitFor();
+  if (migrateLegacy) {
+    assert.equal(await page.evaluate(() => localStorage.getItem('bzcard.sessionToken')), null);
+    assert.equal(await page.evaluate(key => JSON.parse(localStorage.getItem(key)).token, sessionKey), 'user-a');
+    console.log('PASS: original deployment migrates its legacy session');
+  }
   await page.locator('.imagePanel img').waitFor();
   const oldImage = await page.locator('.imagePanel img').getAttribute('src');
   await page.getByRole('button',{name:'メニュー',exact:true}).click();
@@ -47,7 +70,7 @@ try {
   await page.getByLabel('ログインID').fill('b');
   await page.getByLabel('パスワード',{exact:true}).fill('synthetic-password');
   await page.getByRole('button',{name:'ログイン',exact:true}).click();
-  await page.waitForFunction(() => localStorage.getItem('bzcard.sessionToken') === 'user-b');
+  await page.waitForFunction(key => JSON.parse(localStorage.getItem(key)).token === 'user-b', sessionKey);
   await page.getByText('synthetic failure',{exact:false}).waitFor();
   assert.ok(bRequests > 0);
   assert.equal(await page.getByText(card.person_name,{exact:true}).count(),0);
@@ -55,12 +78,42 @@ try {
   assert.equal(await page.locator(`img[src="${oldImage}"]`).count(),0);
   console.log('PASS: account switch clears list, detail and images when the new list fails');
 
+  if (apiBase === '') {
+    await page.reload();
+    await page.getByText('synthetic failure',{exact:false}).waitFor();
+    assert.equal(await page.evaluate(key => JSON.parse(localStorage.getItem(key)).apiBase, sessionKey), '');
+    console.log('PASS: root API settings survive reload');
+  }
+
+  const sibling = await page.context().newPage();
+  await sibling.route('**/*', route => route.fulfill({contentType:'text/html',body:'<!doctype html><title>Storage test</title>'}));
+  await sibling.goto(base);
+  const requestsBefore = bRequests;
+  const unrelatedKey = sessionKey + ':another-installation';
+  const storageReceived = page.evaluate(key => new Promise(resolve => {
+    window.addEventListener('storage', function changed(event) {
+      if (event.key === key) {
+        window.removeEventListener('storage', changed);
+        resolve();
+      }
+    });
+  }), unrelatedKey);
+  await sibling.evaluate(key => localStorage.setItem(key, JSON.stringify({apiBase:'/other-api',token:'other-user'})), unrelatedKey);
+  await storageReceived;
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  assert.equal(bRequests, requestsBefore);
+  await sibling.evaluate(({key,apiBase}) => localStorage.setItem(key, JSON.stringify({apiBase,token:'user-a'})), {key:sessionKey,apiBase});
+  await page.getByText(card.person_name,{exact:true}).first().waitFor();
+  assert.equal(await page.evaluate(key => JSON.parse(localStorage.getItem(key)).token, unrelatedKey), 'other-user');
+  await sibling.close();
+  console.log('PASS: unrelated installations do not affect this tab; matching sessions synchronize');
+
   const liff = page;
-  await liff.unroute('**/bzcard-api/**');
+  await liff.unroute(apiRoute);
   await liff.addInitScript(() => { window.liff = {init:async()=>{},isLoggedIn:()=>true,getIDToken:()=> 'synthetic-id-token',getProfile:async()=>({displayName:'test'})}; });
   let reads = 0, failDetail = true;
   const allCards = Array.from({length:15},(_,i)=>({...card,id:`liff-${i}`,person_name:`名刺 ${i}`,status:'ready'}));
-  await liff.route('**/bzcard-api/**', async route => {
+  await liff.route(apiRoute, async route => {
     const url = new URL(route.request().url()); const path = url.pathname;
     if (path.endsWith('/liff-config')) return fulfill(route,{liff_id:'test'});
     if (path.endsWith('/line/auth/login')) return fulfill(route,{session_token:'line-user'});
@@ -89,4 +142,4 @@ try {
   await liff.waitForFunction(()=>document.querySelectorAll('.liffCardRow').length===1);
   console.log('PASS: LIFF shows failures, retries, follows queued→ready, returns to list, searches and shows more');
   assert.deepEqual(errors,[]);
-} finally { await browser.close(); }
+} finally { await context.close(); await browser.close(); }

@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 import './styles.css';
 import { mergeServerCard } from './cardSync';
+import { apiUrl, createSessionStore, isLiffLocation, normalizeApiBase, normalizeUiBasePath, type Session } from './deployment';
 
 type Card = {
   id: string;
@@ -63,11 +64,6 @@ type Contact = Card & {
   has_in_progress?: boolean;
 };
 
-type Session = {
-  apiBase: string;
-  token: string;
-};
-
 type RuntimeVersions = {
   llm: {
     provider?: string;
@@ -100,7 +96,9 @@ declare global {
   }
 }
 
-const defaultApiBase = import.meta.env.VITE_API_BASE_PATH || '/bzcard-api';
+const uiBasePath = normalizeUiBasePath(window.__BZCARD_CONFIG__?.uiBasePath ?? import.meta.env.BASE_URL);
+const defaultApiBase = normalizeApiBase(window.__BZCARD_CONFIG__?.apiBasePath ?? import.meta.env.VITE_API_BASE_PATH ?? '/bzcard-api');
+const sessionStore = createSessionStore(localStorage, uiBasePath, defaultApiBase, window.location.origin);
 const fields: Array<[keyof Card, string]> = [
   ['person_name', '氏名'],
   ['person_name_kana', 'かな'],
@@ -129,10 +127,7 @@ const rowBreakFieldKeys = new Set<keyof Card>(['postal_code', 'mobile', 'tel']);
 const terminalCardStatuses = new Set(['ready', 'not_card', 'error']);
 
 function loadSession(): Session {
-  return {
-    apiBase: localStorage.getItem('bzcard.apiBase') || defaultApiBase,
-    token: localStorage.getItem('bzcard.sessionToken') || '',
-  };
+  return sessionStore.load();
 }
 
 function App() {
@@ -140,7 +135,11 @@ function App() {
   const activeSession = useRef(session);
   activeSession.current = session;
   useEffect(() => {
-    const changed = () => setSession(loadSession());
+    const changed = (event: StorageEvent) => {
+      if (event.storageArea === localStorage && (event.key === null || event.key === sessionStore.key)) {
+        setSession(loadSession());
+      }
+    };
     window.addEventListener('storage', changed);
     return () => window.removeEventListener('storage', changed);
   }, []);
@@ -148,12 +147,9 @@ function App() {
   function saveSession(next: Session) {
     // An old account's outstanding callback cannot replace the new session.
     if (activeSession.current !== session) return;
-    localStorage.setItem('bzcard.apiBase', next.apiBase);
-    for (const key of ['bzcard.token', 'bzcard.lineSessionToken', 'bzcard.lineSessionExpiresAt']) localStorage.removeItem(key);
-    if (next.token) localStorage.setItem('bzcard.sessionToken', next.token);
-    else localStorage.removeItem('bzcard.sessionToken');
-    activeSession.current = next;
-    setSession(next);
+    const saved = sessionStore.save(next);
+    activeSession.current = saved;
+    setSession(saved);
   }
   return <Workspace key={`${session.apiBase}:${session.token}`} session={session} saveSession={saveSession} />;
 }
@@ -1054,7 +1050,7 @@ function UserManager({ api, onClose }: { api: ReturnType<typeof makeApi>; onClos
 }
 
 function Login({ onLoggedIn }: { onLoggedIn: (session: Session) => void }) {
-  const [apiBase, setApiBase] = useState(localStorage.getItem('bzcard.apiBase') || defaultApiBase);
+  const [apiBase, setApiBase] = useState(() => loadSession().apiBase || '/');
   const [loginId, setLoginId] = useState('');
   const [password, setPassword] = useState('');
   const [needsBootstrap, setNeedsBootstrap] = useState<boolean | null>(null);
@@ -1063,8 +1059,8 @@ function Login({ onLoggedIn }: { onLoggedIn: (session: Session) => void }) {
 
   useEffect(() => {
     let cancelled = false;
-    const base = apiBase.replace(/\/$/, '');
-    fetch(`${base}/api/auth/bootstrap-status`)
+    const base = normalizeApiBase(apiBase);
+    fetch(apiUrl(base, '/api/auth/bootstrap-status'))
       .then(async (response) => {
         if (!response.ok) throw new Error(await response.text());
         return response.json();
@@ -1082,9 +1078,9 @@ function Login({ onLoggedIn }: { onLoggedIn: (session: Session) => void }) {
     event.preventDefault();
     setBusy(true);
     setMessage('');
-    const base = apiBase.trim().replace(/\/$/, '');
+    const base = normalizeApiBase(apiBase);
     try {
-      const response = await fetch(`${base}/api/auth/${needsBootstrap ? 'bootstrap' : 'login'}`, {
+      const response = await fetch(apiUrl(base, `/api/auth/${needsBootstrap ? 'bootstrap' : 'login'}`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ login_id: loginId, password }),
@@ -1724,7 +1720,7 @@ function makeApi(session: Session) {
   };
 
   async function request(path: string, init: RequestInit = {}) {
-    const response = await fetch(`${session.apiBase}${path}`, {
+    const response = await fetch(apiUrl(session.apiBase, path), {
       ...init,
       signal: init.signal ? AbortSignal.any([init.signal, lifetime.signal]) : lifetime.signal,
       headers: {
@@ -1773,7 +1769,7 @@ function makeApi(session: Session) {
         body,
       }),
     blob: async (path: string) => {
-      const response = await fetch(`${session.apiBase}${path}`, { headers, signal: lifetime.signal });
+      const response = await fetch(apiUrl(session.apiBase, path), { headers, signal: lifetime.signal });
       if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
       return response.blob();
     },
@@ -1855,8 +1851,7 @@ function errorMessage(error: unknown) {
 }
 
 function isLiffRoute() {
-  const normalized = window.location.pathname.replace(/\/+$/, '');
-  return normalized.endsWith('/liff') || new URLSearchParams(window.location.search).get('mode') === 'liff';
+  return isLiffLocation(window.location.pathname, window.location.search, uiBasePath);
 }
 
 function getLiffTargetCardId() {
@@ -1897,7 +1892,7 @@ async function loadLiffSdk() {
 }
 
 async function getLiffConfig(connectionId: string) {
-  const response = await fetch(`${defaultApiBase}/api/line-connections/${encodeURIComponent(connectionId)}/liff-config`);
+  const response = await fetch(apiUrl(defaultApiBase, `/api/line-connections/${encodeURIComponent(connectionId)}/liff-config`));
   if (!response.ok) {
     throw new Error(formatHttpError(response, await response.text()));
   }
@@ -1905,7 +1900,7 @@ async function getLiffConfig(connectionId: string) {
 }
 
 async function postLineLogin(idToken: string, connectionId: string, linkToken: string) {
-  const response = await fetch(`${defaultApiBase}/line/auth/login`, {
+  const response = await fetch(apiUrl(defaultApiBase, '/line/auth/login'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ id_token: idToken, connection_id: connectionId, link_token: linkToken }),
@@ -1918,7 +1913,7 @@ async function postLineLogin(idToken: string, connectionId: string, linkToken: s
 }
 
 async function lineBlob(sessionToken: string, path: string) {
-  const response = await fetch(`${defaultApiBase}${path}`, {
+  const response = await fetch(apiUrl(defaultApiBase, path), {
     headers: { Authorization: `Bearer ${sessionToken}` },
   });
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);

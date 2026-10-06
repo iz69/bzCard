@@ -1,43 +1,44 @@
+# Run published application images from GHCR.
 services:
   api:
-    container_name: bzcard-api
-    build: ./api
+    image: ${BZCARD_IMAGE_PREFIX:-ghcr.io/iz69}/bzcard-api:${BZCARD_VERSION:-latest}
     ports:
-      - "127.0.0.1:18081:8000"
+      - "127.0.0.1:${API_PORT:-18081}:8000"
     restart: unless-stopped
     environment:
-      - TZ=Asia/Tokyo
-      - BASE_PATH=/bzcard-api
-      - DATA_DIR=/data
-      - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
-      - LLM_BASE_URL=${LLM_BASE_URL:-http://bzcard-ollama:11434}
-      - LLM_MODEL=${LLM_MODEL:-bzcard-lfm-jp:202606}
-      - KANA_BASE_URL=${KANA_BASE_URL:-http://bzcard-kana:8001}
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.5-flash}
-      - OCR_DEVICE=cpu
-      - OCR_RECOGNIZER_MODEL=${OCR_RECOGNIZER_MODEL:-parseq-large-v4_1}
-      - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-50}
-      - MULTI_USER_ENABLED=${MULTI_USER_ENABLED:-false}
-      # Connector credentials are saved per bzCard user in the database.
-      # Keep this key together with the database backup if you set it explicitly.
-      - LINE_CREDENTIALS_ENCRYPTION_KEY=${LINE_CREDENTIALS_ENCRYPTION_KEY:-}
-      - SESSION_TTL_HOURS=${SESSION_TTL_HOURS:-720}
+      TZ: Asia/Tokyo
+      BASE_PATH: ${API_BASE_PATH:-/bzcard-api}
+      DATA_DIR: /data
+      LLM_PROVIDER: ${LLM_PROVIDER:-ollama}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://ollama:11434}
+      LLM_MODEL: ${LLM_MODEL:-bzcard-lfm-jp:202606}
+      KANA_BASE_URL: ${KANA_BASE_URL:-http://kana:8001}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash}
+      OCR_DEVICE: cpu
+      OCR_RECOGNIZER_MODEL: ${OCR_RECOGNIZER_MODEL:-parseq-large-v4_1}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-50}
+      MULTI_USER_ENABLED: ${MULTI_USER_ENABLED:-false}
+      LINE_CREDENTIALS_ENCRYPTION_KEY: ${LINE_CREDENTIALS_ENCRYPTION_KEY:-}
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-720}
+      HF_HOME: /data/cache/huggingface
     volumes:
-      - ./data:/data
+      - ${BZCARD_DATA_DIR:-./data}:/data
     mem_limit: 3g
 
   kana:
-    container_name: bzcard-kana
-    build:
-      context: ./api
-      dockerfile: Dockerfile.kana
+    image: ${BZCARD_IMAGE_PREFIX:-ghcr.io/iz69}/bzcard-kana:${BZCARD_VERSION:-latest}
     restart: unless-stopped
     environment:
-      - TZ=Asia/Tokyo
-      - KANA_CHECKPOINT=/model/checkpoint_best.pt
+      TZ: Asia/Tokyo
+      KANA_CHECKPOINT: /model/checkpoint_best.pt
     volumes:
-      - ./data/models/kanjikana-1.9o/checkpoint_best.pt:/model/checkpoint_best.pt:ro
+      - type: bind
+        source: ${BZCARD_DATA_DIR:-./data}/models/kanjikana-1.9o/checkpoint_best.pt
+        target: /model/checkpoint_best.pt
+        read_only: true
+        bind:
+          create_host_path: false
     mem_limit: 2500m
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3)"]
@@ -46,21 +47,18 @@ services:
       retries: 3
 
   ui:
-    container_name: bzcard-ui
-    build:
-      context: ./ui
-      args:
-        VITE_BASE_PATH: /bzcard/
-        VITE_API_BASE_PATH: /bzcard-api
+    image: ${BZCARD_IMAGE_PREFIX:-ghcr.io/iz69}/bzcard-ui:${BZCARD_VERSION:-latest}
+    environment:
+      UI_BASE_PATH: ${UI_BASE_PATH:-/bzcard/}
+      API_BASE_PATH: ${API_BASE_PATH:-/bzcard-api}
     ports:
-      - "127.0.0.1:15174:5173"
+      - "127.0.0.1:${UI_PORT:-15174}:5173"
     restart: unless-stopped
     mem_limit: 128m
 
   ollama:
-    container_name: bzcard-ollama
     image: ollama/ollama:latest
     restart: unless-stopped
     volumes:
-      - ./ollama:/root/.ollama
+      - ${BZCARD_OLLAMA_DIR:-./ollama}:/root/.ollama
     mem_limit: 2g

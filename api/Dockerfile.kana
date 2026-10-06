@@ -6,6 +6,7 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.6.0+cpu
 COPY kana ./
+LABEL org.opencontainers.image.source="https://github.com/iz69/bzCard"
 
 EXPOSE 8001
 CMD ["python", "server.py"]
