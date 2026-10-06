@@ -77,7 +77,9 @@ OCRの誤読を推測で書き換えるものではない。
 APIの全テスト（本番データをマウントしない）:
 
 ```sh
-docker run --rm -v "$PWD/api:/app:ro" -w /app bzcard-api \
+docker build -t bzcard-api:distribution-test api
+docker build -f api/Dockerfile.test -t bzcard-api:test api
+docker run --rm --network none -v "$PWD/api:/app:ro" -w /app bzcard-api:test \
   python -m unittest discover -p 'test_*.py'
 ```
 

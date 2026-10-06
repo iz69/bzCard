@@ -473,10 +473,15 @@ OCR/LLM処理中の `docker stats` を見ながら調整してください。
 API回帰テスト（本番データをマウントせずに実行）:
 
 ```sh
+docker build -t bzcard-api:distribution-test api
+docker build -f api/Dockerfile.test -t bzcard-api:test api
 docker run --rm --network none -v "$PWD/api:/review:ro" -w /review \
   -e DATA_DIR=/tmp/bzcard-test -e PYTHONPATH=/review \
-  bzcard-api python -B -m unittest discover -p 'test_*.py'
+  bzcard-api:test python -B -m unittest discover -p 'test_*.py'
 ```
+
+テスト専用イメージには `requirements-test.txt` の依存を導入します。
+APIテストの実行時はネットワークを無効にします。
 
 UIの依存は固定し、Dockerビルドは `npm ci` と型検査を使います。
 

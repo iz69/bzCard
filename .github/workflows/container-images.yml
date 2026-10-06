@@ -68,9 +68,10 @@ jobs:
       - name: API regressions
         if: matrix.service == 'api'
         run: |
+          docker build -f api/Dockerfile.test -t bzcard-api:test api
           docker run --rm --network none -v "$PWD/api:/review:ro" -w /review \
             -e DATA_DIR=/tmp/bzcard-test -e PYTHONPATH=/review \
-            bzcard-api:distribution-test python -B -m unittest discover -p 'test_*.py'
+            bzcard-api:test python -B -m unittest discover -p 'test_*.py'
       - name: Kana import check
         if: matrix.service == 'kana'
         run: docker run --rm --network none bzcard-kana:distribution-test python -B -c 'import model; from pathlib import Path; compile(Path("server.py").read_text(), "server.py", "exec")'

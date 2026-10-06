@@ -1,0 +1,7 @@
+ARG API_IMAGE=bzcard-api:distribution-test
+FROM ${API_IMAGE}
+
+COPY requirements-test.txt /tmp/bzcard-requirements-test.txt
+RUN python -m pip install --no-cache-dir -r /tmp/bzcard-requirements-test.txt
+
+ENTRYPOINT []
