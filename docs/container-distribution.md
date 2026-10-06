@@ -13,8 +13,9 @@ UI・API・kanaをGitHub Container Registry（GHCR）へ配布する。
 | `ghcr.io/iz69/bzcard-kana` | 氏名読み推論のコード、PyTorch |
 
 Ollamaは `ollama/ollama` を使う。kana・Ollamaのモデル重みは、READMEの公式配布先から
-別途取得する。OCRモデルは初回利用時に取得され、配布用Composeでは
-`data/cache/huggingface` に永続化する。
+別途取得する。OCRモデルは初回利用時に取得され、データ保存先の
+`cache/huggingface` に永続化する。APIイメージ側でキャッシュの保存先を
+`/data/cache/huggingface` に固定しているため、配布用・開発用とも同じ場所を使う。
 
 ## 公開後の導入
 

@@ -22,7 +22,6 @@ services:
       MULTI_USER_ENABLED: ${MULTI_USER_ENABLED:-false}
       LINE_CREDENTIALS_ENCRYPTION_KEY: ${LINE_CREDENTIALS_ENCRYPTION_KEY:-}
       SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-720}
-      HF_HOME: /data/cache/huggingface
     volumes:
       - ${BZCARD_DATA_DIR:-./data}:/data
     mem_limit: 3g

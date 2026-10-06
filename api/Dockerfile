@@ -21,6 +21,9 @@ RUN pip install --no-cache-dir \
     torchvision==0.21.0+cpu
 RUN pip install --no-cache-dir -r requirements.txt
 
+# OCRモデルのキャッシュを永続データ領域に保存する。
+ENV HF_HOME=/data/cache/huggingface
+
 COPY src ./src
 LABEL org.opencontainers.image.source="https://github.com/iz69/bzCard"
 
