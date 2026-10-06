@@ -2,8 +2,10 @@
 import assert from 'node:assert/strict';
 import { chromium } from 'playwright-core';
 import { createSessionStore, normalizeApiBase } from '../src/deployment.ts';
+import { checkContactPagination } from './contactPagination.mjs';
 
 const base = process.env.BZCARD_TEST_UI_URL || 'http://127.0.0.1:15175/bzcard/';
+const expectedBuildVersion = process.env.BZCARD_TEST_BUILD_VERSION;
 const apiBase = normalizeApiBase(process.env.BZCARD_TEST_API_BASE_PATH ?? '/bzcard-api');
 const uiUrl = new URL(base);
 const publicApiUrl = new URL(apiBase || '/', uiUrl);
@@ -58,6 +60,10 @@ try {
   });
   await page.goto(base);
   await page.getByText(card.person_name,{exact:true}).first().waitFor();
+  if (expectedBuildVersion) {
+    assert.equal(await page.locator('.topbar .buildVersion').textContent(), expectedBuildVersion);
+    console.log('PASS: WebUI displays its built version ' + expectedBuildVersion);
+  }
   if (migrateLegacy) {
     assert.equal(await page.evaluate(() => localStorage.getItem('bzcard.sessionToken')), null);
     assert.equal(await page.evaluate(key => JSON.parse(localStorage.getItem(key)).token, sessionKey), 'user-a');
@@ -142,4 +148,5 @@ try {
   await liff.waitForFunction(()=>document.querySelectorAll('.liffCardRow').length===1);
   console.log('PASS: LIFF shows failures, retries, follows queued→ready, returns to list, searches and shows more');
   assert.deepEqual(errors,[]);
+  await checkContactPagination(browser, base, apiBase);
 } finally { await context.close(); await browser.close(); }

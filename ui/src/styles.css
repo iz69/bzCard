@@ -70,6 +70,33 @@ button {
   font-size: 22px;
 }
 
+.brandTitle {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.buildVersion {
+  color: #667085;
+  font-size: 12px;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.listLoadMore td {
+  text-align: center;
+  padding: 12px;
+}
+
+.listLoadMore button {
+  padding: 8px 16px;
+  border-radius: 6px;
+  background: #edf2f7;
+  color: #243b53;
+  cursor: pointer;
+}
+
 .topbar p {
   margin: 2px 0 0;
   color: #667085;
@@ -299,6 +326,8 @@ select {
 .tableWrap {
   flex: 1 1 auto;
   overflow: auto;
+  /* Spacer rows change during virtualization; keep the user's scroll position. */
+  overflow-anchor: none;
   min-height: 0;
 }
 

@@ -625,77 +625,41 @@ def list_user_contacts(
     status: str | None = None,
     include_cards: bool = False,
 ) -> list[dict]:
-    """List a user's cards grouped into automatically detected people.
-
-    The underlying cards remain independent records.  This presentation-level
-    grouping is deliberately computed on the server so every client applies the
-    same matching and search rules.
-    """
-    where = ["owner_user_id = ?"]
-    params: list[str] = [user_id]
-    if status:
-        where.append("status = ?")
-        params.append(status)
-    # List responses need no OCR blocks/extraction JSON or image metadata. Search
-    # adds OCR text only when needed; keep all cards for cross-card matching.
-    columns = set(CONTACT_SUMMARY_FIELDS) | {"id", "email", "mobile", "revision"}
-    if q:
-        columns.update(SEARCH_FIELDS)
-    if include_cards:
-        columns.update(CARD_FIELDS)
-    projection = "*" if include_cards else ", ".join(sorted(columns))
-    sql = "SELECT " + projection + " FROM card_records WHERE " + " AND ".join(where)
-    search = _prepare_contact_search(q)
+    """Keep the unpaged interface for LINE and existing API clients."""
+    from .contact_index import page
     with connection() as conn:
-        rows = conn.execute(sql, params).fetchall()
-        entries = []
-        for row in rows:
-            card = dict(row)
-            parts = _token_search_scores(card, search)
-            card["_token_scores"] = parts
-            score = sum(parts)
-            for field in LIST_OMITTED_FIELDS:
-                card.pop(field, None)
-            entries.append((card, score))
-    matched = set()
-    if search:
-        for group in _contact_groups([card for card, _score in entries]):
-            if all(any(card["_token_scores"][i] for card in group) for i in range(len(search))):
-                matched.update(card["id"] for card in group)
-    for card, _score in entries:
-        card.pop("_token_scores", None)
-    return _contacts_from_entries(entries, q if search else None, include_cards=include_cards, matched_groups=matched)
+        items = page(conn, user_id, q, status)['items']
+        return [_contact_detail(conn, user_id, item, status or '') for item in items] if include_cards else items
+
+
+def list_user_contacts_page(user_id: str, q=None, status=None, limit=50, cursor=None, known_revision=None):
+    from .contact_index import page
+    with connection() as conn:
+        return page(conn, user_id, q, status, limit, cursor, known_revision)
 
 
 def get_user_contact(user_id: str, contact_id: str) -> dict | None:
     """Resolve a contact by its representative card ID or any member card ID."""
     with connection() as conn:
-        # Only load identifiers to discover the connected group, then retrieve
-        # full records for that group. Never materialize every person's details.
-        identifiers = [dict(row) for row in conn.execute(
-            "SELECT id, email, mobile FROM cards WHERE owner_user_id = ?", (user_id,)
-        )]
-        members = next((group for group in _contact_groups(identifiers)
-                        if any(card["id"] == contact_id for card in group)), None)
-        if members is None:
+        # Summary and member cards must come from the same snapshot.
+        if not conn.in_transaction:
+            conn.execute('BEGIN')
+        row = conn.execute("""SELECT s.payload FROM contact_members m JOIN contact_summaries s
+            ON s.owner_user_id = m.owner_user_id AND s.scope = m.scope AND s.id = m.contact_id
+            WHERE m.owner_user_id = ? AND m.scope = '' AND m.card_id = ?""", (user_id, contact_id)).fetchone()
+        if row is None:
             return None
-        ids = [card["id"] for card in members]
-        cards = []
-        for start in range(0, len(ids), 500):
-            batch = ids[start:start + 500]
-            placeholders = ",".join("?" for _ in batch)
-            cards.extend(dict(row) for row in conn.execute(
-                f"SELECT * FROM card_records WHERE owner_user_id = ? AND id IN ({placeholders})",
-                [user_id, *batch],
-            ))
-        if not cards:
-            return None
-        for card in cards:
-            for field in LIST_OMITTED_FIELDS:
-                card.pop(field, None)
-        # Build only the requested person's response, with deterministic ordering.
-        contacts = _contacts_from_entries([(card, 0) for card in cards], None, include_cards=True)
-        return next((contact for contact in contacts if any(card["id"] == contact_id for card in contact["cards"])), None)
+        return _contact_detail(conn, user_id, json.loads(row[0]), '')
+
+
+def _contact_detail(conn, user_id, summary, scope):
+    cards = [dict(row) for row in conn.execute("""SELECT c.* FROM contact_members m JOIN card_records c ON c.id = m.card_id
+        WHERE m.owner_user_id = ? AND m.scope = ? AND m.contact_id = ? AND c.owner_user_id = ?
+        ORDER BY c.created_at DESC, c.id DESC""", (user_id, scope, summary['id'], user_id))]
+    for card in cards:
+        for field in LIST_OMITTED_FIELDS:
+            card.pop(field, None)
+    return {**cards[0], **summary, 'cards': cards} if cards else None
 
 
 def get_user_card(card_id: str, user_id: str) -> dict | None:
@@ -1015,12 +979,20 @@ def _prepare_contact_search(query: str | None) -> list[list[tuple[str, str]]]:
             for token in _query_tokens(query)]
 
 
-def _token_search_scores(card: dict, tokens: list[list[tuple[str, str]]]) -> list[int]:
+def _normalized_search_fields(card: dict) -> list[tuple[str, str, int]]:
     fields = []
     for field in SEARCH_FIELDS:
         value = _search_normalize(card.get(field))
         if value:
             fields.append((value, _remove_search_separators(value), _search_field_weight(field)))
+    return fields
+
+
+def _token_search_scores(card: dict, tokens: list[list[tuple[str, str]]]) -> list[int]:
+    return _search_field_scores(_normalized_search_fields(card), tokens) if tokens else []
+
+
+def _search_field_scores(fields, tokens: list[list[tuple[str, str]]]) -> list[int]:
     scores = []
     for variants in tokens:
         best = 0

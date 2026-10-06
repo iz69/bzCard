@@ -6,7 +6,8 @@ COPY package*.json ./
 RUN npm ci
 
 COPY . .
-RUN npm run typecheck && npm run build
+ARG BZCARD_BUILD_VERSION=dev
+RUN npm run typecheck && VITE_BUILD_VERSION="$BZCARD_BUILD_VERSION" npm run build
 
 FROM nginx:1.27-alpine
 

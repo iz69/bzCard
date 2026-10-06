@@ -119,9 +119,18 @@ def list_cards(
 def list_contacts(
     q: str | None = None,
     status: str | None = None,
+    limit: int | None = Query(None, ge=1, le=200),
+    cursor: str | None = Query(None, max_length=4096),
+    known_revision: str | None = Query(None, max_length=32),
     user: dict = Depends(require_user),
 ) -> dict:
-    return {"items": repository.list_user_contacts(user["id"], q=q, status=status)}
+    from ..services.contact_index import InvalidCursor, ChangedList
+    try:
+        return repository.list_user_contacts_page(user['id'], q, status, limit, cursor, known_revision)
+    except InvalidCursor as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except ChangedList as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 @router.get("/contacts/{contact_id}")

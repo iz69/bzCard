@@ -64,6 +64,14 @@ type Contact = Card & {
   has_in_progress?: boolean;
 };
 
+type ContactPage = {
+  items: Contact[];
+  next_cursor?: string | null;
+  revision?: string;
+  has_in_progress?: boolean;
+  unchanged?: boolean;
+};
+
 type RuntimeVersions = {
   llm: {
     provider?: string;
@@ -98,6 +106,7 @@ declare global {
 
 const uiBasePath = normalizeUiBasePath(window.__BZCARD_CONFIG__?.uiBasePath ?? import.meta.env.BASE_URL);
 const defaultApiBase = normalizeApiBase(window.__BZCARD_CONFIG__?.apiBasePath ?? import.meta.env.VITE_API_BASE_PATH ?? '/bzcard-api');
+const uiBuildVersion = import.meta.env.VITE_BUILD_VERSION || 'dev';
 const sessionStore = createSessionStore(localStorage, uiBasePath, defaultApiBase, window.location.origin);
 const fields: Array<[keyof Card, string]> = [
   ['person_name', '氏名'],
@@ -156,6 +165,11 @@ function App() {
 
 function Workspace({ session, saveSession }: { session: Session; saveSession: (next: Session) => void }) {
   const [contacts, setContacts] = useState<Contact[]>([]);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [loadMoreFailed, setLoadMoreFailed] = useState(false);
+  const [serverHasInProgress, setServerHasInProgress] = useState(false);
+  const listDataRef = useRef({items: [] as Contact[], cursor: null as string | null, revision: '', criteria: ''});
   const [selectedContactId, setSelectedContactId] = useState<string>('');
   const [selectedCardId, setSelectedCardId] = useState<string>('');
   const [selectedDetail, setSelectedDetail] = useState<Card | undefined>();
@@ -189,7 +203,7 @@ function Workspace({ session, saveSession }: { session: Session; saveSession: (n
   }, []);
 
   const authed = session.token.trim().length > 0;
-  const hasInProgressCards = contacts.some((contact) => contact.has_in_progress ?? !terminalCardStatuses.has(contact.status));
+  const hasInProgressCards = serverHasInProgress || contacts.some((contact) => contact.has_in_progress ?? !terminalCardStatuses.has(contact.status));
   const selectedContact = selectedContactId ? contacts.find((contact) => contact.id === selectedContactId) : undefined;
   const selectedRevision = selectedContact?.revision || `${selectedContact?.status}:${selectedContact?.updated_at}`;
   const selected = selectedDetail?.id === selectedCardId ? selectedDetail : undefined;
@@ -217,43 +231,69 @@ function Workspace({ session, saveSession }: { session: Session; saveSession: (n
     listControllerRef.current?.abort();
     const controller = new AbortController();
     listControllerRef.current = controller;
-    const requestId = listRequestRef.current + 1;
-    listRequestRef.current = requestId;
+    const requestId = ++listRequestRef.current;
+    const criteria = JSON.stringify([debouncedQuery, status]);
+    const previous = listDataRef.current;
+    const sameCriteria = previous.criteria === criteria;
+    const targetCount = sameCriteria ? Math.max(50, previous.items.length) : 50;
     setLoading(true);
+    setLoadingMore(false);
+    setLoadMoreFailed(false);
     try {
-      const params = new URLSearchParams();
-      if (debouncedQuery) params.set('q', debouncedQuery);
-      if (status) params.set('status', status);
-      const data = await api.get(`/api/contacts?${params.toString()}`, controller.signal);
-      if (requestId !== listRequestRef.current) return;
-      const items: Contact[] = data.items || [];
-      const selection = selectionRef.current;
-      let regrouped: Contact | undefined;
-      // Processing can merge the selected card into an existing person, whose
-      // representative ID differs. Keep that card selected when still listed.
-      if (selection.cardId && !items.some((item) => item.id === selection.contactId)) {
+      let data: ContactPage = {items: []};
+      let items: Contact[] = [];
+      // A card can finish OCR between pages. Restart a changed snapshot once.
+      for (let attempt = 0; attempt < 2; attempt++) {
         try {
-          const resolved: Contact = await api.get(`/api/contacts/${selection.cardId}`, controller.signal);
-          regrouped = items.find((item) => item.id === resolved.id);
+          const params = new URLSearchParams({limit: '50'});
+          if (debouncedQuery) params.set('q', debouncedQuery);
+          if (status) params.set('status', status);
+          if (sameCriteria && previous.revision) params.set('known_revision', previous.revision);
+          data = await api.get(`/api/contacts?${params}`, controller.signal);
+          if (requestId !== listRequestRef.current) return;
+          setServerHasInProgress(Boolean(data.has_in_progress));
+          if (data.unchanged) return;
+          items = data.items || [];
+          while (items.length < targetCount && data.next_cursor) {
+            params.delete('known_revision');
+            params.set('cursor', data.next_cursor);
+            data = await api.get(`/api/contacts?${params}`, controller.signal);
+            items.push(...(data.items || []));
+          }
+          break;
+        } catch (error) {
+          if (!(error instanceof HttpError && error.status === 409 && attempt === 0)) throw error;
+        }
+      }
+      if (requestId !== listRequestRef.current) return;
+      const selection = selectionRef.current;
+      let resolved: Contact | undefined;
+      if (sameCriteria && selection.cardId && !items.some(item => item.id === selection.contactId)) {
+        try {
+          resolved = await api.get(`/api/contacts/${selection.cardId}`, controller.signal);
         } catch (error) {
           if (controller.signal.aborted) throw error;
         }
       }
       if (requestId !== listRequestRef.current) return;
+      const cursor = data.next_cursor || null;
+      listDataRef.current = {items, cursor, revision: data.revision || '', criteria};
       setContacts(items);
+      setNextCursor(cursor);
       if (selectionRef.current.cardId === selection.cardId && selectionRef.current.contactId === selection.contactId) {
-        const retained = items.find((item) => item.id === selection.contactId) || regrouped;
+        const retained = sameCriteria
+          ? items.find(item => item.id === selection.contactId || item.id === resolved?.id) || resolved
+          : items.find(item => item.id === selection.contactId);
         const next = retained || items[0];
         setSelectedContactId(next?.id || '');
         setSelectedCardId(retained && selection.cardId ? selection.cardId : next?.representative_card_id || '');
       }
     } catch (error) {
       if (!controller.signal.aborted && requestId === listRequestRef.current) {
+        setLoadMoreFailed(true);
         const text = errorMessage(error);
         showToast(text);
-        if (text.includes('シングルユーザーモード')) {
-          saveSession({ apiBase: session.apiBase, token: '' });
-        }
+        if (text.includes('シングルユーザーモード')) saveSession({apiBase: session.apiBase, token: ''});
       }
     } finally {
       if (requestId === listRequestRef.current) {
@@ -262,6 +302,52 @@ function Workspace({ session, saveSession }: { session: Session; saveSession: (n
       }
     }
   }, [api, authed, debouncedQuery, session.apiBase, showToast, status]);
+
+  const loadMore = useCallback(async () => {
+    const previous = listDataRef.current;
+    if (!authed || !previous.cursor || listControllerRef.current
+        || previous.criteria !== JSON.stringify([debouncedQuery, status])) return;
+    const controller = new AbortController();
+    listControllerRef.current = controller;
+    const requestId = ++listRequestRef.current;
+    setLoadingMore(true);
+    setLoadMoreFailed(false);
+    try {
+      const params = new URLSearchParams({limit: '50', cursor: previous.cursor});
+      if (debouncedQuery) params.set('q', debouncedQuery);
+      if (status) params.set('status', status);
+      const data = await api.get(`/api/contacts?${params}`, controller.signal);
+      if (requestId !== listRequestRef.current) return;
+      const items = [...previous.items, ...(data.items || [])];
+      const cursor = data.next_cursor || null;
+      listDataRef.current = {items, cursor, revision: data.revision || '', criteria: previous.criteria};
+      setContacts(items);
+      setNextCursor(cursor);
+      setServerHasInProgress(Boolean(data.has_in_progress));
+    } catch (error) {
+      if (!controller.signal.aborted && requestId === listRequestRef.current) {
+        if (error instanceof HttpError && error.status === 409) {
+          await reload();
+        } else {
+          setLoadMoreFailed(true);
+          showToast(errorMessage(error));
+        }
+      }
+    } finally {
+      if (requestId === listRequestRef.current) {
+        setLoadingMore(false);
+        listControllerRef.current = null;
+      }
+    }
+  }, [api, authed, debouncedQuery, reload, showToast, status]);
+
+  useEffect(() => {
+    if (nextCursor && !loading && !loadingMore && !loadMoreFailed && listViewportHeight > 0
+        && listScrollTop + listViewportHeight >= contacts.length * listRowHeight - listOverscan * listRowHeight) {
+      void loadMore();
+    }
+  }, [contacts.length, listScrollTop, listViewportHeight, nextCursor, loading, loadingMore, loadMoreFailed, loadMore]);
+
 
   const refresh = useCallback(async () => {
     await reload();
@@ -410,7 +496,7 @@ function Workspace({ session, saveSession }: { session: Session; saveSession: (n
     <div className="appShell">
       <header className="topbar">
         <div>
-          <h1>bzCard</h1>
+          <BrandTitle />
           <p>{runtimeVersionLabel(runtimeVersions)}</p>
         </div>
         <div className="topActions">
@@ -516,6 +602,13 @@ function Workspace({ session, saveSession }: { session: Session; saveSession: (n
                     <td colSpan={6} style={{ height: trailingContacts * listRowHeight }} />
                   </tr>
                 )}
+                {nextCursor && (
+                  <tr className="listLoadMore"><td colSpan={6}>
+                    <button type="button" onClick={() => void loadMore()} disabled={loading || loadingMore}>
+                      {loadingMore ? '読み込み中…' : loadMoreFailed ? '続きを再試行' : 'さらに表示'}
+                    </button>
+                  </td></tr>
+                )}
               </tbody>
             </table>
           </div>
@@ -553,6 +646,15 @@ function Workspace({ session, saveSession }: { session: Session; saveSession: (n
       )}
       {settingsOpen && <LineSettings api={api} onClose={() => setSettingsOpen(false)} />}
       {usersOpen && <UserManager api={api} onClose={() => setUsersOpen(false)} />}
+    </div>
+  );
+}
+
+function BrandTitle({ title = 'bzCard' }: { title?: string }) {
+  return (
+    <div className="brandTitle">
+      <h1>{title}</h1>
+      <span className="buildVersion" title="WebUIのビルドバージョン">{uiBuildVersion}</span>
     </div>
   );
 }
@@ -689,7 +791,7 @@ function LiffHeader({
         {status === 'active' ? <CheckCircle2 /> : status === 'error' ? <AlertCircle /> : <ShieldCheck />}
       </div>
       <div>
-        <h1>{title}</h1>
+        <BrandTitle title={title} />
         <p>{subtitle}</p>
       </div>
     </div>
@@ -1099,7 +1201,7 @@ function Login({ onLoggedIn }: { onLoggedIn: (session: Session) => void }) {
   return (
     <main className="login">
       <form onSubmit={submit}>
-        <h1>bzCard</h1>
+        <BrandTitle />
         <p>{needsBootstrap ? '最初の管理者アカウントを作成します。既存の名刺はこのアカウントに移行されます。' : 'ログインしてください。'}</p>
         <label>API URL<input value={apiBase} onChange={(event) => setApiBase(event.target.value)} required /></label>
         <label>ログインID<input value={loginId} onChange={(event) => setLoginId(event.target.value)} autoComplete="username" required /></label>
@@ -1713,6 +1815,12 @@ function StatusBadge({ status }: { status: string }) {
   return <span className={`status status-${status}`}>{status}</span>;
 }
 
+class HttpError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
 function makeApi(session: Session) {
   const lifetime = new AbortController();
   const headers = {
@@ -1730,7 +1838,7 @@ function makeApi(session: Session) {
     });
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(formatHttpError(response, text));
+      throw new HttpError(response.status, formatHttpError(response, text));
     }
     if (response.status === 204) return null;
     return response.json();

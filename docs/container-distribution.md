@@ -20,29 +20,33 @@ Ollamaは `ollama/ollama` を使う。kana・Ollamaのモデル重みは、READM
 
 DockerとDocker Composeを用意し、公開バージョンの `docker-compose.yml` と
 `.env.example` を同じディレクトリへ置く。リポジトリ全体やGitは不要。
-以下の `0.1.0` は公開済みのバージョンに置き換える。
+以下の `0.9.1` は取得するComposeファイルの公開バージョンに置き換える。
 
 ```sh
 mkdir bzcard
 cd bzcard
-BZCARD_RELEASE_VERSION=0.1.0
+BZCARD_RELEASE_VERSION=0.9.1
 curl -fL "https://raw.githubusercontent.com/iz69/bzCard/v${BZCARD_RELEASE_VERSION}/docker-compose.yml" -o docker-compose.yml
 curl -fL "https://raw.githubusercontent.com/iz69/bzCard/v${BZCARD_RELEASE_VERSION}/.env.example" -o .env.example
 cp .env.example .env
 ```
 
-`.env` に同じイメージバージョンと公開パスを設定する。
+`.env` に公開パスとデータ保存先を設定する。
 
 ```env
-BZCARD_IMAGE_PREFIX=ghcr.io/iz69
-BZCARD_VERSION=0.1.0
 UI_BASE_PATH=/bzcard/
 API_BASE_PATH=/bzcard-api
-UI_PORT=15174
-API_PORT=18081
 BZCARD_DATA_DIR=./data
 BZCARD_OLLAMA_DIR=./ollama
 ```
+
+イメージの配布先・タグとホスト側ポートは `docker-compose.yml` に直接記載する。
+既定ではUI・API・kanaそれぞれの `latest` を使用し、WebUIは15174番、APIは18081番で公開する。
+バージョンを固定する場合は、対象サービスの `image` を
+`ghcr.io/iz69/bzcard-api:0.9.1` のように変更する。サービスごとに異なるバージョンも指定できる。
+
+コンテナ名は開発用と同じ `bzcard-api`・`bzcard-ui`・`bzcard-kana`・`bzcard-ollama` に固定する。
+同じホストに複数配置する場合は、`container_name` とホスト側ポートを配置ごとに変更する。
 
 標準のComposeファイルでイメージを取得し、モデルの準備をする。
 
@@ -115,7 +119,9 @@ LIFFページは `<UI_BASE_PATH>liff`。UIの公開パスや初期API接続先�
 
 ## 更新と既存配置からの移行
 
-`.env` の `BZCARD_VERSION` を公開済みの更新先バージョンに変更して取得する。
+`latest` を使う場合は、そのまま最新イメージを取得する。
+バージョンを固定している場合は、`docker-compose.yml` の対象サービスの `image` タグを
+公開済みの更新先バージョンに変更して取得する。
 
 ```sh
 docker compose pull
@@ -150,6 +156,10 @@ git push origin v0.1.0
 
 `v0.1.0` はイメージの `0.1.0` タグになる。安定版には `latest`、
 コミット識別用には `sha-...` も付く。プレリリースは `latest` を更新しない。
+WebUIには公開時のGitタグをビルド時に埋め込み、タイトル右側に表示する。
+`latest` で起動しても実際のリリースタグを確認できる。
+ローカルビルドでは既定で `dev` を表示し、独自の表示を指定する場合は
+ビルド引数 `BZCARD_BUILD_VERSION` を渡す。
 初回公開後は、GitHubのPackages設定で3パッケージのVisibilityを `Public` に変更する。
 これで利用者はGHCRにログインせずpullできる。
 
@@ -169,6 +179,7 @@ nginxは正規表現のrewriteへサブパスを埋め込まず、ファイル�
 - HTML・設定JS・JS/CSS・アイコン・LIFFページの取得とキャッシュ指定
 - 末尾スラッシュの補完、存在しないアセットの404、再起動後の設定
 - ログイン移行、ユーザー切替、配置ごとのセッション、ルートAPI、LIFFの操作
+- 人物一覧の50件ずつの取得、全件検索、スクロール、取得失敗時の再試行と編集の保持
 - 配置ごとにJS/CSSの内容とDockerイメージIDが同一であること
 
 ブラウザでのAPI応答は架空のデータを使う。

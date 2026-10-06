@@ -42,7 +42,12 @@ def backup_before_local_auth() -> Path:
 def connection() -> Iterator[sqlite3.Connection]:
     conn = get_connection()
     try:
+        from .services.contact_index import refresh
+        # Also repair changes committed by import tools using raw SQLite.
+        if refresh(conn):
+            conn.commit()
         yield conn
+        refresh(conn)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -290,6 +295,8 @@ def _init_db_locked() -> None:
             END
             WHERE status IN ('preprocessing', 'ocr_processing')"""
         )
+        from .services.contact_index import initialize
+        initialize(conn)
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
