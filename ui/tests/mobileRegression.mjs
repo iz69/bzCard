@@ -169,9 +169,12 @@ export async function checkMobileRegression(browser, base, configuredApiBase) {
     state.failCursor=true;
     await viewport.evaluate(element=>{element.scrollTop=element.scrollHeight;});
     await page.getByText('追加取得失敗',{exact:false}).waitFor();
-    const failedCount=requests.length;
+    // Thumbnails can finish loading after the error is rendered. Only count
+    // pagination requests when checking that a failed page is not retried.
+    const paginationRequests=()=>requests.filter(request=>request.method==='GET'&&request.path==='/api/contacts'&&request.params.cursor).length;
+    const failedCount=paginationRequests();
     await page.waitForTimeout(200);
-    assert.equal(requests.length,failedCount,'failed pagination must not loop');
+    assert.equal(paginationRequests(),failedCount,'failed pagination must not loop');
     await page.getByRole('button',{name:'続きを再試行',exact:true}).click();
     await page.getByText('モバイル修正',{exact:true}).waitFor();
     await page.getByRole('button',{name:'追加',exact:true}).click();
