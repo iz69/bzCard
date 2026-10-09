@@ -23,6 +23,20 @@
 - `kana`: 氏名の読みを推論するローカルPyTorchサービス（1.9o）
 - `data/`: SQLite DBとアップロード画像の永続化ディレクトリ
 
+WebUIのソースは次の構成です。
+
+- `ui/src/app/`: 起動時のPC・スマートフォン判定、LIFF優先の画面選択、セッション同期
+- `ui/src/desktop/`: 従来のPC用画面。人物の自動選択、仮想テーブル、ページ取得処理を維持
+- `ui/src/mobile/`: 一覧・詳細・追加・設定、モバイル用のページ取得・編集・画面遷移
+- `ui/src/liff/`: 従来のLINE認証・LIFF画面
+- `ui/src/shared/`: 共通のAPI通信、型、編集項目、認証画面、画像、タグ、設定ダイアログ、補正履歴
+
+PC・LIFFの既存CSSは `ui/src/styles.css`、モバイルCSSは `ui/src/mobile/mobile.module.css` に置きます。
+モバイルのスタイルはモバイルのルート内に限定し、PC版のCSSを変更せずに調整できます。
+端末判定は起動時に固定し、PCの狭いウィンドウ・タッチ対応PC・タブレットをPC版として扱います。
+モバイルの画面遷移には同じURLの `history.state` を使い、再ログイン時には遷移の範囲を作り直します。
+認証・API・公開パス・保存済みセッションの形式は共通です。各画面は遅延読み込みします。
+
 ローカル確認用ポート:
 
 - WebUI: `http://localhost:15174/bzcard/`
@@ -163,6 +177,12 @@ BZCARD_TEST_API_BASE_PATH=/bzcard-api \
 BROWSER_EXECUTABLE=/path/to/chromium npm run test:browser
 cd ..
 ```
+
+`test:browser` はPC・LIFF・モバイルの回帰テストを実行します。
+モバイルだけを検証する場合は、同じ環境変数で `npm run test:mobile` を実行してください。
+モバイルの検証にはページ追加取得・409からの復旧・検索・処理完了への追従・未保存編集・
+保存中の追加入力・戻る操作・画面回転・画像登録・裏面追加・回転・再解析・設定・利用者切替を含みます。
+撮影ボタンの属性と登録通信は検証しますが、カメラの起動や実際の撮影は実機確認が必要です。
 
 同じDockerイメージを6種類の公開パスで検証する場合:
 

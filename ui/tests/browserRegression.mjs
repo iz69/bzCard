@@ -3,9 +3,11 @@ import assert from 'node:assert/strict';
 import { chromium } from 'playwright-core';
 import { createSessionStore, normalizeApiBase } from '../src/deployment.ts';
 import { checkContactPagination } from './contactPagination.mjs';
+import { checkMobileRegression } from './mobileRegression.mjs';
 
 const base = process.env.BZCARD_TEST_UI_URL || 'http://127.0.0.1:15175/bzcard/';
 const expectedBuildVersion = process.env.BZCARD_TEST_BUILD_VERSION;
+const expectedBuildLabel = expectedBuildVersion || 'dev';
 const apiBase = normalizeApiBase(process.env.BZCARD_TEST_API_BASE_PATH ?? '/bzcard-api');
 const uiUrl = new URL(base);
 const publicApiUrl = new URL(apiBase || '/', uiUrl);
@@ -40,13 +42,14 @@ try {
     }
   }, {key:sessionKey,apiBase,legacy:migrateLegacy});
   let bRequests = 0;
+  let versionsReply = {api:{version:'v0.9.3'},ocr:{},llm:{}};
   await page.route(apiRoute, async route => {
     const path = new URL(route.request().url()).pathname;
     const userB = route.request().headers().authorization === 'Bearer user-b';
     if (path.endsWith('/bootstrap-status')) return fulfill(route, {needs_bootstrap: false});
     if (path.endsWith('/login')) return fulfill(route, {session_token: 'user-b'});
     if (path.endsWith('/auth/me')) return fulfill(route, {user: {login_id: userB ? 'b':'a', role:'user'}, multi_user_enabled: true});
-    if (path.endsWith('/versions')) return fulfill(route, {ocr:{},llm:{}});
+    if (path.endsWith('/versions')) return fulfill(route, versionsReply);
     if (path.endsWith('/logout')) return fulfill(route, {});
     if (path.endsWith('/contacts')) {
       if (userB) { bRequests++; return fulfill(route, {detail:'synthetic failure'}, 503); }
@@ -60,15 +63,24 @@ try {
   });
   await page.goto(base);
   await page.getByText(card.person_name,{exact:true}).first().waitFor();
-  if (expectedBuildVersion) {
-    assert.equal(await page.locator('.topbar .buildVersion').textContent(), expectedBuildVersion);
-    console.log('PASS: WebUI displays its built version ' + expectedBuildVersion);
-  }
+  assert.equal(await page.locator('.topbar .uiBuildVersion').textContent(), 'WebUI ' + expectedBuildLabel);
+  await page.locator('.topbar .apiBuildVersion').filter({hasText:'API v0.9.3'}).waitFor();
+  console.log('PASS: WebUI and API display their own build versions');
   if (migrateLegacy) {
     assert.equal(await page.evaluate(() => localStorage.getItem('bzcard.sessionToken')), null);
     assert.equal(await page.evaluate(key => JSON.parse(localStorage.getItem(key)).token, sessionKey), 'user-a');
     console.log('PASS: original deployment migrates its legacy session');
   }
+  versionsReply = {ocr:{},llm:{}};
+  await page.reload();
+  await page.locator('.topbar .apiBuildVersion').filter({hasText:'API 不明'}).waitFor();
+  await page.getByText(card.person_name,{exact:true}).first().waitFor();
+  versionsReply = {api:{version:'dev'},ocr:{},llm:{}};
+  await page.reload();
+  await page.locator('.topbar .apiBuildVersion').filter({hasText:'API dev'}).waitFor();
+  assert.equal(await page.locator('.topbar .buildVersion').textContent(), `WebUI ${expectedBuildLabel} / API dev`);
+  await page.getByText(card.person_name,{exact:true}).first().waitFor();
+  console.log('PASS: development API builds and older APIs without version metadata remain usable');
   await page.locator('.imagePanel img').waitFor();
   const oldImage = await page.locator('.imagePanel img').getAttribute('src');
   await page.getByRole('button',{name:'メニュー',exact:true}).click();
@@ -149,4 +161,5 @@ try {
   console.log('PASS: LIFF shows failures, retries, follows queued→ready, returns to list, searches and shows more');
   assert.deepEqual(errors,[]);
   await checkContactPagination(browser, base, apiBase);
+  await checkMobileRegression(browser, base, apiBase);
 } finally { await context.close(); await browser.close(); }

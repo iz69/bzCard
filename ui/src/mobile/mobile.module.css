@@ -1,0 +1,150 @@
+.root {
+  height: 100dvh;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  color: #243b53;
+  background: #f4f6f8;
+  font-size: 16px;
+}
+
+.root button, .root input, .root select, .root textarea { font: inherit; }
+.root button { cursor: pointer; }
+.root button:disabled { opacity: .5; cursor: default; }
+.root button:focus-visible, .root input:focus-visible, .root select:focus-visible, .root textarea:focus-visible, .root summary:focus-visible { outline: 2px solid #2264a8; outline-offset: 2px; }
+.root svg { width: 22px; height: 22px; flex-shrink: 0; }
+.root input, .root select, .root textarea { min-width: 0; color: #243b53; }
+.root h2 { margin: 0 0 16px; font-size: 22px; overflow-wrap: anywhere; }
+.root h3 { font-size: 17px; }
+
+.header {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 60px;
+  padding: calc(8px + env(safe-area-inset-top)) 12px 8px;
+  border-bottom: 1px solid #d8dee6;
+  background: white;
+}
+.header h1 { flex: 1; margin: 0; font-size: 21px; }
+.header h1 small { color: #667085; font-size: 12px; font-weight: 400; }
+.header button, .zoomHeader button { min-width: 44px; min-height: 44px; border-radius: 8px; background: #eef2f6; display: inline-flex; align-items: center; justify-content: center; }
+.main { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+.nav { flex-shrink: 0; display: grid; grid-template-columns: repeat(3, 1fr); padding: 4px 8px calc(4px + env(safe-area-inset-bottom)); border-top: 1px solid #d8dee6; background: white; }
+.nav button { min-height: 56px; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 3px; color: #667085; background: transparent; border-radius: 8px; font-size: 12px; }
+.nav button[aria-current] { background: #edf4fb; color: #2264a8; font-weight: 700; }
+
+.listPage { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.listPage[hidden] { display: none; }
+.filters { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; column-gap: 8px; row-gap: 6px; padding: 12px; border-bottom: 1px solid #e4e8ee; background: white; }
+.search { display: flex; align-items: center; gap: 8px; min-width: 0; height: 44px; padding: 0 12px; border: 1px solid #c8d2df; border-radius: 9px; background: #f8fafc; }
+.search input { width: 100%; height: 100%; min-height: 0; border: 0; background: transparent; outline-offset: -2px; }
+.filters select, .tools select { min-height: 44px; max-width: 70%; height: auto; border: 1px solid #c8d2df; border-radius: 8px; padding: 8px; background: white; }
+.filters select { width: 136px; max-width: none; height: 44px; }
+.count { grid-column: 1 / -1; justify-self: end; font-size: 13px; color: #667085; }
+.contactViewport { flex: 1; min-height: 0; overflow: auto; overflow-anchor: none; overscroll-behavior-y: contain; }
+.contactItem { height: var(--contact-row-height); padding: 3px 10px; }
+.contactRow { width: 100%; height: 100%; display: grid; grid-template-columns: 56px minmax(0, 1fr) auto; column-gap: 16px; align-items: center; border: 1px solid #e4e8ee; border-radius: 10px; padding: 6px 10px; background: white; color: #243b53; text-align: left; }
+.contactText { min-width: 0; display: flex; flex-direction: column; gap: 2px; line-height: 1.35; }
+.contactText > strong, .contactText > span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.contactText > strong { font-size: 16px; }
+.contactText > span { font-size: 13px; color: #667085; }
+.contactText :global(.tagList) { max-height: 20px; flex-wrap: nowrap; overflow: hidden; white-space: nowrap; }
+.contactText :global(.tagPill) { display: block; min-height: 20px; max-width: 110px; flex: 0 0 auto; padding: 1px 8px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 11px; }
+.contactMeta { display: flex; align-items: flex-end; flex-direction: column; gap: 4px; }
+.contactMeta small { color: #667085; font-size: 12px; }
+.status { display: inline-block; white-space: nowrap; font-size: 11px; padding: 3px 7px; border-radius: 6px; }
+.ready { color: #17663a; background: #e7f4ec; }
+.failed { color: #b42318; background: #fff0ed; }
+.processing { color: #8a5800; background: #fff5d6; }
+.loadMore { display: block; min-height: 44px; margin: 12px auto; padding: 8px 20px; border-radius: 8px; background: #e3edf7; color: #2264a8; }
+.empty { min-height: 150px; padding: 28px 20px; color: #667085; display: flex; align-items: center; justify-content: center; gap: 8px; text-align: center; }
+.error { margin: 12px; border: 1px solid #ffc9c0; border-radius: 8px; padding: 12px; color: #9f1f17; background: #fff4f2; overflow-wrap: anywhere; }
+.error p { margin: 0 0 8px; }
+.error button { min-height: 44px; padding: 8px 16px; border-radius: 8px; background: white; color: inherit; }
+.page { flex: 1; min-height: 0; padding: 20px 16px; overflow: auto; overscroll-behavior-y: contain; }
+.help { margin: 12px 0 20px; color: #667085; font-size: 14px; line-height: 1.7; }
+.inlineStatus { display: flex; align-items: center; gap: 8px; }
+
+.uploadChoices { display: grid; gap: 12px; }
+.uploadChoice { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; min-height: 140px; padding: 20px; border: 1px solid #c8d2df; border-radius: 12px; background: white; color: #2264a8; cursor: pointer; }
+.uploadChoice svg { width: 30px; height: 30px; }
+.uploadChoice span { font-size: 13px; color: #667085; }
+.uploadChoice input, .backChoices input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
+.uploadChoice:has(input:disabled), .backChoices label:has(input:disabled) { opacity: .5; }
+.uploadChoice:focus-within, .backChoices label:focus-within { outline: 2px solid #2264a8; outline-offset: 2px; }
+.uploadResults { margin: 16px 0; padding: 0; list-style: none; }
+.uploadResults li { padding: 12px; margin: 8px 0; border-radius: 8px; background: white; overflow-wrap: anywhere; }
+
+.account { padding: 16px; border: 1px solid #e4e8ee; border-radius: 10px; background: white; overflow-wrap: anywhere; font-weight: 700; }
+.account small { display: block; margin-top: 4px; font-size: 13px; font-weight: 400; color: #667085; }
+.settingsList { display: grid; gap: 10px; }
+.settingsList button { display: flex; align-items: center; gap: 12px; min-height: 56px; padding: 12px 16px; border: 1px solid #e4e8ee; border-radius: 9px; background: white; color: #243b53; text-align: left; }
+
+.detailPage { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.detailScroll { flex: 1; min-height: 0; padding: 16px 12px 24px; overflow: auto; overscroll-behavior-y: contain; }
+.detailTitle { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 14px; }
+.detailTitle h2 { flex: 1; margin: 0; }
+.imagePanel { border: 1px solid #d8dee6; border-radius: 10px; background: white; overflow: hidden; }
+.imageControls { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px; }
+.imageControls button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 44px; padding: 8px 12px; border-radius: 7px; color: #243b53; background: #eef2f6; font-size: 14px; }
+.imageControls button[aria-pressed="true"] { background: #2264a8; color: white; }
+.imageButton { display: block; width: 100%; min-height: 150px; padding: 0; background: #e9edf2; }
+.imageButton img { display: block; width: 100%; max-height: 260px; object-fit: contain; }
+.backChoices { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 8px; }
+.backChoices label { position: relative; display: flex; align-items: center; justify-content: center; min-height: 44px; border: 1px solid #c8d2df; border-radius: 8px; background: white; font-size: 13px; color: #2264a8; }
+.form { display: grid; gap: 14px; margin: 20px 0; }
+.form > label { display: grid; gap: 6px; color: #52606d; font-size: 14px; }
+.form > label > input, .form textarea { width: 100%; min-height: 46px; padding: 10px 12px; border: 1px solid #c8d2df; border-radius: 8px; background: white; font-size: 16px; }
+.form textarea { min-height: 100px; resize: vertical; }
+.fieldLabel { display: flex; align-items: center; justify-content: space-between; }
+.fieldLabel button { display: inline-flex; align-items: center; justify-content: center; gap: 4px; min-height: 44px; padding: 8px 12px; border-radius: 8px; background: #e3edf7; color: #2264a8; }
+.form :global(.tagsInput) { min-height: 46px; border-radius: 8px; padding: 4px 8px; }
+.form :global(.tagsInput) input { min-height: 40px; font-size: 16px; }
+.form :global(.tagPillEditable) { min-height: 40px; font-size: 14px; }
+.form :global(.tagPill) button { width: 40px; height: 40px; }
+.related { margin: 20px 0; }
+.related button { display: flex; flex-direction: column; gap: 4px; width: 100%; min-height: 70px; padding: 12px; margin: 8px 0; border-radius: 9px; border: 1px solid #d8dee6; background: white; color: #243b53; text-align: left; overflow-wrap: anywhere; }
+.related button span, .related button small { color: #667085; font-size: 13px; }
+.tools { padding: 12px; border: 1px solid #d8dee6; border-radius: 8px; background: white; }
+.tools summary { display: flex; align-items: center; min-height: 44px; cursor: pointer; font-weight: 700; }
+.tools label { display: flex; align-items: center; gap: 8px; }
+.tools pre { min-height: 80px; font-size: 12px; }
+.timestamps { color: #667085; font-size: 12px; }
+.delete { display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; min-height: 48px; padding: 12px; border: 1px solid #ffc9c0; border-radius: 8px; color: #b42318; background: #fff4f2; }
+.saveBar { flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px calc(10px + env(safe-area-inset-bottom)); border-top: 1px solid #d8dee6; background: white; }
+.saveBar > span { color: #667085; font-size: 12px; }
+.primary { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 46px; min-width: 112px; padding: 10px 20px; border-radius: 8px; color: white; background: #2264a8; font-weight: 700; }
+.zoom { position: fixed; inset: 0; z-index: 50; padding: env(safe-area-inset-top) 12px env(safe-area-inset-bottom); display: flex; flex-direction: column; background: #111827; color: white; overflow: auto; }
+.zoomHeader { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0; }
+.zoomHeader button { padding: 8px 12px; }
+.zoom > img { flex: 1; min-height: 0; width: 100%; object-fit: contain; }
+.toast { position: fixed; left: 12px; right: 12px; bottom: calc(80px + env(safe-area-inset-bottom)); z-index: 60; display: flex; align-items: flex-start; gap: 8px; padding: 12px; border: 1px solid #c8d2df; border-radius: 10px; color: #243b53; background: white; box-shadow: 0 8px 24px rgb(15 23 42 / .2); }
+.toast span { flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; }
+.toast button { min-width: 44px; min-height: 44px; border-radius: 8px; background: #eef2f6; }
+
+/* Overrides apply only inside the mobile root. The existing desktop/LIFF
+   stylesheet and selectors remain unchanged. */
+.root:has(:global(.login)) { overflow: auto; }
+.root :global(.login) { flex: 1; min-height: 100%; padding: 16px; }
+.root :global(.login) input { min-height: 46px; font-size: 16px; }
+.root :global(.login) button { min-height: 46px; }
+.root :global(.imageModalBackdrop) { padding: calc(12px + env(safe-area-inset-top)) 12px calc(12px + env(safe-area-inset-bottom)); }
+.root :global(.compactModal) { width: 100%; max-width: 560px; max-height: 100%; }
+.root :global(.compactModal) input { min-height: 46px; font-size: 16px; }
+.root :global(.compactModal) button { min-height: 44px; }
+.root :global(.imageModalHeader) > button { min-width: 44px; }
+.root :global(.userManagerList) li { align-items: flex-start; flex-direction: column; }
+.root :global(.userManagerActions) { flex-wrap: wrap; }
+.root :global(.correctionHistory) { background: white; margin: 16px 0; }
+.root :global(.correctionHistory) summary { min-height: 44px; display: flex; align-items: center; }
+.root :global(.correctionRow) label { display: flex; align-items: center; gap: 8px; min-height: 44px; }
+.root :global(.correctionRow) input[type="checkbox"] { width: 24px; height: 24px; flex-shrink: 0; }
+
+@media (min-width: 600px) {
+  .filters, .page, .detailScroll { padding-left: max(16px, calc((100% - 640px) / 2)); padding-right: max(16px, calc((100% - 640px) / 2)); }
+  .contactItem { max-width: 660px; margin: 0 auto; }
+  .uploadChoices { grid-template-columns: 1fr 1fr; }
+}

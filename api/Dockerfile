@@ -25,6 +25,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 ENV HF_HOME=/data/cache/huggingface
 
 COPY src ./src
+ARG BZCARD_BUILD_VERSION=dev
+ENV BZCARD_BUILD_VERSION=${BZCARD_BUILD_VERSION}
 LABEL org.opencontainers.image.source="https://github.com/iz69/bzCard"
 
 EXPOSE 8000

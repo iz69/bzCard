@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from fastapi import APIRouter, Depends
 
 from ..auth import require_user
@@ -11,8 +13,9 @@ router = APIRouter(prefix="/api/system", dependencies=[Depends(require_user)])
 
 @router.get("/versions")
 def get_runtime_versions() -> dict:
-    """Return the OCR, LLM, and name-reading models used for card processing."""
+    """Return the API build version and the models used for card processing."""
     return {
+        "api": {"version": os.getenv("BZCARD_BUILD_VERSION", "dev").strip() or "dev"},
         "ocr": {
             "engine": "yomitoku",
             "version": _package_version("yomitoku"),

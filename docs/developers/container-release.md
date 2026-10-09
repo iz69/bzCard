@@ -65,10 +65,16 @@ gh workflow run container-images.yml --ref v0.9.4 -f force_images=api
 既に公開済みの同じバージョンは再ビルドしないため、必ず新しいバージョンを使う。
 mainへのpushやmainを対象にした手動実行では検証だけを行い、イメージは公開しない。
 
-WebUIには公開時のGitタグをビルド時に埋め込み、タイトル右側に表示する。
+WebUIとAPIには、それぞれ公開時のGitタグをビルド引数 `BZCARD_BUILD_VERSION` で渡す。
+UIは `VITE_BUILD_VERSION` としてコンパイル済みJavaScriptへ埋め込み、APIはイメージ内の
+環境変数 `BZCARD_BUILD_VERSION` に保存する。バージョン専用ファイルの更新や、実行時のGitHubへの問い合わせは行わない。
+PC版のタイトル右側には `WebUI v0.9.2 / API v0.9.3` のように両方を表示する。
+API側は認証付きの `GET /api/system/versions` の `api.version` から取得する。
+イメージごとに変更のあるときだけ公開するため、UIとAPIのバージョンは一致するとは限らない。
 `latest` で起動しても実際のリリースタグを確認できる。
-ローカルビルドでは既定で `dev` を表示し、独自の表示を指定する場合は
-ビルド引数 `BZCARD_BUILD_VERSION` を渡す。
+ローカルビルドでは `WebUI dev / API dev` と表示する。
+独自のバージョンを指定する場合は各イメージのビルド引数 `BZCARD_BUILD_VERSION` を渡す。
+旧APIイメージなどで `api.version` が取得できない場合は `API 不明` と表示する。
 初回公開後は、GitHubのPackages設定で3パッケージのVisibilityを `Public` に変更する。
 これで利用者はGHCRにログインせずpullできる。
 

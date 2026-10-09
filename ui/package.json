@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
     "test:browser": "node --experimental-strip-types tests/browserRegression.mjs",
+    "test:mobile": "node --experimental-strip-types tests/mobileRegression.mjs",
     "test:runtime": "python3 -B -m unittest discover -s tests -p 'test_runtime_*.py'",
     "test:container": "node --experimental-strip-types tests/containerRegression.mjs"
   },

@@ -29,6 +29,8 @@ curl -H "Authorization: Bearer ${BZCARD_SESSION_TOKEN}" \
   "http://localhost:18081/api/system/versions"
 ```
 
+レスポンスの `api.version` はAPIイメージにビルド時に設定したリリースタグ（例: `v0.9.3`）で、
+ローカル開発ビルドでは `dev` です。既存のOCR/LLM/kana情報に追加した項目で、認証方式は同じです。
 レスポンスにはOCRエンジンの導入済みバージョン、認識モデル・デバイス、
 LLMプロバイダーとモデル名を含みます。Ollama利用時は、Ollamaサーバー版、モデルの
 digest、パラメーター数・量子化方式などのモデル詳細も返します。Ollamaが停止中の場合も
