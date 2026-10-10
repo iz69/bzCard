@@ -4,7 +4,6 @@ import {
   CheckCircle2,
   Loader2,
   Save,
-  Search,
   ShieldCheck,
 } from 'lucide-react';
 import { apiUrl } from '../deployment';
@@ -18,6 +17,7 @@ import { BrandTitle } from '../shared/components/BrandTitle';
 import { TagsInput, TagList } from '../shared/components/Tags';
 import { StatusBadge } from '../shared/components/StatusBadge';
 import { CorrectionHistory } from '../shared/components/CorrectionHistory';
+import { SearchInput } from '../shared/components/SearchInput';
 
 type LiffProfile = {
   displayName?: string;
@@ -196,7 +196,7 @@ function LiffCardList({ sessionToken }: { sessionToken: string }) {
   }, [api, query, refresh]);
   if (selectedCardId) return <LiffCardDetail key={selectedCardId} cardId={selectedCardId} sessionToken={sessionToken} onBack={() => { setSelectedCardId(''); setRefresh((r) => r + 1); }} />;
   return <div className="liffCards">
-    <label className="searchBox"><Search size={16} /><input value={query} placeholder="氏名・会社名を検索" onChange={(e) => { setQuery(e.target.value); setLimit(12); }} /></label>
+    <SearchInput value={query} placeholder="氏名・会社名を検索" onChange={value => { setQuery(value); setLimit(12); }} />
     {loading && <div className="liffStatus"><Loader2 className="spin" />読み込み中</div>}
     {message && <div className="liffError"><p>{message}</p><button onClick={() => setRefresh((r) => r + 1)}>再試行</button></div>}
     {!loading && !message && !cards.length && <p>{query ? '一致する名刺はありません。' : '公式LINEのトーク画面から名刺画像を送ってください。'}</p>}

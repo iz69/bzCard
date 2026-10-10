@@ -1,0 +1,89 @@
+@page {
+  size: A4 portrait;
+  margin: 10mm;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: #fff;
+  color: #111;
+  font-family: "Noto Sans CJK JP", "Noto Sans JP", "Yu Gothic", Meiryo, sans-serif;
+}
+
+body { width: 190mm; }
+
+.printRecord {
+  width: 190mm;
+  height: 90mm;
+  padding: 4mm;
+  border: .25mm solid #111;
+  display: grid;
+  grid-template-columns: 67mm minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto;
+  column-gap: 4mm;
+  row-gap: 2.5mm;
+  font-size: 10pt;
+  line-height: 1.4;
+  break-inside: avoid;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+.printRecord + .printRecord { margin-top: 3mm; }
+
+.printImages {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2mm;
+  min-height: 0;
+}
+
+.printImageSide { width: 100%; flex: 0 0 auto; }
+.printImageLabel { font-size: 7.5pt; color: #555; margin-bottom: .6mm; }
+.printImageSide img {
+  display: block;
+  width: 65mm;
+  height: auto;
+  max-height: 56mm;
+  margin: 0 auto;
+  object-fit: contain;
+}
+
+.printInformation { min-width: 0; min-height: 0; }
+.printNameRow { display: flex; flex-wrap: wrap; align-items: baseline; gap: 1mm 4mm; padding-bottom: 1mm; }
+.printPersonName { font-size: 16pt; font-weight: 700; line-height: 1.2; overflow-wrap: anywhere; }
+.printKana { font-size: 8.5pt; color: #555; overflow-wrap: anywhere; }
+.printCompany { font-size: 11pt; font-weight: 700; margin-top: 1mm; overflow-wrap: anywhere; }
+.printRole { margin-top: .5mm; overflow-wrap: anywhere; }
+.printContacts {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 1.7mm 3mm;
+  margin-top: 2.7mm;
+  padding-top: 2.5mm;
+  border-top: .15mm solid #aaa;
+}
+.printContacts:empty { display: none; }
+.printField { display: flex; gap: 2mm; min-width: 0; align-items: baseline; }
+.printFieldWide { grid-column: 1 / -1; }
+.printLabel { flex: 0 0 9.5mm; font-size: 8pt; color: #555; }
+.printValue { min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.printNotes {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 1.5mm;
+  padding-top: 2mm;
+  border-top: .15mm solid #aaa;
+}
+.printNotes .printLabel { flex-basis: 12mm; }
+
+.printRecordCompact { font-size: 9pt; }
+.printRecordCompact .printPersonName { font-size: 14pt; }
+.printRecordCompact .printCompany { font-size: 10pt; }
+.printRecordCompact .printContacts { gap: 1mm 3mm; margin-top: 2mm; padding-top: 2mm; }
+.printRecordCompact .printNotes { gap: 1mm; }
+.printRecordExpanded { height: auto; min-height: 90mm; grid-template-rows: auto auto; }

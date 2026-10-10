@@ -5,11 +5,11 @@ import {
   Loader2,
   MapPin,
   MoreVertical,
+  Printer,
   RefreshCcw,
   RotateCcw,
   RotateCw,
   Save,
-  Search,
   Trash2,
   Upload,
 } from 'lucide-react';
@@ -26,6 +26,8 @@ import { TagsInput, TagList } from '../shared/components/Tags';
 import { AuthedImage, ThumbImage } from '../shared/components/Images';
 import { StatusBadge } from '../shared/components/StatusBadge';
 import { CorrectionHistory } from '../shared/components/CorrectionHistory';
+import { printCard } from './printCard';
+import { SearchInput } from '../shared/components/SearchInput';
 
 export default function DesktopApp({ session, saveSession }: { session: Session; saveSession: (next: Session) => void }) {
   const [contacts, setContacts] = useState<Contact[]>([]);
@@ -406,10 +408,7 @@ export default function DesktopApp({ session, saveSession }: { session: Session;
       <main className="workspace">
         <section className="leftPane">
           <div className="filterBar">
-            <label className="searchBox">
-              <Search size={16} />
-              <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="検索" />
-            </label>
+            <SearchInput value={query} onChange={setQuery} placeholder="検索" />
             <select value={status} onChange={(e) => setStatus(e.target.value)}>
               <option value="">すべて</option>
               <option value="queued">queued</option>
@@ -604,6 +603,10 @@ function CardDetail({
   const [backBusy, setBackBusy] = useState(false);
   const [orientationBusy, setOrientationBusy] = useState(false);
   const [zoomPath, setZoomPath] = useState('');
+  const [printBusy, setPrintBusy] = useState(false);
+  const printController = useRef<AbortController | null>(null);
+
+  useEffect(() => () => printController.current?.abort(), []);
 
   useEffect(() => {
     const previous = previousServerCard.current;
@@ -639,6 +642,21 @@ function CardDetail({
       onChanged();
     } catch (error) {
       onMessage(errorMessage(error));
+    }
+  }
+
+  async function print() {
+    if (printController.current) return;
+    const controller = new AbortController();
+    printController.current = controller;
+    setPrintBusy(true);
+    try {
+      await printCard(api, { ...draft }, controller.signal);
+    } catch (error) {
+      if (!controller.signal.aborted) onMessage(`印刷できませんでした: ${errorMessage(error)}`);
+    } finally {
+      if (!controller.signal.aborted) setPrintBusy(false);
+      if (printController.current === controller) printController.current = null;
     }
   }
 
@@ -711,6 +729,17 @@ function CardDetail({
           >
             <Trash2 />
             削除
+          </button>
+          <button
+            type="button"
+            className="textButton detailActionButton detailPrintButton"
+            onClick={print}
+            disabled={printBusy}
+            aria-busy={printBusy}
+            title="印刷"
+          >
+            {printBusy ? <Loader2 className="spin" /> : <Printer />}
+            印刷
           </button>
         </div>
       </div>

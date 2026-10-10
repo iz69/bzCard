@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react';
-import { Loader2, Search } from 'lucide-react';
+import { Loader2 } from 'lucide-react';
 import { makeApi } from '../../shared/api';
 import { ThumbImage } from '../../shared/components/Images';
 import { TagList } from '../../shared/components/Tags';
+import { SearchInput } from '../../shared/components/SearchInput';
 import type { Contact } from '../../shared/types';
 import { useContacts } from '../useContacts';
 import { MobileStatus } from '../MobileStatus';
@@ -44,7 +45,7 @@ export default function ContactsPage({ api, list, hidden, onSelect }: {
 
   return <section className={styles.listPage} style={{ '--contact-row-height': `${rowHeight}px` } as CSSProperties} hidden={hidden} aria-label="人物一覧">
     <div className={styles.filters}>
-      <label className={styles.search}><Search size={20} /><input aria-label="検索" placeholder="氏名・会社・タグを検索" value={list.query} onChange={event => list.setQuery(event.target.value)} /></label>
+      <SearchInput className={styles.search} iconSize={20} placeholder="氏名・会社・タグを検索" value={list.query} onChange={list.setQuery} />
       <select aria-label="処理状態" value={list.status} onChange={event => list.setStatus(event.target.value)}>
         <option value="">すべての状態</option><option value="ready">処理完了</option><option value="queued">待機中</option>
         <option value="preparing">画像補正中</option><option value="scanning">文字認識中</option><option value="extracting">項目抽出中</option>

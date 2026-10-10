@@ -61,8 +61,11 @@ export function makeApi(session: Session) {
         method: 'POST',
         body,
       }),
-    blob: async (path: string) => {
-      const response = await fetch(apiUrl(session.apiBase, path), { headers, signal: lifetime.signal });
+    blob: async (path: string, signal?: AbortSignal) => {
+      const response = await fetch(apiUrl(session.apiBase, path), {
+        headers,
+        signal: signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal,
+      });
       if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
       return response.blob();
     },

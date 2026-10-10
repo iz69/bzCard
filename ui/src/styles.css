@@ -243,7 +243,8 @@ button {
 }
 
 .detailSaveButton,
-.detailDeleteButton {
+.detailDeleteButton,
+.detailPrintButton {
   min-height: 40px;
   padding: 0 16px;
   font-weight: 700;
@@ -260,6 +261,19 @@ button {
   background: #fff3f2;
   color: #a51d16;
 }
+
+.detailPrintButton {
+  border: 1px solid #a8d5bd;
+  background: #edf8f1;
+  color: #17663a;
+}
+
+.detailActions {
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+}
+
+.detailActionButton { white-space: nowrap; }
 
 button:disabled {
   opacity: 0.45;
@@ -317,6 +331,24 @@ select {
   outline: 0;
   min-width: 0;
 }
+
+.searchClearButton {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: #667085;
+  cursor: pointer;
+}
+
+.searchClearButton:hover { background: #eef2f6; color: #243b53; }
+.searchClearButton:focus-visible { outline: 2px solid #2264a8; outline-offset: 2px; }
+.searchClearButton > .searchClearIcon { width: 16px; height: 16px; }
 
 select {
   height: 36px;
@@ -456,10 +488,15 @@ tbody tr:not(.virtualSpacer) {
   gap: 12px;
   align-items: flex-start;
   margin-bottom: 14px;
+  flex-wrap: wrap;
 }
+
+.detailHeader > :first-child { min-width: 0; flex: 1 1 200px; }
+.detailHeader .meta { flex-wrap: wrap; }
 
 .detail h2 {
   font-size: 22px;
+  overflow-wrap: anywhere;
 }
 
 .contactHistory {

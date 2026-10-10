@@ -83,6 +83,29 @@ GHCRの公開方法とVisibilityについては
 
 ## 実装と検証
 
+### 稼働中のWebUIをローカルdev版へ切り替える
+
+印刷機能などUIだけを検証する場合は、ローカルソースから `bzcard-ui:dev` を作り、
+[docker-compose.ui-dev.yml](../../docker-compose.ui-dev.yml) を稼働構成に重ねてWebUIを更新できます。
+ビルド時の表示バージョンは `dev` です。
+
+```sh
+docker build -t bzcard-ui:dev ./ui
+docker compose -f docker-compose.yml -f docker-compose.ui-dev.yml up -d --no-deps ui
+```
+
+別のディレクトリから稼働している構成では、最初の `-f` に稼働中のcomposeファイルを指定し、
+2つ目にこのリポジトリの `docker-compose.ui-dev.yml` の絶対パスを指定します。
+稼働中と同じプロジェクト名・環境設定で実行してください。
+配布版へ戻す場合は、稼働中のcomposeファイルだけで `up -d --no-deps ui` を実行します。
+
+APIを修正した場合は `docker build -t bzcard-api:dev ./api` でビルドし、
+[docker-compose.api-dev.yml](../../docker-compose.api-dev.yml) を重ねて同じ方法で `api` を更新します。
+WebUIもdev版で稼働している場合は、UIとAPIの両方のoverrideファイルを指定します。
+更新前のバックアップは [設定・運用ガイド](../administrators/README.md#バックアップとdb移行) を参照してください。
+
+### UIの検証
+
 UIはViteの相対パスで一度だけビルドする。起動時に公開パスを検証し、
 生成したHTMLの `base` と `runtime-config.js` を配置する。コンパイル済みJS/CSSは変更しない。
 HTMLと設定JSは `no-store`、ハッシュ付きJS/CSSは長期キャッシュで配信する。
@@ -99,3 +122,9 @@ nginxは正規表現のrewriteへサブパスを埋め込まず、ファイル�
 
 ブラウザでのAPI応答は架空のデータを使う。
 APIの公開パスと既存機能は、別途APIの回帰テストで検証する。
+
+`npm run test:print` はPCの印刷ボタン、表面だけの画像掲載と元画像へのフォールバック、
+未保存編集のスナップショット、印刷取消と後片付け、長文の折り返し・高さ調整、
+取得失敗時の再試行、名刺切替時の準備中断を架空データで検証します。
+ブラウザの印刷ダイアログはテスト内で置き換え、実際の帳票DOMと画像を検証します。
+`BZCARD_SCREENSHOT_DIR` を指定すると画面・帳票のPNGとA4のPDFも出力します。

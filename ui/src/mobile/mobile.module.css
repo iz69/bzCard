@@ -41,6 +41,7 @@
 .filters { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; column-gap: 8px; row-gap: 6px; padding: 12px; border-bottom: 1px solid #e4e8ee; background: white; }
 .search { display: flex; align-items: center; gap: 8px; min-width: 0; height: 44px; padding: 0 12px; border: 1px solid #c8d2df; border-radius: 9px; background: #f8fafc; }
 .search input { width: 100%; height: 100%; min-height: 0; border: 0; background: transparent; outline-offset: -2px; }
+.search :global(.searchClearButton) { width: 32px; height: 32px; margin-right: -6px; }
 .filters select, .tools select { min-height: 44px; max-width: 70%; height: auto; border: 1px solid #c8d2df; border-radius: 8px; padding: 8px; background: white; }
 .filters select { width: 136px; max-width: none; height: 44px; }
 .count { grid-column: 1 / -1; justify-self: end; font-size: 13px; color: #667085; }

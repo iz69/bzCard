@@ -4,6 +4,7 @@ import { chromium } from 'playwright-core';
 import { createSessionStore, normalizeApiBase } from '../src/deployment.ts';
 import { checkContactPagination } from './contactPagination.mjs';
 import { checkMobileRegression } from './mobileRegression.mjs';
+import { checkPrintRegression } from './printRegression.mjs';
 
 const base = process.env.BZCARD_TEST_UI_URL || 'http://127.0.0.1:15175/bzcard/';
 const expectedBuildVersion = process.env.BZCARD_TEST_BUILD_VERSION;
@@ -162,4 +163,5 @@ try {
   assert.deepEqual(errors,[]);
   await checkContactPagination(browser, base, apiBase);
   await checkMobileRegression(browser, base, apiBase);
+  await checkPrintRegression(browser, base, apiBase);
 } finally { await context.close(); await browser.close(); }

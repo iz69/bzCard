@@ -1,0 +1,6 @@
+# Use a locally built WebUI with an existing published-image deployment.
+# Build first: docker build -t bzcard-ui:dev ./ui
+# Start with: docker compose -f docker-compose.yml -f docker-compose.ui-dev.yml up -d --no-deps ui
+services:
+  ui:
+    image: bzcard-ui:dev
