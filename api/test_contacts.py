@@ -57,24 +57,24 @@ class ContactGroupingTests(unittest.TestCase):
         self.assertEqual(contacts[0]["card_count"], 2)
 
     def test_transitive_matching_and_distinct_people(self):
-        entries = [(card("a", email="a@example.jp"), 0),
-                   (card("b", email="a@example.jp", mobile="09012345678"), 0),
-                   (card("c", mobile="090-1234-5678"), 0),
+        entries = [(card("a", person_name="試験 太郎", email="a@example.jp"), 0),
+                   (card("b", person_name="試験 太郎", email="a@example.jp", mobile="09012345678"), 0),
+                   (card("c", person_name="試験 太郎", mobile="090-1234-5678"), 0),
                    (card("d", email="different@example.jp"), 0)]
         groups = _contacts_from_entries(entries, None, include_cards=True)
         self.assertEqual({frozenset(c["id"] for c in g["cards"]) for g in groups}, {frozenset("abc"), frozenset("d")})
 
     def test_shared_identifier_is_normalized_only_once_per_card(self):
         from src.services import repository
-        entries = [(card(str(n), email="shared@example.jp"), 0) for n in range(2000)]
+        entries = [(card(str(n), person_name="試験 太郎", email="shared@example.jp"), 0) for n in range(2000)]
         with patch.object(repository, "_contact_identifiers", wraps=repository._contact_identifiers) as identifiers:
             result = _contacts_from_entries(entries, None)
         self.assertEqual(identifiers.call_count, 2000)
         self.assertEqual(result[0]["card_count"], 2000)
 
     def test_nonrepresentative_status_changes_revision_and_keeps_polling(self):
-        old = card("old", email="same@example.jp", status="queued", updated_at="same-second")
-        new = card("new", email="same@example.jp", status="ready", created_at="2026-09-29", updated_at="same-second")
+        old = card("old", person_name="試験 太郎", email="same@example.jp", status="queued", updated_at="same-second")
+        new = card("new", person_name="試験 太郎", email="same@example.jp", status="ready", created_at="2026-09-29", updated_at="same-second")
         before = _contacts_from_entries([(old, 0), (new, 0)], None)[0]
         after = _contacts_from_entries([({**old, "status": "ready"}, 0), (new, 0)], None)[0]
         self.assertTrue(before["has_in_progress"])
@@ -89,6 +89,32 @@ class ContactGroupingTests(unittest.TestCase):
         for query in ("山田", "ヤマダ", "09012345678", "person@example.jp", "株式会社", "ABC", "新宿 山田", "不存在", "", "　"):
             with self.subTest(query=query):
                 self.assertEqual(_search_score(row, query), _contact_search_score(row, _prepare_contact_search(query)))
+
+    def test_shared_company_email_keeps_different_people_separate(self):
+        entries = [(card('first-old', person_name='試験 太郎', email='office@example.test',
+                         company_name='株式会社サンプル', created_at='1'), 0),
+                   (card('second', person_name='架空 花子', email='office@example.test',
+                         company_name='株式会社サンプル', created_at='2'), 0),
+                   (card('first-new', person_name='試験太郎', email='OFFICE@example.test',
+                         company_name='株式会社サンプル', created_at='3'), 0)]
+        groups = _contacts_from_entries(entries, None, include_cards=True)
+        self.assertEqual({frozenset(c['id'] for c in g['cards']) for g in groups},
+                         {frozenset(('first-old', 'first-new')), frozenset(('second',))})
+
+    def test_shared_mobile_or_a_missing_name_cannot_bridge_different_people(self):
+        entries = [(card('a', person_name='試験 太郎', email='office@example.test', mobile='090-0000-0001'), 0),
+                   (card('b', person_name='架空 花子', email='office@example.test', mobile='090-0000-0002'), 0),
+                   (card('unknown', email='office@example.test', mobile='090-0000-0001'), 0),
+                   (card('unknown-two', person_name='　 ', email='office@example.test', mobile='090-0000-0002'), 0),
+                   (card('c', person_name='別人 次郎', mobile='090-0000-0001'), 0)]
+        self.assertEqual(len(_contacts_from_entries(entries, None)), len(entries))
+
+    def test_name_normalization_and_company_changes_preserve_history(self):
+        entries = [(card('old', person_name='Ａｌｅｘ　Ｔｅｓｔ', email='shared@example.test', company_name='前の会社'), 0),
+                   (card('new', person_name='alex test', email='SHARED@example.test', company_name='新しい会社'), 0)]
+        self.assertEqual(_contacts_from_entries(entries, None)[0]['card_count'], 2)
+        entries[1][0]['person_name'] = 'alex tester'
+        self.assertEqual(len(_contacts_from_entries(entries, None)), 2)
 
 
 if __name__ == "__main__":

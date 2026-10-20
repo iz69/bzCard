@@ -54,17 +54,24 @@ def initialize(conn):
             for ref in references)
         conn.execute(f"DROP TRIGGER IF EXISTS contacts_{operation.lower()}")
         conn.execute(f"CREATE TRIGGER IF NOT EXISTS contacts_{operation.lower()} AFTER {operation} ON cards BEGIN {body} END")
-    if conn.execute("SELECT 1 FROM schema_migrations WHERE version = 2").fetchone():
+    initial = not conn.execute("SELECT 1 FROM schema_migrations WHERE version = 2").fetchone()
+    if not initial and conn.execute("SELECT 1 FROM schema_migrations WHERE version = 3").fetchone():
         return
+    # Rebuild only derived data when the matching rule changes. Bump existing
+    # list revisions so clients discard cursors/unchanged responses from v2.
+    for table in ('contact_summaries', 'contact_members', 'contact_identifiers', 'contact_search', 'contact_dirty'):
+        conn.execute(f"DELETE FROM {table}")
     for row in conn.execute("SELECT DISTINCT owner_user_id FROM cards WHERE owner_user_id IS NOT NULL AND owner_user_id != ''").fetchall():
         owner = row[0]
         cards = _cards(conn, owner)
         _update_identifiers(conn, owner, cards)
         _write_groups(conn, owner, cards)
-        conn.execute("INSERT OR REPLACE INTO contact_versions VALUES (?, 1)", (owner,))
+        conn.execute("INSERT INTO contact_versions VALUES (?, 1) ON CONFLICT(owner_user_id) DO UPDATE SET revision = revision + 1", (owner,))
     conn.execute("DELETE FROM contact_dirty")
     from .timeutil import now_iso
-    conn.execute("INSERT INTO schema_migrations VALUES (2, ?)", (now_iso(),))
+    if initial:
+        conn.execute("INSERT INTO schema_migrations VALUES (2, ?)", (now_iso(),))
+    conn.execute("INSERT OR REPLACE INTO schema_migrations VALUES (3, ?)", (now_iso(),))
 
 
 def _batches(values):

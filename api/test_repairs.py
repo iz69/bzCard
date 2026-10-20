@@ -135,11 +135,11 @@ class RepairTests(unittest.TestCase):
     def test_contact_and_card_search_require_every_token_with_cross_card_match(self):
         self.card('a')
         self.card('b', color='blue')
-        repository.update_card_fields('a', {'person_name': '青葉 花子', 'email': 'a@ex.jp'})
-        repository.update_card_fields('b', {'company_name': '古い会社', 'email': 'a@ex.jp'})
-        self.assertEqual(repository.list_user_cards(self.owner, q='青葉 古い会社'), [])
-        self.assertEqual(len(repository.list_user_contacts(self.owner, q='青葉 古い会社')), 1)
-        self.assertEqual(repository.list_user_contacts(self.owner, q='青葉 存在しない'), [])
+        repository.update_card_fields('a', {'person_name': '試験 太郎', 'department': '検索専用部', 'email': 'a@ex.jp'})
+        repository.update_card_fields('b', {'person_name': '試験 太郎', 'company_name': '古い会社', 'email': 'a@ex.jp'})
+        self.assertEqual(repository.list_user_cards(self.owner, q='検索専用 古い会社'), [])
+        self.assertEqual(len(repository.list_user_contacts(self.owner, q='検索専用 古い会社')), 1)
+        self.assertEqual(repository.list_user_contacts(self.owner, q='検索専用 存在しない'), [])
         self.assertEqual(repository.list_user_cards(self.owner, q='-'), [])
 
     def test_same_second_updates_change_contact_revision(self):

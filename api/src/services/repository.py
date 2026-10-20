@@ -674,7 +674,7 @@ def get_user_card(card_id: str, user_id: str) -> dict | None:
 
 
 def _contact_groups(cards: list[dict]) -> list[list[dict]]:
-    """Union each identifier with its first card, avoiding all-pairs comparison."""
+    """Union shared identifiers scoped to a matching name, without all-pairs checks."""
     parents = list(range(len(cards)))
     sizes = [1] * len(cards)
 
@@ -709,7 +709,7 @@ def _contacts_from_entries(
     include_cards: bool = False,
     matched_groups: set[str] | None = None,
 ) -> list[dict]:
-    """Group by equal email/mobile, retaining transitive matching and ranking."""
+    """Group equal names with shared email/mobile, retaining transitive matching."""
     scores = {card["id"]: score for card, score in entries}
 
     contacts = []
@@ -750,13 +750,16 @@ def _contact_summary(card: dict) -> dict:
 
 
 def _contact_identifiers(card: dict) -> set[tuple[str, str]]:
+    name = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(card.get("person_name") or ""))).casefold()
+    if not name:
+        return set()
     identifiers = set()
     email = _contact_email(card.get("email"))
     mobile = _contact_mobile(card.get("mobile"))
     if email:
-        identifiers.add(("email", email))
+        identifiers.add(("email", json.dumps([name, email], ensure_ascii=False, separators=(",", ":"))))
     if mobile:
-        identifiers.add(("mobile", mobile))
+        identifiers.add(("mobile", json.dumps([name, mobile], ensure_ascii=False, separators=(",", ":"))))
     return identifiers
 
 

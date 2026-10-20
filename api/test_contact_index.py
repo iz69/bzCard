@@ -75,11 +75,11 @@ class ContactIndexTests(unittest.TestCase):
 
     def test_historical_and_cross_card_search_preserve_ranking(self):
         repo.update_card_fields('a', {'company_name': '古い会社'})
-        repo.update_card_fields('c', {'person_name': '青葉 太郎'})
-        result = repo.list_user_contacts_page(self.user, q='青葉 古い会社')
+        repo.update_card_fields('c', {'department': '検索専用部'})
+        result = repo.list_user_contacts_page(self.user, q='検索専用 古い会社')
         self.assertEqual([p['id'] for p in result['items']], ['c'])
         self.assertEqual(result['items'][0]['card_count'], 3)
-        self.assertEqual(repo.list_user_contacts_page(self.user, q='青葉 不存在')['items'], [])
+        self.assertEqual(repo.list_user_contacts_page(self.user, q='検索専用 不存在')['items'], [])
         repo.save_ocr_result('a', '新しいOCR検索語', [], 0)
         self.assertEqual(repo.list_user_contacts(self.user, q='新しいOCR')[0]['id'], 'c')
 
