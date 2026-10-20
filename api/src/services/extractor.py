@@ -18,9 +18,11 @@ from .name_evidence import (
     _spatial_name_candidates,
     _with_spatial_name_candidates,
     compact_name, person_name_is_printed, name_evidence_scope,
+    _box_coordinates, _name_layout_blocks,
+    _roman_to_hiragana,
 )
 from .person_identity import resolve_person_name
-from .roles import ROLE_TITLES as _ROLE_TITLES, split_printed_role
+from .roles import ROLE_TITLES as _ROLE_TITLES, OCCUPATIONAL_TITLES, is_position_title, split_printed_role
 from .address_evidence import prefer_complete_printed_address
 
 
@@ -46,7 +48,7 @@ def extract_card_fields(raw_text: str, blocks: list[dict], owner_user_id: str | 
     base_prompt = _build_prompt(source_text, blocks)
     prompt = base_prompt + prompt_examples(corrections)
     raw = _generate_structured_response(prompt)
-    data, normalized, identity_info = _normalize_response(raw, source_text, blocks, previous)
+    data, normalized, identity_info, position_info = _normalize_response(raw, source_text, blocks, previous)
     fallback = {}
     company_confusion = (_is_organization_name(data.get("person_name") or "")
                          and bool(_spatial_name_candidates(blocks)))
@@ -58,7 +60,7 @@ def extract_card_fields(raw_text: str, blocks: list[dict], owner_user_id: str | 
         if company_confusion:
             retry_prompt += "\n前の応答では会社名が person_name に入っていました。会社名を氏名に使わず、OCRの氏名候補と座標を確認して人物名を抽出してください。確定できなければ空文字にしてください。\n"
         raw = _generate_structured_response(retry_prompt)
-        data, normalized, identity_info = _normalize_response(raw, source_text, blocks, previous)
+        data, normalized, identity_info, position_info = _normalize_response(raw, source_text, blocks, previous)
     kana_info = apply_specialist_reading(normalized, source_text, blocks,
                                          previous=previous, name_decision=identity_info)
     if kana_info.get("segmentation") == "verified":
@@ -81,11 +83,13 @@ def extract_card_fields(raw_text: str, blocks: list[dict], owner_user_id: str | 
     normalized["_raw"] = data
     normalized["_response_text"] = str(raw)
     normalized["_model"] = {**getattr(raw, "model_info", {}), "identity": identity_info, "kana": kana_info}
+    if position_info:
+        normalized["_model"]["position"] = position_info
     duration_ms = int((time.perf_counter() - started) * 1000)
     return ExtractionResult(data=normalized, duration_ms=duration_ms)
 
 
-def _normalize_response(raw: str, source_text: str, blocks: list[dict], previous: dict | None = None) -> tuple[dict, dict, dict]:
+def _normalize_response(raw: str, source_text: str, blocks: list[dict], previous: dict | None = None) -> tuple[dict, dict, dict, dict]:
     data = _parse_json_object(raw)
     normalized = {key: _string_or_empty(data.get(key)) for key in SCHEMA_KEYS}
     _separate_department_and_title(normalized, source_text)
@@ -93,27 +97,27 @@ def _normalize_response(raw: str, source_text: str, blocks: list[dict], previous
     _prefer_labeled_phone_numbers(normalized, source_text)
     prefer_complete_printed_address(normalized, source_text)
     _remove_ungrounded_values(normalized, source_text, validate_person_name=False)
-    _recover_printed_title(normalized, source_text)
     normalized = normalize_fields(normalized)
     identity_info = resolve_person_name(normalized, source_text, blocks, previous)
     _remove_person_from_title(normalized, source_text, blocks)
-    return data, normalize_fields(normalized), identity_info
+    position_info = _recover_printed_title(normalized, source_text, blocks)
+    return data, normalize_fields(normalized), identity_info, position_info
 
 
-def _generate_structured_response(prompt: str) -> str:
+def _generate_structured_response(prompt: str, schema: dict | None = None) -> str:
     if settings.llm_provider == "ollama":
-        return _generate_with_ollama(prompt)
+        return _generate_with_ollama(prompt, schema)
     if settings.llm_provider == "gemini":
-        return _generate_with_gemini(prompt)
+        return _generate_with_gemini(prompt, schema)
     raise ValueError(f"Unsupported LLM_PROVIDER: {settings.llm_provider}")
 
 
-def _generate_with_ollama(prompt: str) -> str:
+def _generate_with_ollama(prompt: str, schema: dict | None = None) -> str:
     payload = {
         "model": settings.llm_model,
         "prompt": prompt,
         "stream": False,
-        "format": _extraction_schema(),
+        "format": schema or _extraction_schema(),
         "options": {
             "temperature": 0,
         },
@@ -121,7 +125,7 @@ def _generate_with_ollama(prompt: str) -> str:
     response = requests.post(
         f"{settings.llm_base_url}/api/generate",
         json=payload,
-        timeout=180,
+        timeout=30 if schema else 180,
     )
     response.raise_for_status()
     body = response.json()
@@ -131,7 +135,7 @@ def _generate_with_ollama(prompt: str) -> str:
     return response_text
 
 
-def _generate_with_gemini(prompt: str) -> str:
+def _generate_with_gemini(prompt: str, schema: dict | None = None) -> str:
     if not settings.gemini_api_key:
         raise RuntimeError("GEMINI_API_KEY is required when LLM_PROVIDER=gemini")
 
@@ -141,14 +145,14 @@ def _generate_with_gemini(prompt: str) -> str:
         "response_format": {
             "type": "text",
             "mime_type": "application/json",
-            "schema": _extraction_schema(),
+            "schema": schema or _extraction_schema(),
         },
     }
     response = requests.post(
         f"{settings.gemini_base_url}/interactions",
         headers={"x-goog-api-key": settings.gemini_api_key},
         json=payload,
-        timeout=180,
+        timeout=30 if schema else 180,
     )
     response.raise_for_status()
     body = response.json()
@@ -157,16 +161,16 @@ def _generate_with_gemini(prompt: str) -> str:
     return result
 
 
-def _extraction_schema() -> dict:
+def _extraction_schema(keys=SCHEMA_KEYS) -> dict:
     return {
         "type": "object",
         "properties": {
             key: {
                 "type": "string",
             }
-            for key in SCHEMA_KEYS
+            for key in keys
         },
-        "required": SCHEMA_KEYS,
+        "required": keys,
         "additionalProperties": False,
     }
 
@@ -311,12 +315,57 @@ def _string_or_empty(value) -> str:
 _DEPARTMENT_END = re.compile(r"(?:本部|事業部|部|課|室|局|支店|営業所|出張所|センター|グループ|チーム)$")
 
 
-def _recover_printed_title(data: dict, raw_text: str) -> None:
+def _classify_position(name: str, source: str, occupation: str, candidate: str) -> dict:
+    """Review only the position when a nearby label conflicts with a job category."""
+    roman_parts = candidate.split()
+    if (len(roman_parts) == 2 and all(re.fullmatch('[A-Za-z]+', part)
+                                    and _roman_to_hiragana(part) for part in roman_parts)):
+        return {'title': '', 'reason': 'roman_name_candidate'}
+    prompt = f'''以下は日本の名刺のOCR全文です。
+{source}
+
+対象者: {name}
+職種の候補: {occupation}
+対象者の氏名のすぐ近くに印刷された、役職かもしれない候補: {candidate}
+
+職種と役職を区別してください。セールスエンジニアなどの職種は occupation に、所長などの職位は title に入れてください。
+役職は例示した語や既知の一覧に限定せず、名刺上の本人との対応と意味から判断してください。
+title は近くに印刷された別の表現が本人の役職と判断できる場合だけ、その表現をそのまま返してください。
+氏名・会社・部署・職種だった場合や不明な場合は title を空文字にしてください。
+occupation と title だけを持つJSONを返してください。その他の抽出項目を返してはいけません。'''
+    try:
+        schema = _extraction_schema(['occupation', 'title'])
+        schema['properties']['occupation']['enum'] = [occupation, '']
+        schema['properties']['title']['enum'] = [candidate, '']
+        raw = _generate_structured_response(prompt, schema)
+        result = _parse_json_object(raw)
+        return {'title': _string_or_empty(result.get('title')),
+                'occupation': _string_or_empty(result.get('occupation')), 'response_text': str(raw)}
+    except (requests.RequestException, ValueError) as exc:
+        return {'title': '', 'reason': type(exc).__name__}
+
+
+def _recover_printed_title(data: dict, raw_text: str, blocks: list[dict] | None = None) -> dict:
     """Prefer a standalone role to a fragment copied from professional licenses."""
+    decision = {}
+    title = compact_name(data.get('title'))
+    if title in OCCUPATIONAL_TITLES:
+        local = _nearby_title_labels(data.get('person_name') or '', raw_text, blocks or [])
+        excluded = {title, compact_name(data.get('department')), compact_name(data.get('company_name'))}
+        local = {label for label in local if compact_name(label) not in excluded}
+        if len(local) == 1:
+            candidate = next(iter(local))
+            checked = _classify_position(data.get('person_name') or '', raw_text, title, candidate)
+            if compact_name(checked.get('title')) == compact_name(candidate):
+                data['title'] = candidate
+                decision = {**checked, 'source': 'llm_local_context', 'selected': candidate}
+            elif is_position_title(candidate):
+                data['title'] = candidate
+                decision = {**checked, 'source': 'printed_position_fallback', 'selected': candidate}
     roles = {compact_name(line) for line in raw_text.splitlines()
              if compact_name(line) in _ROLE_TITLES}
     if len(roles) != 1:
-        return
+        return decision
     qualifications = re.findall(r'[一-龯々]{2,}士', raw_text)
     title = compact_name(data.get('title'))
     if not title or any(title in qualification for qualification in qualifications):
@@ -326,6 +375,36 @@ def _recover_printed_title(data: dict, raw_text: str) -> None:
             and department not in {compact_name(line) for line in raw_text.splitlines()}
             and any(department in qualification for qualification in qualifications)):
         data['department'] = ''
+    return decision
+
+
+def _nearby_title_labels(name: str, source: str, blocks: list[dict]) -> set[str]:
+    if not person_name_is_printed(name, source, blocks):
+        return set()
+    rows = _name_layout_blocks(blocks)
+    names = [b for b in rows if compact_name(b.get('text')) == compact_name(name)]
+    positions = set()
+    for person in names:
+        box = _box_coordinates(person.get('box'))
+        if not box:
+            continue
+        nx1, ny1, nx2, ny2 = box
+        for row in rows:
+            text = str(row.get('text') or '').strip()
+            role = _box_coordinates(row.get('box'))
+            if not role or row.get('_side') != person.get('_side') or not text or len(text) > 32:
+                continue
+            if (compact_name(text) == compact_name(name) or _DEPARTMENT_END.search(compact_name(text))
+                    or re.search(r'[@:：/0-9]', text)):
+                continue
+            x1, y1, x2, y2 = role
+            height = max(ny2 - ny1, y2 - y1)
+            above = -.25 * height <= ny1 - y2 <= height and min(nx2, x2) > max(nx1, x1)
+            beside = (0 <= nx1 - x2 <= 2 * height
+                      and min(ny2, y2) - max(ny1, y1) >= min(ny2 - ny1, y2 - y1) * .5)
+            if above or beside:
+                positions.add(text)
+    return positions
 
 
 def _remove_person_from_title(data: dict, source: str, blocks: list[dict]) -> None:

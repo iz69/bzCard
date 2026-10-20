@@ -11,6 +11,45 @@ from .name_evidence import (
 
 _ASSOCIATION = r'[（(](?:一社|公社|一財|公財|社|財)[）)]'
 _MEMBERSHIP = re.compile(r'\s*' + _ASSOCIATION + r'\s*(?=[^\n]*(?:会員|加盟))')
+_OFFICE_ENDINGS = ('営業所', '事業所', '支店', '出張所', '支社')
+
+
+def separate_printed_office(data: dict, source: str, blocks: list[dict]) -> bool:
+    """Use an independently printed office to separate a combined company row."""
+    rows = list(dict.fromkeys(line.strip() for line in
+                [*source.splitlines(), *(str(b.get('text') or '') for b in blocks)] if line.strip()))
+    offices = {compact_name(row): row for row in rows
+               if len(compact_name(row)) <= 40 and not _CORPORATE_MARKER.search(row)
+               and any(compact_name(row).endswith(end) and len(compact_name(row)) > len(end)
+                       for end in _OFFICE_ENDINGS)
+               and not re.search(r'[@:：/]', row)}
+    current = compact_name(data.get('company_name'))
+    matches = {}
+    for row in rows:
+        if not _CORPORATE_MARKER.search(row):
+            continue
+        for office, printed_office in offices.items():
+            pattern = r'\s*'.join(map(re.escape, office)) + r'\s*$'
+            match = re.search(pattern, row)
+            if not match:
+                continue
+            company = row[:match.start()].strip()
+            value = compact_name(company)
+            if (not _CORPORATE_MARKER.search(value) or _CORPORATE_MARKER.fullmatch(value)
+                    or current and current not in (value, compact_name(row))):
+                continue
+            entry = matches.setdefault(value, {'company': company, 'offices': {}})
+            entry['offices'][office] = printed_office
+    if len(matches) != 1:
+        return False
+    selected = next(iter(matches.values()))
+    data['company_name'] = selected['company']
+    if len(selected['offices']) == 1:
+        office = next(iter(selected['offices'].values()))
+        department = compact_name(data.get('department'))
+        if not department or department in _OFFICE_ENDINGS or department == compact_name(office):
+            data['department'] = office
+    return True
 
 
 def recover_layout_company(data: dict, source: str, blocks: list[dict]) -> bool:

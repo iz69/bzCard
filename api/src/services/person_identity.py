@@ -5,7 +5,7 @@ import re
 import unicodedata
 
 from .normalization import _normalize_kana_field
-from .company_evidence import recover_layout_company
+from .company_evidence import recover_layout_company, separate_printed_office
 from .name_evidence import (
     _CORPORATE_MARKER, _compact_for_evidence,
     _is_horizontal_neighbour, _is_organization_name, _kanji_text,
@@ -115,6 +115,8 @@ def _join_spaced_person_name(data: dict, raw_text: str, blocks: list[dict]) -> N
 
 
 def _recover_printed_company(data: dict, raw_text: str, blocks: list[dict] | None = None) -> None:
+    if separate_printed_office(data, raw_text, blocks or []):
+        return
     if recover_layout_company(data, raw_text, blocks or []):
         return
     companies = [line.strip() for line in raw_text.splitlines()
