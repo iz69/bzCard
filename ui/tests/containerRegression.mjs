@@ -90,6 +90,13 @@ for (const [ui, api] of deployments) {
     });
     if (browser.error) throw browser.error;
     assert.equal(browser.status, 0, 'browser regression failed for ' + ui);
+    if (ui === '/bzcard/') {
+      const controls = spawnSync(process.execPath, ['--experimental-strip-types', 'tests/imageCorrection.mjs'], {
+        stdio:'inherit', env:{...process.env,BZCARD_TEST_UI_URL:home},
+      });
+      if (controls.error) throw controls.error;
+      assert.equal(controls.status, 0, 'image correction controls failed');
+    }
     if (ui === '/tools/liff/') {
       docker('restart', container);
       // Docker may assign a different host port when restarting a dynamic binding.

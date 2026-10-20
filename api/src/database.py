@@ -166,6 +166,7 @@ def _init_db_locked() -> None:
         )
         _ensure_column(conn, "card_images", "manual_rotation", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "card_images", "auto_rotation", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "card_images", "correction_disabled", "INTEGER NOT NULL DEFAULT 0")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS line_events (

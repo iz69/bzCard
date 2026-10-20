@@ -195,6 +195,7 @@ def rotate_card_image(
             processed, thumb = create_processed_images(
                 resolve_data_path(image["original_image_path"]), card_id, side,
                 (image["manual_rotation"] + image["auto_rotation"]) % 360,
+                correct=not image.get("correction_disabled", False),
             )
             image_rel, thumbnail_rel = relative_path(processed), relative_path(thumb)
             repository.set_card_processing_artifacts(card_id, image_rel, thumbnail_rel, side)
@@ -205,6 +206,46 @@ def rotate_card_image(
         rotate_page_image(image_path, resolve_data_path(thumbnail_rel), degrees)
         updated = repository.update_image_orientation_metadata(card_id, side, degrees, thumbnail_rel)
         return {"card": updated, "side": side, "degrees": degrees}
+
+
+@router.delete("/cards/{card_id}/processed-image")
+def delete_processed_image(
+    card_id: str,
+    side: str = Query("front", pattern="^(front|back)$"),
+    user: dict = Depends(require_user),
+) -> dict:
+    if repository.get_user_card(card_id, user["id"]) is None:
+        raise HTTPException(404, "Card not found")
+    with card_data_lock(card_id):
+        card = repository.get_user_card(card_id, user["id"])
+        if card is None:
+            raise HTTPException(404, "Card not found")
+        if repository.get_active_job(card_id) is not None:
+            raise HTTPException(409, "Card is currently processing")
+        image = next((item for item in card["images"] if item["side"] == side), None)
+        if image is None:
+            raise HTTPException(404, "Image not ready")
+
+        # An uncorrected working copy supports rotation/OCR without ever editing
+        # the uploaded original. Future rescans also skip cropping/enhancement.
+        preview, thumbnail = create_processed_images(
+            resolve_data_path(image["original_image_path"]), card_id, side,
+            (image["manual_rotation"] + image["auto_rotation"]) % 360, correct=False,
+        )
+        updated = repository.disable_image_correction(
+            card_id, side, relative_path(preview), relative_path(thumbnail),
+        )
+        from ..database import connection
+        old_path = image.get("processed_image_path")
+        if old_path:
+            path = resolve_data_path(old_path)
+            with connection() as conn:
+                referenced = conn.execute("""SELECT 1 FROM card_images WHERE
+                    original_image_path = ? OR processed_image_path = ? OR thumbnail_path = ?""",
+                    (old_path, old_path, old_path)).fetchone()
+            if not referenced and path.parent == card_dir(card_id).resolve():
+                path.unlink(missing_ok=True)
+        return {"card": updated, "side": side}
 
 
 

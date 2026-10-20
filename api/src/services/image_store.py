@@ -144,17 +144,17 @@ def _validate_original_image(directory: Path, original_path: Path, side: str) ->
         raise HTTPException(status_code=415, detail="Invalid image file") from exc
 
 
-def create_processed_images(original_path: Path, card_id: str, side: str = "front", rotation: int = 0) -> tuple[Path, Path]:
+def create_processed_images(original_path: Path, card_id: str, side: str = "front", rotation: int = 0, *, correct: bool = True) -> tuple[Path, Path]:
     directory = card_dir(card_id)
-    processed_name = "processed.jpg" if side == "front" else f"processed_{side}.jpg"
+    stem = "processed" if correct else "uncorrected"
+    processed_name = f"{stem}.jpg" if side == "front" else f"{stem}_{side}.jpg"
     thumbnail_name = "thumbnail.jpg" if side == "front" else f"thumbnail_{side}.jpg"
     processed_path = directory / processed_name
     thumbnail_path = directory / thumbnail_name
 
     with Image.open(original_path) as source:
         image = ImageOps.exif_transpose(source).convert("RGB")
-        processed = _autocrop_and_correct(image)
-        processed = _enhance_processed_image(processed)
+        processed = _enhance_processed_image(_autocrop_and_correct(image)) if correct else image
         if rotation % 360:
             processed = processed.rotate(-rotation, expand=True)
         _save_page_image(processed, processed_path)
@@ -427,6 +427,9 @@ def _perspective_warp(rgb, points):
     if ratio < 1.15 or ratio > 2.25:
         return None
 
+    if _crop_discards_print(rgb, rect):
+        return None
+
     max_width, max_height = _business_card_warp_size(max_width, max_height)
 
     destination = np.array(
@@ -440,6 +443,37 @@ def _perspective_warp(rgb, points):
     )
     matrix = cv2.getPerspectiveTransform(rect, destination)
     return cv2.warpPerspective(rgb, matrix, (max_width, max_height))
+
+
+def _crop_discards_print(rgb, rect) -> bool:
+    """Reject an interior logo or frame when printed content remains outside.
+
+    Compare pixels to a local paper/background estimate, so a uniform dark
+    tabletop is not mistaken for text. Check every detection path before any
+    perspective warp; uncertain candidates leave the original image available.
+    """
+    import cv2
+    import numpy as np
+
+    height, width = rgb.shape[:2]
+    scale = min(1.0, 800 / max(width, height))
+    sample = cv2.resize(rgb, (round(width * scale), round(height * scale)), interpolation=cv2.INTER_AREA) if scale < 1 else rgb
+    gray = cv2.cvtColor(sample, cv2.COLOR_RGB2GRAY)
+    paper = cv2.GaussianBlur(gray, (31, 31), 0).astype(np.int16)
+    pixels = gray.astype(np.int16)
+    mask = np.zeros(gray.shape, dtype=np.uint8)
+    cv2.fillConvexPoly(mask, np.rint(rect * scale).astype(np.int32), 255)
+    if not np.any(mask):
+        return True
+    # Only compare print on the candidate's paper tone. White keyboard labels
+    # on a dark background must not veto a light card's actual outer border.
+    if np.median(gray[mask != 0]) >= 140:
+        printed = (paper >= 170) & (paper - pixels >= 35)
+    else:
+        printed = (paper <= 100) & (pixels - paper >= 35)
+    outside = np.count_nonzero(printed & (mask == 0))
+    total = np.count_nonzero(printed)
+    return outside > max(20, gray.size * .0005) and outside > total * .02
 
 
 def _business_card_warp_size(width: int, height: int) -> tuple[int, int]:

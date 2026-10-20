@@ -17,8 +17,11 @@ from .name_evidence import (
     _is_organization_name,
     _spatial_name_candidates,
     _with_spatial_name_candidates,
+    compact_name, person_name_is_printed,
 )
 from .person_identity import resolve_person_name
+from .roles import ROLE_TITLES as _ROLE_TITLES, split_printed_role
+from .address_evidence import prefer_complete_printed_address
 
 
 class ModelResponse(str):
@@ -61,8 +64,12 @@ def extract_card_fields(raw_text: str, blocks: list[dict], owner_user_id: str | 
         identity_info = {"status": "resolved", "source": "reading_verified_boundary"}
     identity_info["selected"] = normalized.get("person_name") or ""
     automatic = dict(normalized)
-    applied = apply_known_reading(normalized, source_text, blocks, corrections,
-                                  allow_general=kana_info.get("source") != "previous")
+    # Text-only feedback cannot reproduce OCR repairs or model-verified roman
+    # association. Preserve their verified printed reading over corrections.
+    protected_roman = (kana_info.get("roman_ocr_corrections")
+                       or kana_info.get("verification") == "family_and_full_name_model_match")
+    applied = [] if protected_roman else apply_known_reading(
+        normalized, source_text, blocks, corrections, allow_general=kana_info.get("source") != "previous")
     if applied:
         kana_info.update(status="corrected", selected=normalized["person_name_kana"], source="confirmed_correction")
     normalized["_automatic"] = automatic
@@ -82,9 +89,12 @@ def _normalize_response(raw: str, source_text: str, blocks: list[dict], previous
     _separate_department_and_title(normalized, source_text)
     _recover_printed_department(normalized, source_text)
     _prefer_labeled_phone_numbers(normalized, source_text)
+    prefer_complete_printed_address(normalized, source_text)
     _remove_ungrounded_values(normalized, source_text, validate_person_name=False)
+    _recover_printed_title(normalized, source_text)
     normalized = normalize_fields(normalized)
     identity_info = resolve_person_name(normalized, source_text, blocks, previous)
+    _remove_person_from_title(normalized, source_text, blocks)
     return data, normalize_fields(normalized), identity_info
 
 
@@ -233,6 +243,8 @@ email は @ を含むOCR上のメールアドレスだけを入れてくださ�
 tel と mobile には電話番号だけを入れてください。fax にはOCR上で FAX と明示された電話番号だけを入れてください。
 department には部署名だけを入れ、部・課・グループなどが複数行に分かれている場合は上位から順にすべて含めてください。title には役職名だけを入れてください。OCR上にない項目は空文字にしてください。
 「専務取締役」「常務取締役」「代表取締役」「部長」などは役職です。役職だけが印刷され、部署名がない場合は department を空文字にし、役職を title だけに入れてください。
+「役職＋姓の一部」のように役職と氏名の一部が同じOCR領域にあっても、役職は title、氏名は person_name に分離してください。title に氏名を含めないでください。
+会社名の単語間の空白はOCRに従い、OCRで続けて読めている日本語の社名に空白を追加しないでください。
 person_name_kana は氏名の読みをひらがなだけで入れてください。漢字や別人の名前を混ぜないでください。姓名の間には半角スペースを1つ入れてください。
 OCRテキスト内にふりがな・フリガナがある場合はそれを優先してください。
 ふりがながない場合でも、日本人名として自然で一般的な読みを推測してください。
@@ -241,10 +253,9 @@ OCRテキスト内にふりがな・フリガナがある場合はそれを優�
 例示した別人の氏名や読みを、OCRで確認できない名刺に流用してはいけません。
 氏名がOCRで姓・名に分割され、行順が崩れることがあります。大きな日本語名らしい断片が複数ある場合は、会社名・部署名・住所ではないかを確認し、自然な日本人名の姓名順に並べ直してください。
 ふりがなはOCRテキストやローマ字表記に存在しない限り、珍しい読みを無理に作らず、判断できない場合は空文字にしてください。
-氏名や社名に「峠」が含まれる場合、姓としての読みは「とうげ」を優先してください。
 読みがどうしても判断できない場合だけ空文字にしてください。
 電話番号、携帯番号、FAX、郵便番号は可能なら半角数字とハイフンに正規化してください。
-電話番号、携帯番号、FAXに括弧は使わず、例: 0465-81-5877 の形式にしてください。
+電話番号、携帯番号、FAXに括弧は使わず、例: 03-0000-0000 の形式にしてください。
 住所の番地・丁目・号に使われている漢数字は数字に正規化してください。例: 朝日町一丁目五三番一号 -> 朝日町1丁目53番1号。
 ただし地名に含まれる漢数字は変換しないでください。例: 三田、四谷、一番町 はそのままにしてください。
 
@@ -295,14 +306,36 @@ def _string_or_empty(value) -> str:
     return str(value).strip()
 
 
-_ROLE_TITLES = {
-    "代表取締役社長", "代表取締役会長", "代表取締役副社長", "代表取締役",
-    "専務取締役", "常務取締役", "取締役", "専務執行役員", "常務執行役員", "執行役員",
-    "社長", "副社長", "会長", "副会長", "専務", "常務",
-    "部長", "課長", "室長", "係長", "主任", "技師", "編集者", "研究員",
-    "担当", "営業担当", "デザイナー", "リーダー", "エンジニア",
-}
 _DEPARTMENT_END = re.compile(r"(?:本部|事業部|部|課|室|局|支店|営業所|出張所|センター|グループ|チーム)$")
+
+
+def _recover_printed_title(data: dict, raw_text: str) -> None:
+    """Recover one standalone printed role after rejecting a model invention."""
+    if data.get("title"):
+        return
+    roles = {compact_name(line) for line in raw_text.splitlines()
+             if compact_name(line) in _ROLE_TITLES}
+    if len(roles) == 1:
+        data["title"] = roles.pop()
+
+
+def _remove_person_from_title(data: dict, source: str, blocks: list[dict]) -> None:
+    name = compact_name(data.get("person_name"))
+    title = compact_name(data.get("title"))
+    if not name or not title or not person_name_is_printed(name, source, blocks):
+        return
+    for role in _ROLE_TITLES:
+        if title in (role + name, name + role):
+            data["title"] = role
+            return
+    # The model may copy only the first OCR fragment (a title plus surname fragment) to title.
+    # Strip it only when that exact combined row is printed and its name
+    # fragment starts the independently verified complete person name.
+    combined = split_printed_role(data.get("title"))
+    rows = [*source.splitlines(), *(str(block.get("text") or "") for block in blocks)]
+    if (combined and name.startswith(compact_name(combined[1]))
+            and any(compact_name(row) == title for row in rows)):
+        data["title"] = combined[0]
 
 
 def _separate_department_and_title(data: dict, raw_text: str) -> None:

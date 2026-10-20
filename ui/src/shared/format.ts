@@ -13,11 +13,18 @@ export function directionLabel(value?: string) {
 }
 
 export function imagePathFor(card: Card, side: 'front' | 'back', mode: 'processed' | 'original') {
+  // The working image of an original-only side preserves its display rotation.
+  if (card.images?.find(image => image.side === side)?.correction_disabled) mode = 'processed';
   const version = `?v=${encodeURIComponent(String(card.revision ?? card.updated_at))}`;
   if (side === 'back') {
     return `/api/cards/${card.id}/${mode === 'processed' ? 'back-processed-image' : 'back-original-image'}${version}`;
   }
   return `/api/cards/${card.id}/${mode === 'processed' ? 'processed-image' : 'original-image'}${version}`;
+}
+
+export function hasCorrectedImage(card: Card, side: 'front' | 'back') {
+  if (card.images?.find(image => image.side === side)?.correction_disabled) return false;
+  return Boolean(side === 'back' ? card.back_processed_image_path : card.processed_image_path);
 }
 
 export function openGoogleMaps(address: string) {

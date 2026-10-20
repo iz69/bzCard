@@ -63,7 +63,7 @@ def _upsert_card_image(
             processed_image_path = NULL,
             thumbnail_path = NULL,
             ocr_direction = excluded.ocr_direction,
-            manual_rotation = 0, auto_rotation = 0,
+            manual_rotation = 0, auto_rotation = 0, correction_disabled = 0,
             ocr_text = NULL,
             ocr_blocks_json = NULL,
             ocr_duration_ms = NULL,
@@ -903,6 +903,16 @@ def set_card_status(card_id: str, status: str, error_message: str | None = None)
             "UPDATE cards SET status = ?, error_message = ?, updated_at = ? WHERE id = ?",
             (status, error_message, now, card_id),
         )
+
+
+def disable_image_correction(card_id: str, side: str, image_path: str, thumbnail_path: str) -> dict | None:
+    # Keep OCR, extraction results and the card status until an explicit rescan.
+    with connection() as conn:
+        conn.execute("""UPDATE card_images SET correction_disabled = 1,
+            processed_image_path = ?, thumbnail_path = ?, updated_at = ?
+            WHERE card_id = ? AND side = ?""",
+            (image_path, thumbnail_path, now_iso(), card_id, side))
+    return get_card(card_id)
 
 
 def update_image_orientation_metadata(card_id: str, side: str, degrees: int, thumbnail_path: str) -> dict | None:

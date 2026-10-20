@@ -18,7 +18,7 @@ import { mergeServerCard } from '../cardSync';
 import type { Card, Contact, ContactPage, RuntimeVersions } from '../shared/types';
 import { makeApi, HttpError } from '../shared/api';
 import { fields, wideFieldKeys, rowBreakFieldKeys, terminalCardStatuses } from '../shared/cardFields';
-import { formatDate, directionLabel, imagePathFor, openGoogleMaps, combinedOcrText, formatJson, errorMessage } from '../shared/format';
+import { formatDate, directionLabel, imagePathFor, hasCorrectedImage, openGoogleMaps, combinedOcrText, formatJson, errorMessage } from '../shared/format';
 import { BrandTitle } from '../shared/components/BrandTitle';
 import { Login } from '../shared/components/Login';
 import { LineSettings, PasswordChange, UserManager } from '../shared/components/AccountDialogs';
@@ -691,7 +691,23 @@ function CardDetail({
     }
   }
 
+  async function deleteCorrection() {
+    if (orientationBusy || backBusy) return;
+    setOrientationBusy(true);
+    try {
+      await api.delete(`/api/cards/${card.id}/processed-image?side=${imageSide}`);
+      setImageMode('processed');
+      onMessage('補正画像を削除しました。以後の再スキャンも元画像を使います');
+      onChanged();
+    } catch (error) {
+      onMessage(errorMessage(error));
+    } finally {
+      setOrientationBusy(false);
+    }
+  }
+
   const hasBack = Boolean(card.back_original_image_path);
+  const hasCorrection = hasCorrectedImage(card, imageSide);
   const imagePath = imagePathFor(card, imageSide, imageMode);
   const historicalCards = relatedCards.filter((relatedCard) => relatedCard.id !== card.id);
 
@@ -923,6 +939,9 @@ function CardDetail({
           path={imagePath}
           title={`${card.person_name || card.company_name || '名刺'} ${imageSide === 'back' ? '裏' : '表'}`}
           imageMode={imageMode}
+          hasCorrection={hasCorrection}
+          deleting={orientationBusy || backBusy || !['ready', 'error', 'not_card'].includes(card.status)}
+          onDeleteCorrection={() => void deleteCorrection()}
           onToggleMode={() => setImageMode(imageMode === 'processed' ? 'original' : 'processed')}
           onClose={() => setZoomPath('')}
         />
@@ -936,6 +955,9 @@ function ImageModal({
   path,
   title,
   imageMode,
+  hasCorrection,
+  deleting,
+  onDeleteCorrection,
   onToggleMode,
   onClose,
 }: {
@@ -943,6 +965,9 @@ function ImageModal({
   path: string;
   title: string;
   imageMode: 'processed' | 'original';
+  hasCorrection: boolean;
+  deleting: boolean;
+  onDeleteCorrection: () => void;
   onToggleMode: () => void;
   onClose: () => void;
 }) {
@@ -964,10 +989,15 @@ function ImageModal({
               type="button"
               className="imageModeButton"
               onClick={onToggleMode}
-              title={imageMode === 'processed' ? '補正画像を表示中' : '元画像を表示中'}
+              disabled={!hasCorrection || deleting}
+              title={hasCorrection && imageMode === 'processed' ? '補正画像を表示中' : '元画像を表示中'}
             >
-              補正画像 ↔ 元画像
+              {hasCorrection ? '補正画像 ↔ 元画像' : '元画像を表示中'}
             </button>
+            {hasCorrection && <button type="button" className="imageModeButton" disabled={deleting}
+              onClick={onDeleteCorrection} title="補正画像を削除し、以後の再スキャンも元画像を使います">
+              補正画像の削除
+            </button>}
             <button type="button" onClick={onClose} title="閉じる">×</button>
           </div>
         </div>

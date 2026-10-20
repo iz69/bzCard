@@ -23,8 +23,8 @@ class ContactGroupingTests(unittest.TestCase):
     def test_merges_cards_with_the_same_mobile(self):
         contacts = _contacts_from_entries(
             [
-                (card("old", person_name="橋口 秀明", mobile="080-9544-2140"), 0),
-                (card("new", person_name="橋口 秀明", email="hashiguchih@example.jp", mobile="08095442140", created_at="2026-09-26T00:00:00+00:00"), 0),
+                (card("old", person_name="空森 律明", mobile="080-0000-0111"), 0),
+                (card("new", person_name="空森 律明", email="soramori-r@example.jp", mobile="08000000111", created_at="2026-09-26T00:00:00+00:00"), 0),
             ],
             None,
         )
@@ -36,8 +36,8 @@ class ContactGroupingTests(unittest.TestCase):
     def test_same_name_and_company_without_strong_identifiers_stay_separate(self):
         contacts = _contacts_from_entries(
             [
-                (card("first", person_name="橋口 秀明", company_name="三和シャッター工業株式会社"), 0),
-                (card("second", person_name="橋口秀明", company_name="三和シヤッター工業 株式会社"), 0),
+                (card("first", person_name="空森 律明", company_name="試験シャッター工業株式会社"), 0),
+                (card("second", person_name="空森律明", company_name="試験シヤッター工業 株式会社"), 0),
             ],
             None,
         )
@@ -47,10 +47,10 @@ class ContactGroupingTests(unittest.TestCase):
     def test_search_keeps_a_contact_when_any_card_matches(self):
         contacts = _contacts_from_entries(
             [
-                (card("old", person_name="橋口 秀明", mobile="080-9544-2140"), 0),
-                (card("new", person_name="橋口 秀明", mobile="080-9544-2140", email="hashiguchih@example.jp"), 1500),
+                (card("old", person_name="空森 律明", mobile="080-0000-0111"), 0),
+                (card("new", person_name="空森 律明", mobile="080-0000-0111", email="soramori-r@example.jp"), 1500),
             ],
-            "hashiguchih",
+            "soramori-r",
         )
 
         self.assertEqual(len(contacts), 1)

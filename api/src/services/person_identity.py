@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 
 from .normalization import _normalize_kana_field
 from .name_evidence import (
     _CORPORATE_MARKER, _compact_for_evidence,
     _is_horizontal_neighbour, _is_organization_name, _kanji_text,
-    _same_text_line,
+    _same_text_line, _name_evidence_lines,
     _spatial_name_blocks, _spatial_name_candidates, _spatial_ruby_identities,
     compact_name, person_name_is_printed, printed_reading, same_person,
     PERSON_CHARS, unique_name_candidate,
@@ -75,10 +76,10 @@ def _join_spaced_person_name(data: dict, raw_text: str, blocks: list[dict]) -> N
     parts = (data.get("person_name") or "").split()
     if len(parts) == 2:
         # OCR boxes are recognition fragments, not necessarily surname/given
-        # boundaries (e.g. "佐藤 正" / "宗"). Do not replace a complete pair.
+        # boundaries within a given name. Do not replace a complete pair.
         return
     compact = compact_name(data.get("person_name"))
-    printed = {" ".join(line.split()) for line in raw_text.splitlines()
+    printed = {" ".join(line.split()) for line in _name_evidence_lines(raw_text)
                if compact_name(line) == compact and len(line.split()) == 2}
     if len(printed) == 1:
         data["person_name"] = printed.pop()
@@ -109,6 +110,18 @@ def _recover_printed_company(data: dict, raw_text: str) -> None:
     companies = [line.strip() for line in raw_text.splitlines()
                  if _CORPORATE_MARKER.search(line) and len(line.strip()) <= 80]
     companies = list(dict.fromkeys(companies))
+    current = compact_name(data.get("company_name"))
+    if (current and _CORPORATE_MARKER.search(current) and not _CORPORATE_MARKER.fullmatch(current)
+            and any(compact_name(line).endswith(current) for line in companies)):
+        # A logo can be recognized as a numeric prefix in the same OCR block.
+        # Use only the matched company, preserving its printed word spacing.
+        # The model can add spaces inside a Japanese company name.
+        pattern = r"\s*".join(map(re.escape, current)) + r"\s*$"
+        printed = {match[0].strip() for line in companies
+                   if (match := re.search(pattern, unicodedata.normalize("NFKC", line)))}
+        if len(printed) == 1:
+            data["company_name"] = printed.pop()
+        return
     if len(companies) == 1:
         data["company_name"] = companies[0]
 
@@ -195,10 +208,11 @@ def retain_previous_identity_from_partial_ocr(data: dict, previous: dict | None,
             or any(compact_name(block.get("text")) == family for block in blocks)):
         return None
     kana = _normalize_kana_field(previous.get("person_name_kana"))
+    has_previous_reading = len(kana.split()) == 2
     data["person_name"] = name
-    data["person_name_kana"] = kana
+    data["person_name_kana"] = kana if has_previous_reading else ""
     return {"status": "retained", "source": "previous_identity_partial_ocr",
-            "retain_previous_reading": True,
+            "retain_previous_reading": has_previous_reading,
             "reason": "surname_email_and_mobile_match_given_name_unreadable"}
 
 

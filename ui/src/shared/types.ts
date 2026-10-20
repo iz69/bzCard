@@ -3,6 +3,8 @@ export type Card = {
   status: string;
   revision?: string | number;
   ocr_direction?: string;
+  processed_image_path?: string;
+  images?: { side: 'front' | 'back'; correction_disabled?: number | boolean }[];
   thumbnail_path?: string;
   back_original_image_path?: string;
   back_processed_image_path?: string;

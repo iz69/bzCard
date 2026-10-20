@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sys
 import time
+import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,8 +12,11 @@ import numpy as np
 from PIL import Image
 
 from ..config import settings
+from .name_evidence import _is_organization_name, _kanji_text, _roman_labeled_name_rows
+from .address_evidence import PREFECTURES
 
 _engine = None
+logger = logging.getLogger("bzcard.ocr")
 
 
 @dataclass
@@ -49,6 +54,8 @@ def run_yomitoku(image_path: Path, direction: str = "horizontal") -> OcrResult:
 
     results, _ = engine(img_array)
     blocks = _extract_blocks(results)
+    blocks = _refine_roman_labeled_names(engine, img_array, blocks)
+    blocks = _refine_truncated_prefectures(engine, img_array, blocks)
     horizontal_score, vertical_score = _orientation_scores(blocks)
     if direction == "auto":
         direction = _detect_direction(horizontal_score, vertical_score)
@@ -69,6 +76,108 @@ def run_yomitoku(image_path: Path, direction: str = "horizontal") -> OcrResult:
         horizontal_score=horizontal_score,
         vertical_score=vertical_score,
     )
+
+
+def _refine_roman_labeled_names(engine, image: np.ndarray, blocks: list[dict]) -> list[dict]:
+    """Retry incomplete roman-labeled kanji using slightly larger image crops.
+
+    Both padding sizes must agree with high recognition scores. Preserve the
+    detector geometry and record the initial reading for later inspection.
+    """
+    rows = [row for row in _roman_labeled_name_rows(blocks)
+            if any(_is_organization_name(name["text"]) for name in row["names"])
+            or sum(len(name["text"]) for name in row["names"]) < 3][:2]
+    if not rows:
+        return blocks
+    polygons, targets = [], []
+    height, width = image.shape[:2]
+    for row in rows:
+        for name in row["names"]:
+            x1, y1, x2, y2 = name["box"]
+            for ratio in (.1, .2):
+                padding = max(2, round((y2 - y1) * ratio))
+                box = [max(0, int(x1) - padding), max(0, int(y1) - padding),
+                       min(width, int(x2) + padding), min(height, int(y2) + padding)]
+                a, b, c, d = box
+                polygons.append([[a, b], [c, b], [c, d], [a, d]])
+                targets.append((name["index"], box))
+    try:
+        result, _ = engine.recognizer(image, polygons)
+        if len(result.contents) != len(targets) or len(result.scores) != len(targets):
+            return blocks
+    except Exception:
+        logger.exception("Name crop recognition failed; retaining initial OCR")
+        return blocks
+    readings: dict[int, list[dict]] = {}
+    for (index, box), text, score in zip(targets, result.contents, result.scores):
+        readings.setdefault(index, []).append({"text": str(text).strip(), "score": float(score), "box": box})
+    updated = list(blocks)
+    for row in rows:
+        names = row["names"]
+        proposals = [readings[name["index"]] for name in names]
+        if any(len({v["text"] for v in values}) != 1 or min(v["score"] for v in values) < .9
+               for values in proposals):
+            continue
+        spelling = [values[0]["text"] for values in proposals]
+        if (not all(_kanji_text(text) and not _is_organization_name(text) for text in spelling)
+                or not 3 <= sum(len(_kanji_text(text)) for text in spelling) <= 6):
+            continue
+        for name, text, variants in zip(names, spelling, proposals):
+            original = blocks[name["index"]]
+            if text != original["text"]:
+                updated[name["index"]] = {**original, "text": text,
+                    "_recognition_retry": {"method": "expanded_name_crop", "original_text": original["text"],
+                                           "variants": variants}}
+    return updated
+
+
+def _refine_truncated_prefectures(engine, image: np.ndarray, blocks: list[dict]) -> list[dict]:
+    """Re-read an address missing its first prefecture character from the image.
+
+    Geography only triggers recognition. Both crops must actually read the
+    complete address; never insert a character based on the place name alone.
+    """
+    targets, polygons = [], []
+    height, width = image.shape[:2]
+    for index, block in enumerate(blocks):
+        text, box = str(block.get("text") or ""), block.get("box")
+        if not box or len(box) != 4 or any(text.startswith(name) for name in PREFECTURES):
+            continue
+        expected = [name[0] + text for name in PREFECTURES if text.startswith(name[1:])]
+        if len(expected) != 1 or not re.search(r"[市区郡].*[0-9０-９]", text):
+            continue
+        if len(targets) >= 4:
+            break
+        variants = []
+        for ratio in (.3, .4):
+            x1, y1, x2, y2 = box
+            padding = max(2, round((y2 - y1) * ratio))
+            crop = [max(0, int(x1) - padding), max(0, int(y1) - padding),
+                    min(width, int(x2) + padding), min(height, int(y2) + padding)]
+            a, b, c, d = crop
+            polygons.append([[a, b], [c, b], [c, d], [a, d]])
+            variants.append(crop)
+        targets.append((index, expected[0], variants))
+    if not targets:
+        return blocks
+    try:
+        result, _ = engine.recognizer(image, polygons)
+        if len(result.contents) != len(polygons) or len(result.scores) != len(polygons):
+            return blocks
+    except Exception:
+        logger.exception("Address crop recognition failed; retaining initial OCR")
+        return blocks
+    updated = list(blocks)
+    for position, (index, expected, crops) in enumerate(targets):
+        variants = [{"text": str(result.contents[position * 2 + offset]).strip(),
+                     "score": float(result.scores[position * 2 + offset]), "box": crop}
+                    for offset, crop in enumerate(crops)]
+        if all(variant["text"] == expected and variant["score"] >= .9 for variant in variants):
+            original = blocks[index]
+            updated[index] = {**original, "text": expected,
+                "_recognition_retry": {"method": "expanded_address_crop", "original_text": original["text"],
+                                       "variants": variants}}
+    return updated
 
 
 def _detect_direction(horizontal_score: int, vertical_score: int) -> str:

@@ -5,7 +5,7 @@ import { fields } from '../../shared/cardFields';
 import { AuthedImage } from '../../shared/components/Images';
 import { TagsInput } from '../../shared/components/Tags';
 import { CorrectionHistory } from '../../shared/components/CorrectionHistory';
-import { combinedOcrText, errorMessage, formatDate, formatJson, imagePathFor, openGoogleMaps } from '../../shared/format';
+import { combinedOcrText, errorMessage, formatDate, formatJson, imagePathFor, hasCorrectedImage, openGoogleMaps } from '../../shared/format';
 import { MobileStatus } from '../MobileStatus';
 import { useCardDetail } from '../useCardDetail';
 import { useCardEditor } from '../useCardEditor';
@@ -50,6 +50,19 @@ export default function CardDetailPage({ api, contactId, cardId, revision, onCha
     {error ? <div className={styles.error} role="alert"><p>{error}</p><button type="button" onClick={reload}>再試行</button></div> : <p className={styles.inlineStatus} role="status"><Loader2 className="spin" />名刺を読み込んでいます</p>}
   </div>;
   const imagePath = imagePathFor(card, side, mode);
+  const hasCorrection = hasCorrectedImage(card, side);
+  const imageBusy = busy || saving || !['ready', 'error', 'not_card'].includes(card.status);
+  async function deleteCorrection() {
+    if (imageBusy) return;
+    setBusy(true);
+    try {
+      await api.delete(`/api/cards/${encodeURIComponent(cardId)}/processed-image?side=${side}`);
+      setMode('processed');
+      onMessage('補正画像を削除しました。以後の再スキャンも元画像を使います');
+      reload(); onChanged();
+    } catch (error) { onMessage(errorMessage(error)); }
+    finally { setBusy(false); }
+  }
   const historical = relatedCards.filter(item => item.id !== cardId);
   return <section className={styles.detailPage} aria-label="名刺詳細">
     <div className={styles.detailScroll}>
@@ -60,7 +73,7 @@ export default function CardDetailPage({ api, contactId, cardId, revision, onCha
         <div className={styles.imageControls}>
           <button type="button" aria-pressed={side === 'front'} onClick={() => setSide('front')}>表</button>
           <button type="button" aria-pressed={side === 'back'} disabled={!card.back_original_image_path} onClick={() => setSide('back')}>裏</button>
-          <button type="button" onClick={() => setMode(mode === 'processed' ? 'original' : 'processed')}>{mode === 'processed' ? '元画像を表示' : '補正画像を表示'}</button>
+          <button type="button" disabled={!hasCorrection || imageBusy} onClick={() => setMode(mode === 'processed' ? 'original' : 'processed')}>{hasCorrection ? (mode === 'processed' ? '元画像を表示' : '補正画像を表示') : '元画像を表示中'}</button>
         </div>
         <button type="button" className={styles.imageButton} aria-label="名刺画像を拡大" onClick={() => setZoom(true)}><AuthedImage api={api} path={imagePath} /></button>
         <div className={styles.imageControls}>
@@ -102,7 +115,7 @@ export default function CardDetailPage({ api, contactId, cardId, revision, onCha
       catch (error) { onMessage(errorMessage(error)); }
     }}>{saving ? <Loader2 className="spin" /> : <Save />}保存</button></div>
     {zoom && <div className={styles.zoom} role="dialog" aria-modal="true" aria-label="名刺画像">
-      <div className={styles.zoomHeader}><button type="button" onClick={() => setMode(mode === 'processed' ? 'original' : 'processed')}>{mode === 'processed' ? '元画像を表示' : '補正画像を表示'}</button><button type="button" aria-label="画像を閉じる" onClick={() => setZoom(false)}><X /></button></div>
+      <div className={styles.zoomHeader}><button type="button" disabled={!hasCorrection || imageBusy} onClick={() => setMode(mode === 'processed' ? 'original' : 'processed')}>{hasCorrection ? (mode === 'processed' ? '元画像を表示' : '補正画像を表示') : '元画像を表示中'}</button><span className={styles.zoomActions}>{hasCorrection && <button type="button" disabled={imageBusy} onClick={() => void deleteCorrection()}>補正画像の削除</button>}<button type="button" aria-label="画像を閉じる" onClick={() => setZoom(false)}><X /></button></span></div>
       <AuthedImage api={api} path={imagePath} />
     </div>}
   </section>;

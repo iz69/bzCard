@@ -117,7 +117,10 @@ def _run_locked_job(job: dict) -> None:
 def _process_image(card_id: str, image: dict) -> None:
     side = image["side"]
     original_path = resolve_data_path(image["original_image_path"])
-    processed_path, thumbnail_path = create_processed_images(original_path, card_id, side, (image["manual_rotation"] + image["auto_rotation"]) % 360)
+    processed_path, thumbnail_path = create_processed_images(
+        original_path, card_id, side, (image["manual_rotation"] + image["auto_rotation"]) % 360,
+        correct=not image.get("correction_disabled", False),
+    )
     repository.set_card_processing_artifacts(
         card_id,
         relative_path(processed_path),
