@@ -75,10 +75,11 @@ def main():
     generate = extractor._generate_structured_response
     generated = {}
 
-    def cached_generate(prompt):
-        if prompt not in generated:
-            generated[prompt] = generate(prompt)
-        return generated[prompt]
+    def cached_generate(prompt, schema=None):
+        key = (prompt, json.dumps(schema, sort_keys=True))
+        if key not in generated:
+            generated[key] = generate(prompt, schema) if schema is not None else generate(prompt)
+        return generated[key]
 
     with patch.object(feedback, 'connection', readonly_connection), \
          patch.object(kana_reading, '_predict', side_effect=cached_predict):

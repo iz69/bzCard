@@ -98,6 +98,33 @@ class ReadonlyReplayTests(unittest.TestCase):
         self.assertEqual(llm.call_count, 2)
         self.assertEqual(self.digest(), before)
 
+    def test_generate_caches_auxiliary_role_checks_without_writing_cards(self):
+        rows = [{'text': text, 'box': box, '_side': 'front'} for text, box in (
+            ('セールスエンジニア', [100, 40, 300, 60]),
+            ('所長', [100, 100, 150, 120]),
+            ('雲原 晴輔', [100, 130, 300, 170]),
+        )]
+        with sqlite3.connect(self.path) as conn:
+            conn.execute('CREATE TABLE card_images(id TEXT, card_id TEXT, side TEXT, ocr_text TEXT, ocr_blocks_json TEXT)')
+            conn.execute('INSERT INTO card_images VALUES(?,?,?,?,?)',
+                         ('image', 'sample', 'front', '\n'.join(row['text'] for row in rows), json.dumps(rows)))
+        before = self.digest()
+        def generate(prompt, schema=None):
+            if schema is not None:
+                return json.dumps({'occupation': 'セールスエンジニア', 'title': '所長'})
+            return json.dumps({'person_name': '雲原 晴輔', 'person_name_kana': 'くもはら はるすけ',
+                               'title': 'セールスエンジニア'})
+        output = io.StringIO()
+        with patch('sys.argv', ['replay', '--with-readings', '--generate', '--check-fresh']), \
+             patch.object(extractor, '_generate_structured_response', side_effect=generate) as llm, \
+             patch.object(kana_reading, 'settings', SimpleNamespace(kana_base_url='')), \
+             contextlib.redirect_stdout(output):
+            replay.main()
+        summary = json.loads(output.getvalue().splitlines()[-1])
+        self.assertEqual((summary['cards'], summary['fresh_changed_or_failed']), (1, 0))
+        self.assertEqual(llm.call_count, 2)
+        self.assertEqual(self.digest(), before)
+
 
 if __name__ == '__main__':
     unittest.main()
