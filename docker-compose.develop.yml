@@ -2,6 +2,7 @@
 services:
   api:
     container_name: bzcard-api
+    image: bzcard-api:dev
     build: ./api
     ports:
       - "127.0.0.1:18081:8000"
@@ -11,9 +12,9 @@ services:
       - BASE_PATH=${API_BASE_PATH:-/bzcard-api}
       - DATA_DIR=/data
       - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
-      - LLM_BASE_URL=${LLM_BASE_URL:-http://bzcard-ollama:11434}
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://ollama:11434}
       - LLM_MODEL=${LLM_MODEL:-bzcard-lfm-jp:202606}
-      - KANA_BASE_URL=${KANA_BASE_URL:-http://bzcard-kana:8001}
+      - KANA_BASE_URL=${KANA_BASE_URL:-http://kana:8001}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.5-flash}
       - OCR_DEVICE=cpu
@@ -25,11 +26,12 @@ services:
       - LINE_CREDENTIALS_ENCRYPTION_KEY=${LINE_CREDENTIALS_ENCRYPTION_KEY:-}
       - SESSION_TTL_HOURS=${SESSION_TTL_HOURS:-720}
     volumes:
-      - ./data:/data
+      - ${BZCARD_DATA_DIR:-./data}:/data
     mem_limit: 3g
 
   kana:
     container_name: bzcard-kana
+    image: bzcard-kana:dev
     build:
       context: ./api
       dockerfile: Dockerfile.kana
@@ -38,7 +40,12 @@ services:
       - TZ=Asia/Tokyo
       - KANA_CHECKPOINT=/model/checkpoint_best.pt
     volumes:
-      - ./data/models/kanjikana-1.9o/checkpoint_best.pt:/model/checkpoint_best.pt:ro
+      - type: bind
+        source: ${BZCARD_DATA_DIR:-./data}/models/kanjikana-1.9o/checkpoint_best.pt
+        target: /model/checkpoint_best.pt
+        read_only: true
+        bind:
+          create_host_path: false
     mem_limit: 2500m
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3)"]
@@ -48,6 +55,7 @@ services:
 
   ui:
     container_name: bzcard-ui
+    image: bzcard-ui:dev
     build:
       context: ./ui
     environment:
@@ -63,5 +71,5 @@ services:
     image: ollama/ollama:latest
     restart: unless-stopped
     volumes:
-      - ./ollama:/root/.ollama
+      - ${BZCARD_OLLAMA_DIR:-./ollama}:/root/.ollama
     mem_limit: 2g

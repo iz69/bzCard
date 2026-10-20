@@ -93,7 +93,7 @@ docker compose up -d ollama
 
 [導入ガイドのモデル準備](../administrators/installation.md#モデルの準備) を実行します。
 このシェルでは `COMPOSE_FILE=docker-compose.develop.yml` を維持し、
-モデル保存先には `./data` を使ってください。
+モデル保存先には `BZCARD_DATA_DIR` で指定したディレクトリ（既定は `./data`）を使ってください。
 
 続いて、APIとWebUIを含む全コンテナを起動します。
 

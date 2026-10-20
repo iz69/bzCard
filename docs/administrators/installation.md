@@ -92,8 +92,7 @@ echo "cd9d29ad7ecf33afb02a14b807716fbf07fc6d535b9fa385bc431cdf7e53850f  $BZCARD_
 ```
 
 上の `BZCARD_MODEL_DATA_DIR` はダウンロード先を指定するシェル変数です。
-配布用Composeで `BZCARD_DATA_DIR` を変更した場合は同じ保存先を指定してください。
-ソースビルド用Composeのモデル保存先は `./data` です。
+`BZCARD_DATA_DIR` を変更した場合は、どちらのComposeでも同じ保存先（既定は `./data`）を指定してください。
 重みは、その保存先の `models/kanjikana-1.9o/checkpoint_best.pt` に配置します。
 重みがない場合、kanaコンテナの起動はエラーになります。
 

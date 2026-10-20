@@ -1,4 +1,0 @@
-# Apply over the running compose configuration to use the locally built API.
-services:
-  api:
-    image: bzcard-api:dev

@@ -83,30 +83,28 @@ GHCRの公開方法とVisibilityについては
 
 ## 実装と検証
 
-### 稼働中のWebUIをローカルdev版へ切り替える
+### ローカルビルド版を使う
 
-印刷機能などUIだけを検証する場合は、ローカルソースから `bzcard-ui:dev` を作り、
-[docker-compose.ui-dev.yml](../../docker-compose.ui-dev.yml) を稼働構成に重ねてWebUIを更新できます。
-ビルド時の表示バージョンは `dev` です。
+ローカルソースから起動・更新する場合は、[docker-compose.develop.yml](../../docker-compose.develop.yml)
+だけを使います。API・WebUI・読みサービスのイメージ名は、それぞれ
+`bzcard-api:dev`・`bzcard-ui:dev`・`bzcard-kana:dev` です。ビルド時の表示バージョンは `dev` です。
 
 ```sh
-docker build -t bzcard-ui:dev ./ui
-docker compose -f docker-compose.yml -f docker-compose.ui-dev.yml up -d --no-deps ui
+docker compose -f docker-compose.develop.yml build api ui kana
+docker compose -f docker-compose.develop.yml up -d --no-build --pull never
 ```
 
-別のディレクトリから稼働している構成では、最初の `-f` に稼働中のcomposeファイルを指定し、
-2つ目にこのリポジトリの `docker-compose.ui-dev.yml` の絶対パスを指定します。
-稼働中と同じプロジェクト名・環境設定で実行してください。
-配布版へ戻す場合は、稼働中のcomposeファイルだけで `up -d --no-deps ui` を実行します。
+一つのサービスだけを更新するときも、同じComposeを使います。例えばAPIの場合:
 
-APIを修正した場合は `docker build -t bzcard-api:dev ./api` でビルドし、
-[docker-compose.api-dev.yml](../../docker-compose.api-dev.yml) を重ねて同じ方法で `api` を更新します。
-WebUIもdev版で稼働している場合は、UIとAPIの両方のoverrideファイルを指定します。
+```sh
+docker compose -f docker-compose.develop.yml build api
+docker compose -f docker-compose.develop.yml up -d --no-deps --no-build --pull never api
+```
+
+稼働環境を切り替える場合は、同じプロジェクト名・`.env`・データ保存先を指定してください。
+既存イメージを使って構成だけ切り替える場合はビルドを省き、`up -d --no-build --pull never` を使います。
 更新前のバックアップは [設定・運用ガイド](../administrators/README.md#バックアップとdb移行) を参照してください。
-
-読みサービスを修正した場合は `docker build -f api/Dockerfile.kana -t bzcard-kana:dev ./api` でビルドし、
-[docker-compose.kana-dev.yml](../../docker-compose.kana-dev.yml) も重ねて `kana` を更新します。
-API・WebUIを含め、稼働中のdev版に対応するoverrideファイルは次回の更新時にも指定してください。
+配布版を使う場合は `docker-compose.yml` を指定します。
 ビルド後はPython・Torchのバージョンも稼働中の環境と照合し、ローカルの古いベースイメージによる意図しないダウングレードを避けてください。
 
 ### UIの検証
