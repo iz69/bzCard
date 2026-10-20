@@ -12,7 +12,7 @@ from .normalization import normalize_fields, _normalize_kana_field
 from .name_evidence import printed_reading
 from .timeutil import now_iso
 
-PIPELINE_VERSION = "29"
+PIPELINE_VERSION = "32"
 
 
 def _compact(value: str) -> str:
@@ -119,14 +119,20 @@ def prompt_examples(corrections: list[dict]) -> str:
 
 
 def apply_known_reading(data: dict, source: str, blocks: list[dict], corrections: list[dict],
-                        allow_general: bool = True) -> list[str]:
+                        allow_general: bool = True, reading_decision: dict | None = None) -> list[str]:
     name = data.get("person_name", "")
     if not name or not corrections:
         return []
-    printed = printed_reading(data, source, blocks)
-    # The printed evidence was already handled by the extractor. General
-    # reading preferences must not reinterpret it, including roman spelling.
-    if printed:
+    if reading_decision is None:
+        # Standalone callers still need evidence validation. The extraction
+        # pipeline supplies its final decision, including model-backed checks.
+        if printed_reading(data, source, blocks):
+            return []
+    elif (reading_decision.get('source') in ('printed', 'roman')
+          or reading_decision.get('status') in ('printed', 'roman')
+          or str(reading_decision.get('reason') or '').startswith('conflicting_')):
+        # Do not reinterpret an established or unresolved printed reading after
+        # throwing away the model context that produced that decision.
         return []
     ids = _identifiers(data)
     matches = [c for c in corrections if _compact(c["context"].get("person_name", "")) == _compact(name)

@@ -104,6 +104,11 @@ APIを修正した場合は `docker build -t bzcard-api:dev ./api` でビルド�
 WebUIもdev版で稼働している場合は、UIとAPIの両方のoverrideファイルを指定します。
 更新前のバックアップは [設定・運用ガイド](../administrators/README.md#バックアップとdb移行) を参照してください。
 
+読みサービスを修正した場合は `docker build -f api/Dockerfile.kana -t bzcard-kana:dev ./api` でビルドし、
+[docker-compose.kana-dev.yml](../../docker-compose.kana-dev.yml) も重ねて `kana` を更新します。
+API・WebUIを含め、稼働中のdev版に対応するoverrideファイルは次回の更新時にも指定してください。
+ビルド後はPython・Torchのバージョンも稼働中の環境と照合し、ローカルの古いベースイメージによる意図しないダウングレードを避けてください。
+
 ### UIの検証
 
 UIはViteの相対パスで一度だけビルドする。起動時に公開パスを検証し、

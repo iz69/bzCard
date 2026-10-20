@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
+from functools import wraps
 from string import ascii_lowercase
 
 from .normalization import _normalize_kana_field
@@ -11,6 +14,33 @@ from .roles import ROLE_TITLES, split_printed_role
 
 KANJI_CHARS = "㐀-䶿一-鿿豈-﫿\U00020000-\U0002ebef々〆ヵヶ"
 PERSON_CHARS = KANJI_CHARS + "ぁ-ゖァ-ヶー"
+
+_geometry_cache: ContextVar[dict | None] = ContextVar('name_geometry_cache', default=None)
+
+
+@contextmanager
+def name_evidence_scope():
+    """Reuse geometry only while one extraction reads unchanged OCR blocks."""
+    token = _geometry_cache.set({})
+    try:
+        yield
+    finally:
+        _geometry_cache.reset(token)
+
+
+def _cached_geometry(function):
+    @wraps(function)
+    def cached(blocks):
+        cache = _geometry_cache.get()
+        if cache is None:
+            return function(blocks)
+        key = (function, id(blocks))
+        if key not in cache:
+            # Retain the input as well as the result so temporary aligned lists
+            # cannot be freed and have their ids reused within this extraction.
+            cache[key] = (blocks, function(blocks))
+        return cache[key][1]
+    return cached
 
 
 def _name_evidence_lines(source: str) -> list[str]:
@@ -107,6 +137,8 @@ def name_candidates(source: str, blocks: list[dict]) -> list[NameCandidate]:
         add(spelling, "printed_roman_identity", 3)
     for spelling, _reading in _spatial_ruby_identities(blocks):
         add(spelling, "printed_ruby_identity", 3)
+    for spelling, _reading in _fragmented_ruby_readings(blocks):
+        add(spelling, "printed_ruby_name", 3)
     japanese_part = rf"[{PERSON_CHARS}]{{1,8}}"
     for line in _name_evidence_lines(source):
         line = re.sub(r"^(?:氏名|姓名|名前)\s*[:：]\s*", "", line.strip())
@@ -167,6 +199,7 @@ def _with_spatial_name_candidates(raw_text: str, blocks: list[dict]) -> str:
     return f"{raw_text}\n\n【座標補正による氏名候補】\n{lines}"
 
 
+@_cached_geometry
 def _corporate_fragments(blocks: list[dict]) -> set[str]:
     """Recognize words next to a corporation marker, even in separate boxes."""
     corporate_blocks = [{"box": box, "side": block.get("_side")}
@@ -193,8 +226,10 @@ def _corporate_fragments(blocks: list[dict]) -> set[str]:
     return fragments - independent
 
 
+@_cached_geometry
 def _spatial_name_blocks(blocks: list[dict]) -> list[dict]:
     """Select prominent kanji relative to each card side, independent of pixels."""
+    blocks = _name_layout_blocks(blocks)
     corporate_fragments = _corporate_fragments(blocks)
     by_side: dict[str, list[dict]] = {}
     for block in blocks:
@@ -214,17 +249,50 @@ def _spatial_name_blocks(blocks: list[dict]) -> list[dict]:
     selected = []
     for side_blocks in by_side.values():
         height = max(block["box"][3] - block["box"][1] for block in side_blocks)
-        selected.extend(block for block in side_blocks if block["box"][3] - block["box"][1] >= height * .6)
+        selected.extend(block for block in side_blocks if block["box"][3] - block["box"][1] >= height * .55)
     return selected
 
 
+@_cached_geometry
+def _name_layout_blocks(blocks: list[dict]) -> list[dict]:
+    """Compare sideways OCR boxes in reading order, leaving saved boxes intact."""
+    orientations: dict[str, list[bool]] = {}
+    for block in blocks:
+        text = compact_name(block.get("text"))
+        box = _box_coordinates(block.get("box"))
+        if len(text) < 3 or box is None:
+            continue
+        width, height = box[2] - box[0], box[3] - box[1]
+        if max(width, height) >= min(width, height) * 1.5:
+            orientations.setdefault(str(block.get("_side") or "unknown"), []).append(height > width)
+    sideways = {side for side, directions in orientations.items()
+                if len(directions) >= 3 and sum(directions) / len(directions) >= .8}
+    if not sideways:
+        return blocks
+    aligned = []
+    for block in blocks:
+        box = _box_coordinates(block.get("box"))
+        if str(block.get("_side") or "unknown") in sideways and box is not None:
+            x1, y1, x2, y2 = box
+            block = {**block, "box": [y1, -x2, y2, -x1]}
+        aligned.append(block)
+    return aligned
+
+
+@_cached_geometry
 def _spatial_name_candidates(blocks: list[dict]) -> list[str]:
     """Return likely Japanese names formed by aligned, prominent OCR boxes."""
+    return list(dict.fromkeys(row['text'] for row in _spatial_name_rows(blocks)))
+
+
+@_cached_geometry
+def _spatial_name_rows(blocks: list[dict]) -> list[dict]:
+    """Keep each reconstructed row's position as well as its spelling."""
     by_side: dict[str, list[dict]] = {}
     for block in _spatial_name_blocks(blocks):
         by_side.setdefault(str(block["side"] or "unknown"), []).append(block)
 
-    candidates: list[str] = []
+    candidates: list[dict] = []
     for side_blocks in by_side.values():
         lines: list[list[dict]] = []
         for block in sorted(side_blocks, key=lambda item: (item["box"][1] + item["box"][3]) / 2):
@@ -240,9 +308,9 @@ def _spatial_name_candidates(blocks: list[dict]) -> list[str]:
                 if run and _is_horizontal_neighbour(run[-1], block, max_gap_ratio=2):
                     run.append(block)
                     continue
-                _append_name_candidate(candidates, run)
+                _append_name_row(candidates, run)
                 run = [block]
-            _append_name_candidate(candidates, run)
+            _append_name_row(candidates, run)
     return candidates
 
 
@@ -252,7 +320,7 @@ def _same_text_line(left: dict, right: dict) -> bool:
     return abs((left_y1 + left_y2) - (right_y1 + right_y2)) / 2 <= min(left_y2 - left_y1, right_y2 - right_y1) * 0.4
 
 
-def _append_name_candidate(candidates: list[str], blocks: list[dict]) -> None:
+def _append_name_row(candidates: list[dict], blocks: list[dict]) -> None:
     if not blocks:
         return
     if len(blocks) == 1 and not re.fullmatch(
@@ -263,8 +331,38 @@ def _append_name_candidate(candidates: list[str], blocks: list[dict]) -> None:
     # Two to six kanji covers ordinary Japanese full names while excluding most
     # split department labels and sentences.
     minimum = 3 if len(blocks) == 1 else 2
-    if minimum <= len(candidate) <= 6 and not _is_organization_name(candidate) and candidate not in candidates:
-        candidates.append(candidate)
+    if minimum <= len(candidate) <= 6 and not _is_organization_name(candidate):
+        candidates.append({'text': candidate, 'side': blocks[0]['side'],
+                           'box': (min(b['box'][0] for b in blocks), min(b['box'][1] for b in blocks),
+                                   max(b['box'][2] for b in blocks), max(b['box'][3] for b in blocks))})
+
+
+@_cached_geometry
+def _spatial_roman_name_rows(blocks: list[dict]) -> list[dict]:
+    """Link a small roman label below exactly one complete Japanese name row."""
+    found = []
+    for block in _name_layout_blocks(blocks):
+        match = re.fullmatch(r'([A-Za-z]{3,})\s+([A-Za-z]{3,})', str(block.get('text') or '').strip())
+        box = _box_coordinates(block.get('box'))
+        if not match or box is None:
+            continue
+        x1, y1, x2, y2 = box
+        matches = []
+        for row in _spatial_name_rows(blocks):
+            rx1, ry1, rx2, ry2 = row['box']
+            height = ry2 - ry1
+            overlap = min(x2, rx2) - max(x1, rx1)
+            if (row['side'] == block.get('_side') and (y2 - y1) <= height * .8
+                    and -.1 * height <= y1 - ry2 <= height * .8
+                    and overlap >= min(x2 - x1, rx2 - rx1) * .8):
+                matches.append(row)
+        if len(matches) == 1:
+            found.append({'text': matches[0]['text'], 'roman': tuple(p.casefold() for p in match.groups())})
+    return found
+
+
+def _spatial_roman_pairs(name: str, blocks: list[dict]) -> set[tuple[str, str]]:
+    return {row['roman'] for row in _spatial_roman_name_rows(blocks) if row['text'] == compact_name(name)}
 
 
 def _is_horizontal_neighbour(left: dict, right: dict, max_gap_ratio: float = .8) -> bool:
@@ -306,6 +404,7 @@ _CORPORATE_MARKER = re.compile(
 )
 
 
+@_cached_geometry
 def _roman_labeled_name_rows(blocks: list[dict]) -> list[dict]:
     """Locate two kanji fields with small roman labels immediately above them.
 
@@ -531,6 +630,7 @@ def _ruby_kana_for_name(blocks: list[dict], name: str) -> str:
     return results.pop() if len(results) == 1 else ""
 
 
+@_cached_geometry
 def _spatial_ruby_identities(blocks: list[dict]) -> list[tuple[str, str]]:
     """Read a two-block kanji name and the smaller ruby printed above each block."""
     names = []
@@ -572,6 +672,61 @@ def _spatial_ruby_identities(blocks: list[dict]) -> list[tuple[str, str]]:
             if family and given:
                 found.add((f"{left['text']} {right['text']}", f"{family} {given}"))
     return sorted(found)
+
+
+@_cached_geometry
+def _fragmented_ruby_readings(blocks: list[dict]) -> list[tuple[str, str]]:
+    """Collect small kana above a single name box without inventing a boundary."""
+    found = set()
+    for name_block in blocks:
+        name = _kanji_text(name_block.get("text"))
+        box = _box_coordinates(name_block.get("box"))
+        if not name or not 3 <= len(name) <= 6 or _is_organization_name(name) or box is None:
+            continue
+        nx1, ny1, nx2, ny2 = box
+        height = ny2 - ny1
+        if nx2 - nx1 < height * 2:
+            continue
+        ruby = []
+        for block in blocks:
+            if block.get("_side") != name_block.get("_side"):
+                continue
+            text = _normalize_kana_field(block.get("text"))
+            position = _box_coordinates(block.get("box"))
+            if not text or position is None:
+                continue
+            x1, y1, x2, y2 = position
+            if (y2 - y1 >= height * .65 or not ny1 - height <= y2 <= ny1 + height * .2
+                    or y1 >= ny1 or not nx1 <= (x1 + x2) / 2 <= nx2):
+                continue
+            ruby.append((x1, (y1 + y2) / 2, x2, text))
+        ruby.sort()
+        if ((2 <= len(ruby) <= 6 or (len(ruby) == 1 and len(ruby[0][3].split()) >= 3))
+                and ruby[-1][2] - ruby[0][0] >= (nx2 - nx1) * .6
+                and max(r[1] for r in ruby) - min(r[1] for r in ruby) <= height * .3
+                and all(left[2] <= right[0] for left, right in zip(ruby, ruby[1:]))):
+            found.add((name, "".join(r[3].replace(' ', '') for r in ruby)))
+    return sorted(found)
+
+
+def _adjacent_ocr_one(name: str, blocks: list[dict]) -> bool:
+    """Locate a separate OCR '1' immediately after the selected kanji name."""
+    blocks = _name_layout_blocks(blocks)
+    for block in blocks:
+        box = _box_coordinates(block.get("box"))
+        if compact_name(block.get("text")) != compact_name(name) or box is None:
+            continue
+        left = {"box": box}
+        for other in blocks:
+            right_box = _box_coordinates(other.get("box"))
+            if (str(other.get("text") or "").strip() != "1" or right_box is None
+                    or other.get("_side") != block.get("_side") or right_box[0] <= box[0]):
+                continue
+            if (_same_text_line(left, {"box": right_box})
+                    and _is_horizontal_neighbour(left, {"box": right_box}, max_gap_ratio=.5)
+                    and right_box[3] - right_box[1] >= (box[3] - box[1]) * .5):
+                return True
+    return False
 
 
 def _roman_name_pairs(raw_text: str) -> list[tuple[str, str]]:

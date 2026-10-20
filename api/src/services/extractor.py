@@ -17,7 +17,7 @@ from .name_evidence import (
     _is_organization_name,
     _spatial_name_candidates,
     _with_spatial_name_candidates,
-    compact_name, person_name_is_printed,
+    compact_name, person_name_is_printed, name_evidence_scope,
 )
 from .person_identity import resolve_person_name
 from .roles import ROLE_TITLES as _ROLE_TITLES, split_printed_role
@@ -34,6 +34,7 @@ class ExtractionResult:
     duration_ms: int
 
 
+@name_evidence_scope()
 def extract_card_fields(raw_text: str, blocks: list[dict], owner_user_id: str | None = None,
                         previous: dict | None = None) -> ExtractionResult:
     started = time.perf_counter()
@@ -62,16 +63,17 @@ def extract_card_fields(raw_text: str, blocks: list[dict], owner_user_id: str | 
                                          previous=previous, name_decision=identity_info)
     if kana_info.get("segmentation") == "verified":
         identity_info = {"status": "resolved", "source": "reading_verified_boundary"}
+    if kana_info.get("name_repair"):
+        identity_info = {"status": "resolved", "source": "reading_verified_ocr_character",
+                         "repair": kana_info["name_repair"]}
     identity_info["selected"] = normalized.get("person_name") or ""
     automatic = dict(normalized)
-    # Text-only feedback cannot reproduce OCR repairs or model-verified roman
-    # association. Preserve their verified printed reading over corrections.
-    protected_roman = (kana_info.get("roman_ocr_corrections")
-                       or kana_info.get("verification") == "family_and_full_name_model_match")
-    applied = [] if protected_roman else apply_known_reading(
-        normalized, source_text, blocks, corrections, allow_general=kana_info.get("source") != "previous")
+    applied = apply_known_reading(
+        normalized, source_text, blocks, corrections,
+        allow_general=kana_info.get("source") != "previous", reading_decision=kana_info)
     if applied:
         kana_info.update(status="corrected", selected=normalized["person_name_kana"], source="confirmed_correction")
+    kana_info['selected'] = normalized.get('person_name_kana') or ''
     normalized["_automatic"] = automatic
     normalized["_feedback"] = {"example_ids": [c["id"] for c in corrections], "applied_ids": applied}
     if fallback:
@@ -310,13 +312,20 @@ _DEPARTMENT_END = re.compile(r"(?:本部|事業部|部|課|室|局|支店|営業
 
 
 def _recover_printed_title(data: dict, raw_text: str) -> None:
-    """Recover one standalone printed role after rejecting a model invention."""
-    if data.get("title"):
-        return
+    """Prefer a standalone role to a fragment copied from professional licenses."""
     roles = {compact_name(line) for line in raw_text.splitlines()
              if compact_name(line) in _ROLE_TITLES}
-    if len(roles) == 1:
-        data["title"] = roles.pop()
+    if len(roles) != 1:
+        return
+    qualifications = re.findall(r'[一-龯々]{2,}士', raw_text)
+    title = compact_name(data.get('title'))
+    if not title or any(title in qualification for qualification in qualifications):
+        data['title'] = roles.pop()
+    department = compact_name(data.get('department'))
+    if (department and not _DEPARTMENT_END.search(department)
+            and department not in {compact_name(line) for line in raw_text.splitlines()}
+            and any(department in qualification for qualification in qualifications)):
+        data['department'] = ''
 
 
 def _remove_person_from_title(data: dict, source: str, blocks: list[dict]) -> None:

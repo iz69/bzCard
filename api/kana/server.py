@@ -11,9 +11,11 @@ from pathlib import Path
 import torch
 
 from model import KanaModel, MODEL_VERSION
+from prediction_cache import CachedPredictor
 
 torch.set_num_threads(2)
 model = KanaModel(Path(os.getenv("KANA_CHECKPOINT", "/model/checkpoint_best.pt")))
+predict = CachedPredictor(model.predict)
 lock = threading.Lock()
 logging.basicConfig(level=logging.INFO)
 
@@ -39,8 +41,8 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(name, str) or not isinstance(family, str):
                 raise ValueError("name and family must be strings")
             with lock:
-                candidates = model.predict(name)
-                family_candidates = model.predict(family)
+                candidates = predict(name)
+                family_candidates = predict(family)
             self.respond(200, {"model": MODEL_VERSION, "candidates": candidates, "family_candidates": family_candidates})
         except (ValueError, json.JSONDecodeError) as exc:
             self.respond(400, {"error": str(exc)})

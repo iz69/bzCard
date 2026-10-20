@@ -85,28 +85,25 @@ def _run_locked_job(job: dict) -> None:
             raw_text = _combined_ocr_text(images)
             if not raw_text.strip():
                 raise RuntimeError("OCR text is empty; run full reprocess first")
-            extracted = extract_card_fields(raw_text, _combined_ocr_blocks(images), owner_user_id=card["owner_user_id"], previous=card)
-            repository.save_extraction_result(card_id, extracted.data, extracted.duration_ms, raw_text, _combined_ocr_blocks(images))
-            repository.finish_job(job["id"])
-            return
+        else:
+            repository.set_card_status(card_id, "preparing")
+            images = repository.get_card_images(card_id)
+            if not images:
+                raise RuntimeError("No images registered for this card")
+            for image in images:
+                _process_image(card_id, image)
 
-        repository.set_card_status(card_id, "preparing")
-        images = repository.get_card_images(card_id)
-        if not images:
-            raise RuntimeError("No images registered for this card")
-        for image in images:
-            _process_image(card_id, image)
+            images = repository.get_card_images(card_id)
+            raw_text = _combined_ocr_text(images)
+            card_check = check_business_card(raw_text)
+            if not card_check.is_likely_card:
+                repository.set_card_status(card_id, "not_card", card_check.reason)
+                repository.finish_job(job["id"])
+                return
 
-        images = repository.get_card_images(card_id)
-        raw_text = _combined_ocr_text(images)
-        card_check = check_business_card(raw_text)
-        if not card_check.is_likely_card:
-            repository.set_card_status(card_id, "not_card", card_check.reason)
-            repository.finish_job(job["id"])
-            return
-
-        extracted = extract_card_fields(raw_text, _combined_ocr_blocks(images), owner_user_id=card["owner_user_id"], previous=card)
-        repository.save_extraction_result(card_id, extracted.data, extracted.duration_ms, raw_text, _combined_ocr_blocks(images))
+        blocks = _combined_ocr_blocks(images)
+        extracted = extract_card_fields(raw_text, blocks, owner_user_id=card["owner_user_id"], previous=card)
+        repository.save_extraction_result(card_id, extracted.data, extracted.duration_ms, raw_text, blocks)
         repository.finish_job(job["id"])
     except Exception as exc:
         message = str(exc)[:2000]

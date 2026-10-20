@@ -5,11 +5,13 @@ import re
 import unicodedata
 
 from .normalization import _normalize_kana_field
+from .company_evidence import recover_layout_company
 from .name_evidence import (
     _CORPORATE_MARKER, _compact_for_evidence,
     _is_horizontal_neighbour, _is_organization_name, _kanji_text,
     _same_text_line, _name_evidence_lines,
     _spatial_name_blocks, _spatial_name_candidates, _spatial_ruby_identities,
+    _spatial_roman_pairs, _spatial_name_rows,
     compact_name, person_name_is_printed, printed_reading, same_person,
     PERSON_CHARS, unique_name_candidate,
 )
@@ -21,11 +23,11 @@ def resolve_person_name(data: dict, source: str, blocks: list[dict], previous: d
     name = " ".join(str(data.get("person_name") or "").split())
     is_company = (_is_organization_name(name) or bool(data.get("company_name")
                   and _compact_for_evidence(name) == _compact_for_evidence(data["company_name"])))
-    _recover_printed_company(data, source)
+    _recover_printed_company(data, source, blocks)
     valid = person_name_is_printed(name, source, blocks) and not is_company
     previous_name = str((previous or {}).get("person_name") or "")
     previous_candidate = {**data, "person_name": previous_name}
-    if previous and (not valid or compact_name(name) == compact_name(previous_name)):
+    if previous and not _has_printed_name_continuation(name, blocks) and (not valid or compact_name(name) == compact_name(previous_name)):
         if same_person(previous_candidate, previous) and person_name_is_printed(previous_name, source, blocks):
             if compact_name(name) != compact_name(previous_name):
                 data["person_name_kana"] = ""
@@ -35,6 +37,10 @@ def resolve_person_name(data: dict, source: str, blocks: list[dict], previous: d
     name = " ".join(str(data.get("person_name") or "").split())
     compact = compact_name(name)
     valid = person_name_is_printed(name, source, blocks)
+    if valid:
+        retained = retain_previous_identity_from_partial_ocr(data, previous, source, blocks)
+        if retained:
+            return retained
     if not valid or re.fullmatch(r"[A-Za-z0-9&.-]+", compact) and len(name.split()) < 2:
         data["person_name"] = ""
         data["person_name_kana"] = ""
@@ -51,7 +57,8 @@ def resolve_person_name(data: dict, source: str, blocks: list[dict], previous: d
         data["person_name"] = ruby_names.pop()
         return {"status": "resolved", "source": "printed_ruby_boundary"}
     data["person_name"] = name
-    _correct_person_name_order(data, blocks, source)
+    if recovered:
+        _correct_person_name_order(data, blocks, source)
     _join_spaced_person_name(data, source, blocks)
     parts = data["person_name"].split()
     if len(parts) == 2:
@@ -95,6 +102,7 @@ def _join_spaced_person_name(data: dict, raw_text: str, blocks: list[dict]) -> N
                     or left["box"][0] >= right["box"][0]):
                 continue
             if (left["text"] + right["text"] == compact
+                    and not _spatial_roman_pairs(compact, blocks)
                     and _same_text_line(left, right)
                     and _is_horizontal_neighbour(left, right, max_gap_ratio=2)):
                 candidates.add(f"{left['text']} {right['text']}")
@@ -106,7 +114,9 @@ def _join_spaced_person_name(data: dict, raw_text: str, blocks: list[dict]) -> N
         data["person_name"] = compact
 
 
-def _recover_printed_company(data: dict, raw_text: str) -> None:
+def _recover_printed_company(data: dict, raw_text: str, blocks: list[dict] | None = None) -> None:
+    if recover_layout_company(data, raw_text, blocks or []):
+        return
     companies = [line.strip() for line in raw_text.splitlines()
                  if _CORPORATE_MARKER.search(line) and len(line.strip()) <= 80]
     companies = list(dict.fromkeys(companies))
@@ -131,19 +141,25 @@ def _recover_printed_identity(data: dict, raw_text: str, blocks: list[dict] | No
     name = data.get("person_name") or ""
     model_company = bool(name and data.get("company_name")
                          and _compact_for_evidence(name) == _compact_for_evidence(data["company_name"]))
-    _recover_printed_company(data, raw_text)
+    _recover_printed_company(data, raw_text, blocks)
     return _recover_name_candidate(data, raw_text, blocks or [], model_company)
 
 
 def _recover_name_candidate(data: dict, raw_text: str, blocks: list[dict], model_company: bool) -> str | None:
     """Select once from the shared candidate catalogue after rejecting the model."""
     name = data.get("person_name") or ""
-    if model_company or not name or _is_organization_name(name) or not person_name_is_printed(name, raw_text, blocks or []) or (
+    preferred, _candidates = unique_name_candidate(raw_text, blocks)
+    stronger_ruby = bool(preferred and preferred.source == "printed_ruby_name"
+                         and compact_name(preferred.spelling) != compact_name(name))
+    complete_row = bool(preferred and preferred.source == 'assembled_ocr_row'
+                        and compact_name(preferred.spelling).startswith(compact_name(name))
+                        and _has_printed_name_continuation(name, blocks))
+    if stronger_ruby or complete_row or model_company or not name or _is_organization_name(name) or not person_name_is_printed(name, raw_text, blocks or []) or (
         not re.search(f"[{PERSON_CHARS}]", name) and len(name.split()) < 2
     ) or (
         data.get("company_name") and _compact_for_evidence(name) == _compact_for_evidence(data["company_name"])
     ):
-        candidate, _candidates = unique_name_candidate(raw_text, blocks)
+        candidate = preferred
         if candidate:
             data["person_name"] = candidate.spelling
             if _compact_for_evidence(name) != _compact_for_evidence(data["person_name"]):
@@ -162,6 +178,19 @@ def _recover_name_candidate(data: dict, raw_text: str, blocks: list[dict], model
         ):
             data["person_name"] = ""
             data["person_name_kana"] = ""
+
+
+def _has_printed_name_continuation(name: str, blocks: list[dict]) -> bool:
+    """An independently recognized OCR fragment is incomplete on its own row."""
+    compact = compact_name(name)
+    fragments = [b for b in _spatial_name_blocks(blocks) if b['text'] == compact]
+    if not compact or not fragments:
+        return False
+    return all(any(row['text'] != compact and row['text'].startswith(compact)
+                   and row['side'] == fragment['side']
+                   and row['box'][0] <= fragment['box'][0] < fragment['box'][2] <= row['box'][2]
+                   and row['box'][1] <= fragment['box'][1] < fragment['box'][3] <= row['box'][3]
+                   for row in _spatial_name_rows(blocks)) for fragment in fragments)
 
 
 
@@ -185,13 +214,14 @@ def _retain_supported_previous_reading(data: dict, previous: dict | None, kana_i
 
 def retain_previous_identity_from_partial_ocr(data: dict, previous: dict | None,
                                               source: str, blocks: list[dict]) -> dict | None:
-    """Keep existing identity when OCR loses the given name of the same contact.
+    """Keep existing identity when OCR loses name characters of the same contact.
 
     Called after invented contact values have been removed. Require BOTH the
-    personal email and mobile plus an independently printed surname; this never
-    manufactures a new identity from an email account or source filename.
+    personal email and mobile plus an independently printed surname, or an
+    edge-truncated name with the complete printed reading. This never creates
+    an identity from an email account or source filename.
     """
-    if data.get("person_name") or not previous:
+    if not previous:
         return None
     name = " ".join(str(previous.get("person_name") or "").split())
     parts = name.split()
@@ -203,17 +233,33 @@ def retain_previous_identity_from_partial_ocr(data: dict, previous: dict | None,
             and len(mobile(data.get("mobile"))) >= 10
             and mobile(data.get("mobile")) == mobile(previous.get("mobile"))):
         return None
-    family = compact_name(parts[0])
-    if not (any(compact_name(line) == family for line in source.splitlines())
-            or any(compact_name(block.get("text")) == family for block in blocks)):
-        return None
     kana = _normalize_kana_field(previous.get("person_name_kana"))
+    current = str(data.get('person_name') or '')
+    if current:
+        # A complete printed roman name and BOTH personal identifiers can
+        # identify a known contact even if OCR drops one edge kanji. Preserve
+        # the known spelling; do not generate that missing kanji for new cards.
+        old_compact, new_compact = compact_name(name), compact_name(current)
+        missing_edge = (len(old_compact) == len(new_compact) + 1
+                        and (old_compact.startswith(new_compact) or old_compact.endswith(new_compact)))
+        confused_edge = (len(old_compact) == len(new_compact) and old_compact != new_compact
+                         and (old_compact[:-1] == new_compact[:-1] or old_compact[1:] == new_compact[1:]))
+        if not (missing_edge or confused_edge) or not person_name_is_printed(current, source, blocks):
+            return None
+        evidence = printed_reading({**data, 'person_name_kana': kana}, source, blocks)
+        if len(kana.split()) != 2 or evidence.get('selected') != kana:
+            return None
+    else:
+        family = compact_name(parts[0])
+        if not (any(compact_name(line) == family for line in source.splitlines())
+                or any(compact_name(block.get("text")) == family for block in blocks)):
+            return None
     has_previous_reading = len(kana.split()) == 2
     data["person_name"] = name
     data["person_name_kana"] = kana if has_previous_reading else ""
     return {"status": "retained", "source": "previous_identity_partial_ocr",
             "retain_previous_reading": has_previous_reading,
-            "reason": "surname_email_and_mobile_match_given_name_unreadable"}
+            "reason": "roman_email_and_mobile_match_edge_kanji_unreadable" if current else "surname_email_and_mobile_match_given_name_unreadable"}
 
 
 

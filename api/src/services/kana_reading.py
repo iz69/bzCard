@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import logging
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 
 import requests
 
@@ -11,7 +14,8 @@ from .normalization import _normalize_kana_field
 from .name_evidence import (
     _email_corroborated_roman_pairs, _kanji_text, _prefer_printed_kana,
     _linked_roman_pairs, _roman_ocr_matches, _roman_name_pairs, _model_verified_roman_readings,
-    person_name_is_printed,
+    person_name_is_printed, _spatial_name_candidates, _fragmented_ruby_readings, _adjacent_ocr_one,
+    _spatial_roman_pairs,
     KANJI_CHARS, _roman_to_hiragana, compact_name, email_name_parts, printed_reading, same_person,
 )
 from .person_identity import _retain_supported_previous_reading
@@ -19,11 +23,49 @@ from .person_identity import _retain_supported_previous_reading
 logger = logging.getLogger("bzcard.kana_reading")
 
 
+@dataclass
+class _PredictionSession:
+    results: dict = field(default_factory=dict)
+    unavailable: requests.RequestException | None = None
+
+
+_prediction_session: ContextVar[_PredictionSession | None] = ContextVar('kana_prediction_session', default=None)
+
+
+@contextmanager
+def _prediction_scope():
+    token = _prediction_session.set(_PredictionSession())
+    try:
+        yield
+    finally:
+        _prediction_session.reset(token)
+
+
 def _predict(name: str, family: str) -> dict:
-    response = requests.post(f"{settings.kana_base_url}/predict",
-                             json={"name": name, "family": family}, timeout=30)
-    response.raise_for_status()
-    return response.json()
+    session = _prediction_session.get()
+    key = (settings.kana_base_url, name, family)
+    if session is not None:
+        if session.unavailable is not None:
+            raise session.unavailable
+        if key in session.results:
+            result = session.results[key]
+            if isinstance(result, Exception):
+                raise result
+            return result
+    try:
+        response = requests.post(f"{settings.kana_base_url}/predict",
+                                 json={"name": name, "family": family}, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        if session is not None:
+            session.results[key] = exc
+            if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+                session.unavailable = exc
+        raise
+    if session is not None:
+        session.results[key] = result
+    return result
 
 
 def _model_info(result: dict) -> dict:
@@ -47,6 +89,7 @@ def _candidate_readings(result: dict) -> list[str]:
     return readings
 
 
+@_prediction_scope()
 def apply_specialist_reading(data: dict, source: str, blocks: list[dict],
                              previous: dict | None = None, name_decision: dict | None = None) -> dict:
     name = data.get("person_name") or ""
@@ -69,25 +112,33 @@ def apply_specialist_reading(data: dict, source: str, blocks: list[dict],
     if evidence.get("status") == "uncertain":
         data["person_name_kana"] = ""
         return evidence
-    linked = _linked_roman_pairs(name, source, blocks)
     parts = name.split()
-    if ((name_decision or {}).get("source") == "assembled_ocr_row"
-            and _email_corroborated_roman_pairs(source)):
-        restored = _restore_unspaced_name(data, source, blocks)
-        if restored and restored.get("segmentation") == "verified":
-            return restored
-    if len(parts) != 2:
-        restored = _restore_unspaced_name(data, source, blocks)
+    if len(parts) == 2 and evidence.get('status') == 'printed':
+        data['person_name_kana'] = evidence['selected']
+        return evidence
+    repaired = _restore_ocr_one_name(data, source, blocks)
+    if repaired:
+        return repaired
+    spatial_roman = _spatial_roman_pairs(name, blocks)
+    if spatial_roman and settings.kana_base_url and not evidence.get('selected'):
+        restored = _restore_spatial_roman_boundary(data, spatial_roman)
         if restored:
-            if restored.get("status") == "uncertain":
-                data["person_name_kana"] = ""
             return restored
-        data["person_name_kana"] = evidence.get("selected", "")
-        return {"status": "uncertain", "reason": "surname_boundary_unresolved"}
+    linked = _linked_roman_pairs(name, source, blocks)
+    if len(parts) != 2 or ((name_decision or {}).get("source") == "assembled_ocr_row"
+                          and _email_corroborated_roman_pairs(source)):
+        restored = _restore_unspaced_name(data, source, blocks)
+        if restored and restored.get('segmentation') == 'verified':
+            return restored
+        if len(parts) != 2:
+            if restored:
+                if restored.get("status") == "uncertain":
+                    data["person_name_kana"] = ""
+                return restored
+            data["person_name_kana"] = evidence.get("selected", "")
+            return {"status": "uncertain", "reason": "surname_boundary_unresolved"}
     if evidence.get("selected"):
         data["person_name_kana"] = evidence["selected"]
-        if evidence["status"] == "printed":
-            return evidence
     if not settings.kana_base_url or not all(_kanji_text(part) for part in parts):
         if linked and not evidence.get("selected"):
             return _unresolved_roman_reading(data, "reading_model_not_available")
@@ -121,6 +172,13 @@ def apply_specialist_reading(data: dict, source: str, blocks: list[dict],
         return _repair_roman_ocr_reading(data, linked, info, chosen_evidence.get("selected"))
     if chosen_evidence.get("selected"):
         selected = validated_evidence.get("selected") or chosen_evidence["selected"]
+        initial = evidence.get('selected')
+        if initial and initial != selected and _roman_long_vowel_variants(initial, selected):
+            # Plain roman letters cannot decide whether an omitted long vowel
+            # is present. Do not replace an already compatible reading merely
+            # because a lower-ranked surname candidate inserts う.
+            selected = initial
+            info['long_vowel_variant_retained'] = True
         data["person_name_kana"] = selected
         info.update(status="applied" if selected in choices else "roman", selected=selected,
                     source="roman")
@@ -143,9 +201,41 @@ def apply_specialist_reading(data: dict, source: str, blocks: list[dict],
     return info
 
 
+def _roman_long_vowel_variants(first: str, second: str) -> bool:
+    a, b = first.split(), second.split()
+    return len(a) == len(b) == 2 and all(
+        _prefer_printed_kana(left, right) == left or _prefer_printed_kana(right, left) == right
+        for left, right in zip(a, b))
+
+
 def _unresolved_roman_reading(data: dict, reason: str, info: dict | None = None) -> dict:
     data["person_name_kana"] = ""
     return {**(info or {}), "status": "uncertain", "source": "roman", "selected": "", "reason": reason}
+
+
+def _restore_ocr_one_name(data: dict, source: str, blocks: list[dict]) -> dict | None:
+    """Verify an adjacent 1/一 confusion against both printed roman components."""
+    parts = str(data.get("person_name") or "").split()
+    if (len(parts) != 2 or not all(_kanji_text(part) for part in parts)
+            or not settings.kana_base_url or not _adjacent_ocr_one(data['person_name'], blocks)):
+        return None
+    if not _linked_roman_pairs(data['person_name'], source, blocks):
+        return None
+    spelling = f'{parts[0]} {parts[1]}一'
+    try:
+        result = _predict(compact_name(spelling), parts[0])
+    except (requests.RequestException, ValueError):
+        return None
+    verified = _model_verified_roman_readings(source, result.get('family_candidates') or [], result.get('candidates') or [])
+    if len(verified) != 1:
+        return None
+    reading, pairs = next(iter(verified.items()))
+    original = data['person_name']
+    data['person_name'], data['person_name_kana'] = spelling, reading
+    return {**_model_info(result), 'status': 'roman', 'source': 'roman', 'selected': reading,
+            'verification': 'family_and_full_name_model_match', 'roman_pairs': pairs,
+            'name_repair': {'method': 'adjacent_ocr_one', 'before': original, 'after': spelling,
+                            'observed': '1', 'selected': '一'}}
 
 
 def _repair_roman_ocr_reading(data: dict, pairs: set[tuple[str, str]], info: dict,
@@ -194,6 +284,40 @@ def _unavailable_reading(data: dict, previous: dict | None, reason: str) -> dict
     return {"status": "fallback", "selected": data.get("person_name_kana") or "", "reason": reason}
 
 
+def _restore_spatial_roman_boundary(data: dict, pairs: set[tuple[str, str]]) -> dict | None:
+    """Printed local roman labels can supply a rare given reading absent from the model."""
+    name = compact_name(data.get('person_name'))
+    if not re.fullmatch(f'[{KANJI_CHARS}]{{3,6}}', name):
+        return None
+    matches = {}
+    for length in range(1, min(4, len(name) - 1) + 1):
+        try:
+            result = _predict(name, name[:length])
+        except (requests.RequestException, ValueError) as exc:
+            return _unresolved_roman_reading(data, type(exc).__name__)
+        for first, second in pairs:
+            for surname, given in ((first, second), (second, first)):
+                family_reading, given_reading = _roman_to_hiragana(surname), _roman_to_hiragana(given)
+                if not family_reading or not given_reading:
+                    continue
+                if any(_prefer_printed_kana(_normalize_kana_field(c.get('reading')), family_reading)
+                       == _normalize_kana_field(c.get('reading')) for c in result.get('family_candidates') or []):
+                    spelling = f'{name[:length]} {name[length:]}'
+                    selected = f'{family_reading} {given_reading}'
+                    matches[(spelling, selected)] = {
+                        **_model_info(result), 'status': 'roman', 'source': 'roman', 'selected': selected,
+                        'segmentation': 'verified', 'verification': 'spatial_roman_and_surname_model_match',
+                        'roman_pairs': [list(pair) for pair in sorted(pairs)],
+                    }
+    if len(matches) == 1:
+        (spelling, reading), info = next(iter(matches.items()))
+        data['person_name'], data['person_name_kana'] = spelling, reading
+        return info
+    if matches:
+        return _unresolved_roman_reading(data, 'conflicting_spatial_roman_boundaries')
+    return None
+
+
 def _restore_unspaced_name(data: dict, source: str, blocks: list[dict]) -> dict | None:
     """Verify a surname length with its reading, rather than the kanji count."""
     name = compact_name(data.get("person_name"))
@@ -202,6 +326,9 @@ def _restore_unspaced_name(data: dict, source: str, blocks: list[dict]) -> dict 
     evidence = printed_reading(data, source, blocks)
     if evidence.get("status") == "uncertain":
         return evidence
+    ruby = {reading for spelling, reading in _fragmented_ruby_readings(blocks) if spelling == name}
+    if ruby:
+        return _restore_component_verified_boundary(data, ruby)
     pairs = _email_corroborated_roman_pairs(source)
     if not evidence.get("selected") and not pairs:
         restored = _restore_model_verified_roman_boundary(data, source, blocks)
@@ -210,8 +337,9 @@ def _restore_unspaced_name(data: dict, source: str, blocks: list[dict]) -> dict 
     current = _normalize_kana_field(data.get("person_name_kana")).split()
     single_emails = [parts[0] for parts in email_name_parts(source) if len(parts) == 1]
     spaced_line = any(compact_name(line) == name and len(line.split()) > 2 for line in source.splitlines())
-    if not (evidence.get("selected") or pairs or len(current) == 2 or (spaced_line and single_emails)):
-        return None
+    fragmented = spaced_line or name in _spatial_name_candidates(blocks)
+    if not (evidence.get("selected") or pairs or len(current) == 2 or (fragmented and single_emails)):
+        return _restore_component_verified_boundary(data) if fragmented else None
     if len(pairs) > 1:
         # Different full accounts may have opposite orders. Compare the actual
         # phonetic parts rather than selecting whichever appeared first.
@@ -246,10 +374,9 @@ def _restore_unspaced_name(data: dict, source: str, blocks: list[dict]) -> dict 
                     targets.append((f"{family} {first}", "roman"))
         if not targets and len(current) == 2:
             targets.append((" ".join(current), "applied"))
-        if not targets and spaced_line and any(
-                (sound := _roman_to_hiragana(s)) and _prefer_printed_kana(family, sound) == family
-                for s in single_emails):
-            targets.extend((candidate, "applied") for candidate in candidates[:1])
+        if not targets and fragmented:
+            targets.extend((candidate, "applied") for candidate in candidates[:1]
+                           if any(_account_supports_reading(account, candidate) for account in single_emails))
         verified = []
         for reading, status in targets:
             target_parts = reading.split()
@@ -274,7 +401,94 @@ def _restore_unspaced_name(data: dict, source: str, blocks: list[dict]) -> dict 
         info.update(status=status, selected=selected, segmentation="verified",
                     source="printed" if status == "printed" else "roman" if status == "roman" else "specialist")
         return info
+    if fragmented and not (evidence.get('selected') or pairs):
+        restored = _restore_component_verified_boundary(data)
+        if restored:
+            return restored
     return {"status": "uncertain", "reason": "surname_boundary_not_verified"}
+
+
+def _restore_component_verified_boundary(data: dict, ruby: set[str] | None = None) -> dict | None:
+    """Require independent surname, given-name and full-name model agreement."""
+    name = compact_name(data.get("person_name"))
+    matches = {}
+    preferred = set()
+    for length in range(1, min(4, len(name) - 1) + 1):
+        try:
+            result = _predict(name, name[:length])
+            given_result = _predict(name[length:], "")
+        except (requests.RequestException, ValueError) as exc:
+            return {"status": "uncertain", "reason": type(exc).__name__}
+        given_candidates = given_result.get("candidates") or []
+        if not given_candidates:
+            continue
+        givens = {_normalize_kana_field(c.get("reading")) for c in (given_candidates if ruby else given_candidates[:1])}
+        full_candidates = result.get("candidates") or []
+        model_readings = {_normalize_kana_field(full.get("reading")) for full in full_candidates}
+        if ruby:
+            readings = set(ruby) | {r for r in model_readings if any(_ruby_matches_model(o, r) for o in ruby)}
+        else:
+            readings = [_normalize_kana_field(full_candidates[0].get("reading"))] if full_candidates else []
+        for reading in readings:
+            observed = {r for r in ruby or [] if _ruby_matches_model(r, reading)}
+            if not reading or " " in reading or (ruby and not observed):
+                continue
+            for candidate in result.get("family_candidates") or []:
+                family = _normalize_kana_field(candidate.get("reading"))
+                if not family or not reading.startswith(family) or reading[len(family):] not in givens:
+                    continue
+                given = reading[len(family):]
+                if not given:
+                    continue
+                selected = f"{family} {given}"
+                info = {**_model_info(result), "status": "printed" if ruby else "applied",
+                        "source": "printed" if ruby else "specialist", "selected": selected,
+                        "given_candidates": given_candidates, "segmentation": "verified",
+                        "verification": "family_given_and_full_name_model_match"}
+                if ruby:
+                    info["ruby_readings"] = sorted(observed)
+                    if reading not in model_readings:
+                        info['verification'] = 'family_given_and_printed_ruby_match'
+                    if reading not in observed:
+                        info["ruby_ocr_corrections"] = {"observed": sorted(observed), "selected": reading}
+                matches[(f"{name[:length]} {name[length:]}", selected)] = info
+                if (ruby and reading in model_readings
+                        and given == _normalize_kana_field(given_candidates[0].get('reading'))):
+                    preferred.add((f"{name[:length]} {name[length:]}", selected))
+    if preferred:
+        matches = {key: value for key, value in matches.items() if key in preferred}
+    if len(matches) == 1:
+        (spelling, reading), info = next(iter(matches.items()))
+        data["person_name"], data["person_name_kana"] = spelling, reading
+        return info
+    if ruby or matches:
+        return {"status": "uncertain", "reason": "fragmented_ruby_not_verified" if not matches else "conflicting_model_boundaries"}
+    return None
+
+
+def _ruby_matches_model(observed: str, predicted: str) -> bool:
+    if observed == predicted:
+        return True
+    # A small っ before a vowel or semivowel cannot form a geminate. Correct
+    # only that OCR size confusion, with the full-name model as corroboration.
+    corrected = re.sub(r"っ(?=[あいうえおやゆよわん]|$)", "つ", observed, count=1)
+    return corrected != observed and corrected == predicted
+
+
+def _account_supports_reading(account: str, reading: str) -> bool:
+    """Check a surname account, with an optional supported given-name initial."""
+    family, given = reading.split()
+    sound = _roman_to_hiragana(account)
+    if sound and _prefer_printed_kana(family, sound) == family:
+        return True
+    if not re.fullmatch(r"[a-z]{4,}", account):
+        return False
+    sound = _roman_to_hiragana(account[:-1])
+    if not sound or _prefer_printed_kana(family, sound) != family:
+        return False
+    # The final letter must also agree with the full-name model's given name.
+    return any(given.startswith(initial) for suffix in ("a", "i", "u", "e", "o", "ya", "yu", "yo", "hi", "su")
+               if (initial := _roman_to_hiragana(account[-1] + suffix)))
 
 
 def _restore_model_verified_roman_boundary(data: dict, source: str, blocks: list[dict]) -> dict | None:
