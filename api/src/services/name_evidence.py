@@ -73,6 +73,9 @@ def email_name_parts(source: str) -> list[tuple[str, ...]]:
     """Read account components, including OCR spaces around dot separators."""
     found = []
     for line in source.splitlines():
+        # OCR can join a field label and the account with an underscore.
+        # Remove only a standalone label; never a token inside an account.
+        line = re.sub(r"(?<![A-Za-z0-9._-])e[-_\s]?mail[_:：]\s*(?=[A-Za-z])", " ", line, flags=re.I)
         line = re.sub(r"(?<=[A-Za-z0-9])[._-]\s+(?=[A-Za-z])", lambda m: m.group(0).strip(), line)
         line = re.sub(r"\s+([._-])(?=[A-Za-z])", r"\1", line)
         for local in re.findall(r"\b([A-Za-z][A-Za-z0-9._-]*)\s*@", line):
@@ -887,6 +890,33 @@ def _model_verified_roman_readings(source: str, family_candidates: list[dict],
     return matches
 
 
+def _email_full_name_readings(name: str, source: str, blocks: list[dict],
+                             reading_candidates: list[dict]) -> dict[str, list[list[str]]]:
+    """Verify both email components against a whole-name model prediction.
+
+    The identity stage must already have selected a printed, segmented name.
+    A wrong independent surname prediction must not discard this agreement.
+    Single accounts and guesses differing from either component are excluded.
+    """
+    if len(name.split()) != 2 or not person_name_is_printed(name, source, blocks):
+        return {}
+    full_names = {_normalize_kana_field(candidate.get('reading')) for candidate in reading_candidates}
+    matches: dict[str, list[list[str]]] = {}
+    for parts in email_name_parts(source):
+        if len(parts) != 2 or not all(part.isalpha() and len(part) >= 3 for part in parts):
+            continue
+        first, second = (_roman_to_hiragana(part) for part in parts)
+        if not first or not second:
+            continue
+        for family, given in ((first, second), (second, first)):
+            if family + given in full_names:
+                pair = list(parts)
+                evidence = matches.setdefault(f'{family} {given}', [])
+                if pair not in evidence:
+                    evidence.append(pair)
+    return matches
+
+
 def printed_reading(data: dict, source: str, blocks: list[dict],
                     family_candidates: list[dict] | None = None,
                     reading_candidates: list[dict] | None = None) -> dict:
@@ -912,6 +942,7 @@ def printed_reading(data: dict, source: str, blocks: list[dict],
         families.append(current[0])
     linked = _linked_roman_pairs(name, source, blocks)
     pairs = linked | set(_email_corroborated_roman_pairs(source))
+    email_matches = _email_full_name_readings(name, source, blocks, reading_candidates or []) if pairs and reading_candidates else {}
     if (not pairs and family_candidates and reading_candidates
             and person_name_is_printed(name, source, blocks)):
         verified = _model_verified_roman_readings(source, family_candidates, reading_candidates)
@@ -927,6 +958,7 @@ def printed_reading(data: dict, source: str, blocks: list[dict],
         a, b = _roman_to_hiragana(first), _roman_to_hiragana(second)
         if not a or not b:
             continue
+        choices.update(reading for reading, evidence in email_matches.items() if [first, second] in evidence)
         for family in families:
             if _prefer_printed_kana(family, a) == family:
                 given = _prefer_printed_kana(current[1], b) if len(current) == 2 else b
@@ -965,5 +997,9 @@ def printed_reading(data: dict, source: str, blocks: list[dict],
     if len(choices) > 1:
         return {"status": "uncertain", "reason": "conflicting_roman_readings"}
     if choices:
-        return {"status": "roman", "selected": choices.pop()}
+        selected = choices.pop()
+        if selected in email_matches:
+            return {"status": "roman", "selected": selected,
+                    "verification": "email_and_full_name_model_match", "roman_pairs": email_matches[selected]}
+        return {"status": "roman", "selected": selected}
     return {}

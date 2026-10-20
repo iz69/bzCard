@@ -8,6 +8,7 @@ import requests
 
 from src.services.kana_reading import apply_specialist_reading
 from src.services.extractor import extract_card_fields
+from src.services.name_evidence import email_name_parts
 
 
 def prediction(readings, families=()):
@@ -26,6 +27,70 @@ class RomanReadingTests(unittest.TestCase):
         if name == "晴輔":
             return prediction(["セイスケ", "ハルスケ", "アスケ"])
         return prediction(["ウンバラセイスケ", "クモハラセイスケ"], ["ウンバラ", "クモバラ", "クモハラ"])
+
+    def test_email_label_joined_by_ocr_is_not_an_account_component(self):
+        for label in ("E-mail_", "EMAIL_", "e_mail_", "E-mail:", "E-mail: "):
+            with self.subTest(label=label):
+                self.assertEqual(email_name_parts(label + "harusuke.kumohara@example.test"),
+                                 [("harusuke", "kumohara")])
+        self.assertEqual(email_name_parts("team.e-mail_harusuke.kumohara@example.test"),
+                         [("team", "e", "mail", "harusuke", "kumohara")])
+
+    def test_email_and_full_name_agreement_survives_wrong_surname_predictions(self):
+        model = prediction(["クモハラハルスケ", "クモバラハルスケ"], ["ウンバラ", "クモバラ"])
+        for account in ("harusuke.kumohara", "kumohara.harusuke"):
+            for previous in (None, {"person_name": "雲原 晴輔", "person_name_kana": "くもばら はるすけ",
+                                    "email": account + "@example.test"}):
+                data = {"person_name": "雲原 晴輔", "person_name_kana": "うんばら せいすけ",
+                        "email": account + "@example.test"}
+                with self.subTest(account=account, previous=bool(previous)), \
+                     patch("src.services.kana_reading._predict", return_value=model) as predict:
+                    info = apply_specialist_reading(data, "雲原 晴輔\nE-mail_" + data['email'], [], previous=previous)
+                self.assertEqual(data["person_name_kana"], "くもはら はるすけ")
+                self.assertEqual(info["verification"], "email_and_full_name_model_match")
+                self.assertEqual(info["roman_pairs"], [account.split('.')])
+                predict.assert_called_once()
+
+    def test_email_full_name_verification_requires_the_entire_printed_name(self):
+        for source, model in (
+                ("雲原 晴輔\nharusuke.kumohara@example.test", prediction(["クモバラハルスケ"], ["クモバラ"])),
+                ("雲原 晴輔\nharusuke@example.test", prediction(["クモハラハルスケ"], ["クモバラ"])),
+                ("別人 次郎\nharusuke.kumohara@example.test", prediction(["クモハラハルスケ"], ["クモバラ"]))):
+            data = {"person_name": "雲原 晴輔", "person_name_kana": ""}
+            with self.subTest(source=source, model=model), \
+                 patch("src.services.kana_reading._predict", return_value=model):
+                info = apply_specialist_reading(data, source, [])
+            self.assertNotEqual(info.get("verification"), "email_and_full_name_model_match")
+
+    def test_different_email_readings_supported_by_the_model_remain_ambiguous(self):
+        data = {"person_name": "雲原 晴輔", "person_name_kana": ""}
+        source = "雲原 晴輔\nharusuke.kumohara@example.test\nseisuke.kumohara@example.test"
+        with patch("src.services.kana_reading._predict", return_value=prediction(
+                ["クモハラハルスケ", "クモハラセイスケ"], ["クモバラ"])):
+            info = apply_specialist_reading(data, source, [])
+        self.assertEqual(data["person_name_kana"], "")
+        self.assertEqual(info["reason"], "conflicting_roman_readings")
+
+    def test_printed_ruby_outranks_email_and_full_name_agreement(self):
+        data = {"person_name": "雲原 晴輔", "person_name_kana": ""}
+        source = "雲原 晴輔（くもばら せいすけ）\nE-mail_harusuke.kumohara@example.test"
+        with patch("src.services.kana_reading._predict") as predict:
+            info = apply_specialist_reading(data, source, [])
+        self.assertEqual(data["person_name_kana"], "くもばら せいすけ")
+        self.assertEqual(info["status"], "printed")
+        predict.assert_not_called()
+
+    def test_verified_email_reading_is_not_replaced_by_saved_corrections(self):
+        raw = {"person_name": "雲原 晴輔", "person_name_kana": "うんばら せいすけ",
+               "email": "harusuke.kumohara@example.test"}
+        correction = {"id": "old-reading", "context": raw, "corrected_value": "うんばら せいすけ",
+                      "automatic_value": "くもばら はるすけ", "reading_rules": [], "person_example": True}
+        with patch("src.services.extractor._generate_structured_response", return_value=json.dumps(raw)), \
+             patch("src.services.extractor.relevant_corrections", return_value=[correction]), \
+             patch("src.services.kana_reading._predict", return_value=prediction(["クモハラハルスケ"], ["クモバラ"])):
+            result = extract_card_fields("雲原 晴輔\nE-mail_" + raw['email'], []).data
+        self.assertEqual(result['person_name_kana'], 'くもはら はるすけ')
+        self.assertEqual(result['_feedback']['applied_ids'], [])
 
     def test_single_component_email_links_an_adjacent_roman_identity(self):
         for separator in (" ", "\n"):
