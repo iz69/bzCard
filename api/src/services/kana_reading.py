@@ -246,7 +246,9 @@ def _restore_unspaced_name(data: dict, source: str, blocks: list[dict]) -> dict 
                     targets.append((f"{family} {first}", "roman"))
         if not targets and len(current) == 2:
             targets.append((" ".join(current), "applied"))
-        if not targets and spaced_line and any(_roman_to_hiragana(s) == family for s in single_emails):
+        if not targets and spaced_line and any(
+                (sound := _roman_to_hiragana(s)) and _prefer_printed_kana(family, sound) == family
+                for s in single_emails):
             targets.extend((candidate, "applied") for candidate in candidates[:1])
         verified = []
         for reading, status in targets:

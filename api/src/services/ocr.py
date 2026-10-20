@@ -12,7 +12,7 @@ import numpy as np
 from PIL import Image
 
 from ..config import settings
-from .name_evidence import _is_organization_name, _kanji_text, _roman_labeled_name_rows
+from .name_evidence import _is_organization_name, _kanji_text, _roman_labeled_name_rows, _spatial_name_blocks
 from .address_evidence import PREFECTURES
 
 _engine = None
@@ -54,6 +54,7 @@ def run_yomitoku(image_path: Path, direction: str = "horizontal") -> OcrResult:
 
     results, _ = engine(img_array)
     blocks = _extract_blocks(results)
+    blocks = _refine_spaced_name_rows(engine, img_array, blocks)
     blocks = _refine_roman_labeled_names(engine, img_array, blocks)
     blocks = _refine_truncated_prefectures(engine, img_array, blocks)
     horizontal_score, vertical_score = _orientation_scores(blocks)
@@ -76,6 +77,94 @@ def run_yomitoku(image_path: Path, direction: str = "horizontal") -> OcrResult:
         horizontal_score=horizontal_score,
         vertical_score=vertical_score,
     )
+
+
+def _spaced_name_glyphs(image: np.ndarray, box: list) -> list[list[int]]:
+    """Find separated square glyphs, without guessing their identity or boundary."""
+    import cv2
+
+    height, width = image.shape[:2]
+    x1, y1, x2, y2 = box
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(width, int(x2)), min(height, int(y2))
+    h = y2 - y1
+    if h < 4 or x2 - x1 < h * 3:
+        return []
+    gray = cv2.cvtColor(image[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+    if int(gray.max()) - int(gray.min()) < 40:
+        return []
+    padding = max(2, round(h * .2))
+    context = image[max(0, y1 - padding):min(height, y2 + padding),
+                    max(0, x1 - padding):min(width, x2 + padding)]
+    background = np.median(cv2.cvtColor(context, cv2.COLOR_BGR2GRAY))
+    polarity = cv2.THRESH_BINARY_INV if background >= 128 else cv2.THRESH_BINARY
+    _, ink = cv2.threshold(gray, 0, 255, polarity | cv2.THRESH_OTSU)
+    columns = np.count_nonzero(ink, axis=0) >= max(1, h * .04)
+    edges = np.diff(np.r_[False, columns, False].astype(np.int8))
+    spans: list[list[int]] = []
+    for a, b in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
+        if spans and a - spans[-1][1] < h * .3:
+            spans[-1][1] = int(b)
+        else:
+            spans.append([int(a), int(b)])
+    if (not 2 <= len(spans) <= 6
+            or any(b - a < h * .45 or b - a > h * 1.6 for a, b in spans)
+            or any(right[0] - left[1] < h * .5 for left, right in zip(spans, spans[1:]))):
+        return []
+    for a, b in spans:
+        rows = np.flatnonzero(np.any(ink[:, a:b], axis=1))
+        if not len(rows) or rows[-1] - rows[0] + 1 < h * .65:
+            return []
+    return [[x1 + a, y1, x1 + b, y2] for a, b in spans]
+
+
+def _refine_spaced_name_rows(engine, image: np.ndarray, blocks: list[dict]) -> list[dict]:
+    """Re-read prominent kanji after reducing unusually wide character gaps.
+
+    Two independently padded crops must agree at high confidence and contain
+    exactly as many kanji as visible glyphs. No name dictionary is consulted.
+    """
+    candidates = {(block["text"], tuple(block["box"])) for block in _spatial_name_blocks(blocks)}
+    updated, attempts = list(blocks), 0
+    height, width = image.shape[:2]
+    for index, block in enumerate(blocks):
+        text, box = _kanji_text(block.get("text")), block.get("box")
+        if not text or not box or (text, tuple(box)) not in candidates:
+            continue
+        glyphs = _spaced_name_glyphs(image, box)
+        if not glyphs or len(text) > len(glyphs):
+            continue
+        if attempts >= 2:
+            break
+        attempts += 1
+        variants = []
+        try:
+            for ratio in (.1, .2):
+                padding = max(2, round((box[3] - box[1]) * ratio))
+                pieces = [image[max(0, y1 - padding):min(height, y2 + padding),
+                                max(0, x1 - padding):min(width, x2 + padding)]
+                          for x1, y1, x2, y2 in glyphs]
+                compacted = np.concatenate(pieces, axis=1)
+                h, w = compacted.shape[:2]
+                result, _ = engine.recognizer(compacted, [[[0, 0], [w, 0], [w, h], [0, h]]])
+                if len(result.contents) != 1 or len(result.scores) != 1:
+                    break
+                variants.append({"text": str(result.contents[0]).strip(), "score": float(result.scores[0]),
+                                 "padding": padding, "size": [w, h]})
+        except Exception:
+            logger.exception("Spaced name recognition failed; retaining initial OCR")
+            continue
+        readings = {_kanji_text(variant["text"]) for variant in variants}
+        if (len(variants) != 2 or len(readings) != 1 or not all(variant["score"] >= .95 for variant in variants)):
+            continue
+        reading = readings.pop()
+        if (not reading or len(reading) != len(glyphs) or _is_organization_name(reading)
+                or reading == text):
+            continue
+        updated[index] = {**block, "text": " ".join(reading),
+            "_recognition_retry": {"method": "compacted_name_spacing", "original_text": block["text"],
+                                   "glyph_boxes": glyphs, "variants": variants}}
+    return updated
 
 
 def _refine_roman_labeled_names(engine, image: np.ndarray, blocks: list[dict]) -> list[dict]:
