@@ -27,13 +27,19 @@ class ReleaseError(RuntimeError):
 
 
 def version_parts(value):
-    match = re.fullmatch(r'v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?', value)
+    match = re.fullmatch(
+        r'v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)([A-Z]+)?'
+        r'(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?', value)
     if not match or len(value.removeprefix('v')) > 128:
         raise ReleaseError(f'Invalid release version: {value}')
-    prerelease = match[4]
+    prerelease = match[5]
     if prerelease and any(part.isdigit() and len(part) > 1 and part.startswith('0') for part in prerelease.split('.')):
         raise ReleaseError(f'Invalid release version: {value}')
-    return tuple(int(match[i]) for i in (1, 2, 3)), bool(prerelease)
+    # Accuracy revisions follow A ... Z, AA ... AZ, BA ...; no suffix is revision 0.
+    revision = 0
+    for letter in match[4] or '':
+        revision = revision * 26 + ord(letter) - ord('A') + 1
+    return tuple(int(match[i]) for i in (1, 2, 3)) + (revision,), bool(prerelease)
 
 
 def inspect_labels(reference):
@@ -105,11 +111,14 @@ def plan_release(directory, prefix, tag, force='none', inspect=inspect_labels):
     return {'include': selected}, decisions
 
 
-def write_report(matrix, decisions, output=None, summary=None):
+def write_report(matrix, decisions, tag, output=None, summary=None):
+    _, prerelease = version_parts(tag)
     if output:
         with Path(output).open('a') as stream:
             stream.write('has_changes=' + ('true' if matrix['include'] else 'false') + '\n')
             stream.write('matrix=' + json.dumps(matrix, separators=(',', ':')) + '\n')
+            stream.write('image_version=' + tag.removeprefix('v') + '\n')
+            stream.write('stable_release=' + ('false' if prerelease else 'true') + '\n')
     report = '| Image | Published | After release | Action |\n| --- | --- | --- | --- |\n'
     for decision in decisions:
         report += f"| {decision['service']} | {decision['previous']} | {decision['release']} | {decision['reason']} |\n"
@@ -127,7 +136,8 @@ def main():
     args = parser.parse_args()
     try:
         matrix, decisions = plan_release(Path.cwd(), args.prefix, args.tag, args.force)
-        write_report(matrix, decisions, os.environ.get('GITHUB_OUTPUT'), os.environ.get('GITHUB_STEP_SUMMARY'))
+        write_report(matrix, decisions, args.tag,
+                     os.environ.get('GITHUB_OUTPUT'), os.environ.get('GITHUB_STEP_SUMMARY'))
     except (ReleaseError, OSError, subprocess.SubprocessError) as error:
         parser.exit(1, f'Image release selection failed: {error}\n')
 

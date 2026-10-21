@@ -5,20 +5,35 @@
 配布用は [docker-compose.yml](../../docker-compose.yml)、ソースビルド用は
 [docker-compose.develop.yml](../../docker-compose.develop.yml) を使います。
 
+## バージョンの付け方
+
+名刺取り込み精度の微修正（OCR・抽出・ふりがなの判定調整）は、数字を据え置き、
+末尾の大文字英字を進める。現在の `v0.9.8` に対する次の精度改善は `v0.9.8A`、
+続く改善は `v0.9.8B`、`v0.9.8C` とする。`Z` の次は `AA`、`AB` と続ける。
+機能追加など通常のリリースでは `v0.9.9` のように数字を上げ、英字を外す。
+過去に公開済みのバージョンやタグは付け替えない。
+
+英字付きも安定版として公開し、イメージには `0.9.8A` と `latest` のタグを付ける。
+UI/APIのバージョン表示にも英字を残す。公開順は `v0.9.8 < v0.9.8A < v0.9.8B < v0.9.9` となる。
+試験版は `v0.9.8A-rc.1` のように `-` 以降で区別し、`latest` を更新しない。
+
+抽出履歴の処理バージョン `PIPELINE_VERSION` は公開バージョンとは別に管理する。
+抽出ロジックを変えたときは、従来どおり更新して履歴の判別に使う。
+
 ## メンテナーの公開手順
 
 [container-images.yml](../../.github/workflows/container-images.yml) がPRとmainへのpushで検証を行う。
-`v0.1.0` のようなバージョンタグのpushでは、すべての検証が成功した後で
+`v0.9.8A` のようなバージョンタグのpushでは、すべての検証が成功した後で
 変更のあるイメージだけをGHCRへpushする。GitHub Actionsの `GITHUB_TOKEN` に `packages: write` を付与しているため、
 個人アクセストークンの登録は不要。
 
 ```sh
 # 検証済みのコミットをGitHubへ反映した後に実行
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.9.8A
+git push origin v0.9.8A
 ```
 
-`v0.1.0` はイメージの `0.1.0` タグになる。安定版には `latest`、
+`v0.9.8A` はイメージの `0.9.8A` タグになる。安定版には `latest`、
 コミット識別用には `sha-...` も付く。プレリリースは `latest` を更新しない。
 
 公開対象は [image_release.py](../../.github/scripts/image_release.py) が、イメージごとの

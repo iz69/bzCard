@@ -106,6 +106,8 @@ jobs:
     outputs:
       has_changes: ${{ steps.plan.outputs.has_changes }}
       matrix: ${{ steps.plan.outputs.matrix }}
+      image_version: ${{ steps.plan.outputs.image_version }}
+      stable_release: ${{ steps.plan.outputs.stable_release }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -154,9 +156,12 @@ jobs:
         id: metadata
         with:
           images: ${{ env.IMAGE }}
+          flavor: latest=${{ needs.release-plan.outputs.stable_release }}
           tags: |
-            type=semver,pattern={{version}}
+            type=raw,value=${{ needs.release-plan.outputs.image_version }}
             type=sha
+          labels: |
+            org.opencontainers.image.version=${{ needs.release-plan.outputs.image_version }}
       - uses: docker/build-push-action@3b5e8027fcad23fda98b2e3ac259d8d67585f671 # v6
         with:
           context: ${{ matrix.context }}
