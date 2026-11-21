@@ -84,7 +84,7 @@ export default function DesktopApp({ session, saveSession }: { session: Session;
   const visibleContacts = contacts.slice(firstVisibleContact, firstVisibleContact + visibleContactCount);
   const trailingContacts = Math.max(0, contacts.length - firstVisibleContact - visibleContacts.length);
 
-  const api = useMemo(() => makeApi(session), [session]);
+  const api = useMemo(() => makeApi(session, () => saveSession({ apiBase: session.apiBase, token: '' })), [session, saveSession]);
   useEffect(() => () => api.dispose(), [api]);
 
   useEffect(() => {

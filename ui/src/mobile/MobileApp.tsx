@@ -21,7 +21,7 @@ export default function MobileApp(props: Props) {
 }
 
 function MobileWorkspace({ session, saveSession }: Props) {
-  const api = useMemo(() => makeApi(session), [session]);
+  const api = useMemo(() => makeApi(session, () => saveSession({ apiBase: session.apiBase, token: '' })), [session, saveSession]);
   useEffect(() => () => api.dispose(), [api]);
   const list = useContacts(api);
   const { route, navigate, back, setDirty } = useMobileNavigation();

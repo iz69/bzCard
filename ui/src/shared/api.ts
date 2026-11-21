@@ -6,11 +6,19 @@ export class HttpError extends Error {
   }
 }
 
-export function makeApi(session: Session) {
+export function makeApi(session: Session, onUnauthorized?: () => void) {
   const lifetime = new AbortController();
+  let unauthorized = false;
   const headers = {
     Authorization: `Bearer ${session.token}`,
   };
+
+  function checkAuthorization(response: Response) {
+    if (response.status === 401 && !lifetime.signal.aborted && !unauthorized) {
+      unauthorized = true;
+      onUnauthorized?.();
+    }
+  }
 
   async function request(path: string, init: RequestInit = {}) {
     const response = await fetch(apiUrl(session.apiBase, path), {
@@ -21,6 +29,7 @@ export function makeApi(session: Session) {
         ...(init.headers || {}),
       },
     });
+    checkAuthorization(response);
     if (!response.ok) {
       const text = await response.text();
       throw new HttpError(response.status, formatHttpError(response, text));
@@ -66,6 +75,7 @@ export function makeApi(session: Session) {
         headers,
         signal: signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal,
       });
+      checkAuthorization(response);
       if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
       return response.blob();
     },
