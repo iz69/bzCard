@@ -54,13 +54,17 @@ GEMINI_MODEL=gemini-3.5-flash
 
 ### LLMモデルの切替
 
-現在の既定は、日本語特化のローカルモデル `bzcard-lfm-jp:202606` です。従来の
-`qwen2.5:7b` は削除せず残せるため、`.env` の `LLM_MODEL` を次の値に戻して
-`docker compose up -d --force-recreate api` を実行すれば復帰できます。
+現在の既定は、日本語特化のローカルモデル `bzcard-lfm-jp:202606` です。
+標準構成でOllamaに登録するモデルはこの1つで、従来の `qwen2.5:7b` が
+残っていることは前提にしません。利用可能なモデルは次のコマンドで確認できます。
 
-```env
-LLM_MODEL=qwen2.5:7b
+```sh
+docker compose exec ollama ollama list
 ```
+
+別のモデルに切り替える場合は、先にOllamaへ対象モデルを取得・登録し、`.env` の
+`LLM_MODEL` を登録名に変更して `docker compose up -d --force-recreate api` を実行してください。
+既定モデルの登録方法は [導入ガイド](installation.md#モデルの準備) を参照してください。
 
 SQLiteデータベースは既定でホスト側の `data/bzcard.db` に保存されます。画像と
 `data/line-credentials.key` も同じデータ保存先にあるため、バックアップ時は
