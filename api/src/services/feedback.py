@@ -12,7 +12,7 @@ from .normalization import normalize_fields, _normalize_kana_field
 from .name_evidence import printed_reading
 from .timeutil import now_iso
 
-PIPELINE_VERSION = "34"
+PIPELINE_VERSION = "35"
 
 
 def _compact(value: str) -> str:

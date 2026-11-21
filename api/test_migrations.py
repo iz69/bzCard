@@ -13,7 +13,7 @@ from src import database
 from src.config import settings
 from src.services import repository
 from src.services.fields import SCHEMA_KEYS
-from src.services.image_store import save_original_bytes, relative_path
+from src.services.image_store import save_original_bytes, relative_path, rotate_processed_images
 from src.services.ocr import _extract_blocks, _get_engine
 from src.worker import OcrResult, _process_image, _run_ocr_with_auto_rotation
 from test_repairs import image_bytes
@@ -77,7 +77,7 @@ class MigrationTests(unittest.TestCase):
         processed, thumb = create_processed_images(original, 'card')
         vertical = OcrResult('名刺の文字列を十分な長さにします' * 2, [], 1, 'vertical', 0, 4)
         horizontal = OcrResult(vertical.raw_text, [], 1, 'horizontal', 6, 0)
-        with patch('src.worker.run_yomitoku', side_effect=[vertical,horizontal,vertical]), patch('src.worker._is_portrait_image', return_value=True):
+        with patch('src.worker.run_yomitoku', side_effect=[vertical,horizontal,vertical]):
             _run_ocr_with_auto_rotation(processed, thumb, 'auto', 'card')
         rotated = processed.read_bytes()
         image = repository.get_card_images('card')[0]
@@ -89,3 +89,44 @@ class MigrationTests(unittest.TestCase):
             # JPEG re-encoding changes bytes; geometry and pixels stay aligned.
             difference = np.abs(np.asarray(before, dtype=float) - np.asarray(after, dtype=float))
             self.assertLess(float(difference.mean()), 3)
+
+
+class AutomaticRotationTests(unittest.TestCase):
+    def test_sideways_text_is_rotated_regardless_of_image_shape(self):
+        vertical = OcrResult('名刺の文字列を十分な長さにします' * 2, [], 1, 'vertical', 0, 4)
+        horizontal = OcrResult(vertical.raw_text, [], 1, 'horizontal', 6, 0)
+        for size in ((813, 581), (581, 813), (600, 600)):
+            for best_degrees in (90, -90):
+                with self.subTest(size=size, degrees=best_degrees), tempfile.TemporaryDirectory() as temp:
+                    processed, thumb = Path(temp) / 'processed.jpg', Path(temp) / 'thumbnail.jpg'
+                    Image.new('RGB', size, 'white').save(processed)
+                    candidates = [horizontal, vertical] if best_degrees == 90 else [vertical, horizontal]
+                    with patch('src.worker.run_yomitoku', side_effect=[vertical, *candidates]) as run, patch('src.worker.rotate_processed_images', wraps=rotate_processed_images) as rotate:
+                        result = _run_ocr_with_auto_rotation(processed, thumb, 'auto')
+                    self.assertIs(result, horizontal)
+                    self.assertEqual(run.call_count, 3)
+                    rotate.assert_called_once_with(processed, thumb, best_degrees)
+                    with Image.open(processed) as image:
+                        self.assertEqual(image.size, size[::-1])
+                    self.assertFalse(list(Path(temp).glob('*_rotate_*.jpg')))
+
+    def test_keeps_original_when_no_rotation_improves_text(self):
+        original = OcrResult('名刺の文字列を十分な長さにします' * 2, [], 1, 'vertical', 0, 4)
+        weak = OcrResult('短い', [], 1, 'horizontal', 6, 0)
+        with tempfile.TemporaryDirectory() as temp:
+            processed, thumb = Path(temp) / 'processed.jpg', Path(temp) / 'thumbnail.jpg'
+            Image.new('RGB', (813, 581), 'white').save(processed)
+            before = processed.read_bytes()
+            with patch('src.worker.run_yomitoku', side_effect=[original, weak, original]), patch('src.worker.rotate_processed_images') as rotate:
+                self.assertIs(_run_ocr_with_auto_rotation(processed, thumb, 'auto'), original)
+            rotate.assert_not_called()
+            self.assertEqual(processed.read_bytes(), before)
+
+    def test_skips_candidates_for_horizontal_text_or_explicit_direction(self):
+        for requested, detected in (('auto', 'horizontal'), ('horizontal', 'horizontal'), ('vertical', 'vertical')):
+            with self.subTest(requested=requested, detected=detected):
+                original = OcrResult('名刺', [], 1, detected, 0, 4)
+                with patch('src.worker.run_yomitoku', return_value=original) as run, patch('src.worker.save_rotated_candidate') as candidate:
+                    self.assertIs(_run_ocr_with_auto_rotation(Path('unused'), Path('unused'), requested), original)
+                run.assert_called_once()
+                candidate.assert_not_called()

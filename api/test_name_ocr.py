@@ -138,6 +138,61 @@ class NameOcrTests(unittest.TestCase):
 
 
 class AddressOcrTests(unittest.TestCase):
+    def test_extractor_restores_a_whole_prefecture_with_postal_code_and_wrapped_building(self):
+        source = "〒191-0024 東京都日野市架空町 6-41-3\nサンプル第 3 ビル"
+        partial = "日野市架空町 6-41-3 サンプル第3ビル"
+        with patch("src.services.extractor._generate_structured_response",
+                   return_value=json.dumps({"address": partial})):
+            result = extract_card_fields(source, []).data
+        self.assertEqual(result["address"], "東京都" + partial)
+        self.assertEqual(result["_automatic"]["address"], "東京都" + partial)
+        self.assertEqual(result["_raw"]["address"], partial)
+
+    def test_missing_prefecture_requires_a_unique_full_printed_address(self):
+        partial = "架空市若葉町1-2-3 サンプルビル"
+        for source in (
+            partial,
+            "東京都架空市若葉町1-2-4 サンプルビル",
+            "東京都架空市若葉町1-2-3 別ビル",
+            "東京都別市1-2-3\n" + partial,
+            "東京都" + partial + "\n大阪府" + partial,
+        ):
+            with self.subTest(source=source):
+                data = {"address": partial}
+                prefer_complete_printed_address(data, source)
+                self.assertEqual(data["address"], partial)
+
+    def test_failed_or_ambiguous_completion_does_not_blank_a_grounded_partial_address(self):
+        partial = "架空市若葉町1-2-3 サンプルビル"
+        for source in (
+            partial,
+            "東京都別市1-2-3\n" + partial,
+            "東京都架空市若葉町1-2-4 サンプルビル\n" + partial,
+            "東京都架空市若葉町1-2-3 別ビル\n" + partial,
+            "東京都" + partial + "\n大阪府" + partial,
+        ):
+            with self.subTest(source=source), patch(
+                "src.services.extractor._generate_structured_response",
+                return_value=json.dumps({"address": partial}),
+            ):
+                result = extract_card_fields(source, []).data
+                self.assertEqual(result["address"], partial)
+
+    def test_completion_and_guard_share_street_number_normalization(self):
+        partial = "架空市若葉町1-2-3 サンプルビル"
+        source = "〒100-0000 東京都架空市若葉町一丁目2-3\nサンプルビル"
+        with patch("src.services.extractor._generate_structured_response",
+                   return_value=json.dumps({"address": partial})):
+            result = extract_card_fields(source, []).data
+        self.assertEqual(result["address"], "東京都" + partial)
+
+    def test_keeps_complete_or_empty_address(self):
+        for address in ("", "大阪府架空市若葉町1-2-3"):
+            with self.subTest(address=address):
+                data = {"address": address}
+                prefer_complete_printed_address(data, "東京都架空市若葉町1-2-3")
+                self.assertEqual(data["address"], address)
+
     def test_extractor_only_restores_a_prefecture_character_from_complete_ocr(self):
         partial = "奈川県横浜市架空町2丁目4番68号"
         for source, expected in (("神" + partial, "神" + partial), (partial, partial),

@@ -9,7 +9,7 @@ import requests
 
 from ..config import settings
 from .fields import SCHEMA_KEYS
-from .normalization import normalize_fields, _normalize_address
+from .normalization import normalize_fields
 from .feedback import relevant_corrections, prompt_examples, apply_known_reading
 from .kana_reading import apply_specialist_reading
 from .name_evidence import (
@@ -23,7 +23,10 @@ from .name_evidence import (
 )
 from .person_identity import resolve_person_name
 from .roles import ROLE_TITLES as _ROLE_TITLES, OCCUPATIONAL_TITLES, is_position_title, split_printed_role
-from .address_evidence import prefer_complete_printed_address
+from .address_evidence import (
+    prefer_complete_printed_address,
+    compact_address_for_evidence as _compact_address_for_evidence,
+)
 
 
 class ModelResponse(str):
@@ -578,11 +581,3 @@ def _numbers_on_labeled_lines(raw_text: str, label_pattern: str) -> set[str]:
             if number:
                 values.add(_normalized_digits(number.group(1)))
     return values
-
-
-def _compact_address_for_evidence(value: str) -> str:
-    # Normalize only street numbers, preserving both place names and digits.
-    normalized = _normalize_address(value)
-    normalized = re.sub(r"(\d+)(?:丁目|番地?|号)", r"\1-", normalized)
-    normalized = re.sub(r"[ー－−]", "-", normalized)
-    return re.sub(r"[\s()（）./:：]", "", normalized).strip("-").casefold()

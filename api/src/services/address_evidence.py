@@ -1,4 +1,6 @@
 """Address evidence; missing prefecture characters require printed text."""
+import re
+
 from .normalization import _normalize_address
 
 
@@ -11,12 +13,31 @@ PREFECTURES = (
 
 
 def prefer_complete_printed_address(data: dict, source: str) -> None:
-    """Use an OCR address when the model omitted its first prefecture character."""
+    """Restore an omitted prefecture prefix only from the same printed address."""
     current = _normalize_address(data.get("address"))
     if not current or any(current.startswith(name) for name in PREFECTURES):
         return
-    candidates = {_normalize_address(line) for line in source.splitlines()
-                  if any(_normalize_address(line).startswith(name) for name in PREFECTURES)}
-    matching = {line for line in candidates if line[1:] == current}
+    # Postal codes can precede the address, and building names can wrap to the
+    # next OCR line. Match the whole address, ignoring only printed whitespace.
+    compact_source = compact_address_for_evidence(source)
+    compact_current = compact_address_for_evidence(current)
+    matching = set()
+    for prefecture in PREFECTURES:
+        for missing in range(1, len(prefecture) + 1):
+            if not compact_current.startswith(prefecture[missing:]):
+                continue
+            prefix = prefecture[:missing]
+            # Use exactly the same check as the downstream address guard. A
+            # failed completion must leave the original extracted address intact.
+            if compact_address_for_evidence(prefix + current) in compact_source:
+                matching.add(prefix + current)
     if len(matching) == 1:
         data["address"] = matching.pop()
+
+
+def compact_address_for_evidence(value: str) -> str:
+    # Normalize only street numbers, preserving both place names and digits.
+    normalized = _normalize_address(value)
+    normalized = re.sub(r"(\d+)(?:丁目|番地?|号)", r"\1-", normalized)
+    normalized = re.sub(r"[ー－−]", "-", normalized)
+    return re.sub(r"[\s()（）./:：]", "", normalized).strip("-").casefold()

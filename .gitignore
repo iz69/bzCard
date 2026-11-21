@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 .env
 ollama/
+
+docker-compose.override.yml
+docker-compose.develop.override.yml

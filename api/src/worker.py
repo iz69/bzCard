@@ -136,7 +136,9 @@ def _process_image(card_id: str, image: dict) -> None:
 
 def _run_ocr_with_auto_rotation(processed_path, thumbnail_path, direction: str, card_id: str | None = None, side: str = "front") -> OcrResult:
     ocr = run_yomitoku(processed_path, direction)
-    if direction != "auto" or ocr.direction != "vertical" or not _is_portrait_image(processed_path):
+    # Sideways text can occur in landscape images too (for example a rotated
+    # portrait card). Use the detected text direction rather than the aspect ratio.
+    if direction != "auto" or ocr.direction != "vertical":
         return ocr
 
     best: tuple[int, OcrResult, int] | None = None
@@ -162,14 +164,6 @@ def _run_ocr_with_auto_rotation(processed_path, thumbnail_path, direction: str, 
     if card_id:
         repository.save_auto_rotation(card_id, side, -degrees)
     return rotated_ocr
-
-
-def _is_portrait_image(path) -> bool:
-    from PIL import Image
-
-    with Image.open(path) as image:
-        width, height = image.size
-    return height > width * 1.15
 
 
 def _rotation_score(candidate: OcrResult, original: OcrResult) -> int:
